@@ -39,7 +39,7 @@ while true; do
 
     if [ -z "$EXPIRED_USERS" ]; then
         # No users found, wait and continue
-        sleep 10
+        sleep 5
         continue
     fi
 
@@ -65,8 +65,8 @@ while true; do
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] SYSTEM: Xray Core Restarted" >> "$LOG"
     fi
 
-    # Wait for 10 seconds before the next check to save CPU resources
-    sleep 10
+    # Wait for 5 seconds before the next check to save CPU resources
+    sleep 5
 done
 EOF
 
