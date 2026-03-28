@@ -25,27 +25,21 @@ install_service() {
     echo "Installing Traffic Controller..."
 
     # Create the worker script
-    cat << EOF > $SCRIPT_PATH
+    cat << 'EOF' > $SCRIPT_PATH
 #!/bin/bash
 DB="/etc/x-ui/x-ui.db"
-LOG="$LOG_FILE"
+LOG="/var/log/traffic_check.log"
 while true; do
-    # Search for expired clients
-    IDS=\$(sqlite3 "\$DB" "SELECT id, email FROM client_traffics WHERE enable=1 AND total>0 AND (up+down)>=(total-1024);")
-    
-    if [ -n "\$IDS" ]; then
-        echo "\$IDS" | while read -r line; do
-            ID=\$(echo \$line | cut -d'|' -f1)
-            EMAIL=\$(echo \$line | cut -d'|' -f2)
-            
-            # Disable in DB
-            sqlite3 "\$DB" "UPDATE client_traffics SET enable=0 WHERE id=\$ID;"
-            echo "[\$(date)] DISABLED: \$EMAIL (ID: \$ID)" >> \$LOG
+    IDS=$(sqlite3 "$DB" "SELECT id, email FROM client_traffics WHERE enable=1 AND total>0 AND (up+down)>=(total-1024);")
+    if [ -n "$IDS" ]; then
+        echo "$IDS" | while read -r line; do
+            ID=$(echo $line | cut -d'|' -f1)
+            EMAIL=$(echo $line | cut -d'|' -f2)
+            sqlite3 "$DB" "UPDATE client_traffics SET enable=0 WHERE id=$ID;"
+            echo "[$(date)] DISABLED: $EMAIL (ID: $ID)" >> $LOG
         done
-        
-        # Restart Core
         x-ui restart-xray > /dev/null 2>&1
-        echo "[\$(date)] Xray Core Restarted due to limit enforcement." >> \$LOG
+        echo "[$(date)] Xray Core Restarted" >> $LOG
     fi
     sleep 10
 done
@@ -53,9 +47,9 @@ EOF
 
     chmod +x $SCRIPT_PATH
     
-    # Initialize the log file with a message so it's not empty
+    # Create initial log entry
     echo "=======================================" > $LOG_FILE
-    echo "[\$(date)] Service Installed Successfully" >> $LOG_FILE
+    echo "[$(date)] Service Installed Successfully" >> $LOG_FILE
     echo "Monitoring Started..." >> $LOG_FILE
     echo "=======================================" >> $LOG_FILE
 
@@ -100,26 +94,30 @@ while true; do
         1) install_service ;;
         2) uninstall_service ;;
         3) 
-            # Check if log file exists and has content
+            echo "Checking logs..."
             if [ ! -f "$LOG_FILE" ]; then
                 echo "---------------------------------------"
-                echo "ERROR: Log file not found."
+                echo "ERROR: Log file does not exist."
                 echo "Please install the service first (Option 1)."
                 echo "---------------------------------------"
+                read -p "Press Enter to return to menu..."
             elif [ ! -s "$LOG_FILE" ]; then
                 echo "---------------------------------------"
-                echo "NOTICE: No logs recorded yet."
-                echo "The service is waiting for an event..."
+                echo "NOTICE: Log file is empty."
+                echo "The service hasn't recorded any events yet."
                 echo "---------------------------------------"
+                read -p "Press Enter to return to menu..."
             else
-                echo "Showing logs (Press Ctrl+C to stop):"
+                echo "Showing logs (Press Ctrl+C to stop and return to menu):"
                 echo "---------------------------------------"
-                tail -f -n 20 "$LOG_FILE"
+                # tail -f will keep the screen open until Ctrl+C is pressed
+                tail -f "$LOG_FILE"
             fi
-            read -p "Press Enter to return to menu..."
             ;;
         4) 
+            clear
             systemctl status traffic-check
+            echo "---------------------------------------"
             read -p "Press Enter to return to menu..."
             ;;
         5) exit 0 ;;
