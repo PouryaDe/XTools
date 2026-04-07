@@ -34,8 +34,8 @@ LOG="/var/log/traffic_check.log"
 while true; do
     # 1. Find users who reached the limit (with 1KB buffer as requested)
     # total > 0 ensures we only target limited accounts
-    # (up + down) >= (total - 1024) is the trigger logic
-    EXPIRED_USERS=$(sqlite3 "$DB" "SELECT id, email FROM client_traffics WHERE enable=1 AND total>0 AND (up+down) >= (total - 1024);" 2>/dev/null)
+    # (up + down) >= total is the trigger logic
+    EXPIRED_USERS=$(sqlite3 "$DB" "SELECT id, email FROM client_traffics WHERE enable=1 AND total>0 AND (up+down) >= total;" 2>/dev/null)
 
     if [ -z "$EXPIRED_USERS" ]; then
         # No users found, wait and continue
