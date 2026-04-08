@@ -24,7 +24,7 @@ show_menu() {
 install_service() {
     echo "Installing Traffic Controller..."
 
-    # Create the worker script that runs in the background
+    # Create the worker script
     cat << 'EOF' > /root/traffic_check.sh
 #!/bin/bash
 # Configuration
@@ -32,40 +32,43 @@ DB="/etc/x-ui/x-ui.db"
 LOG="/var/log/traffic_check.log"
 
 while true; do
-    # 1. Find users who reached the limit (with 1KB buffer as requested)
-    # total > 0 ensures we only target limited accounts
-    # (up + down) >= total is the trigger logic
-    EXPIRED_USERS=$(sqlite3 "$DB" "SELECT id, email FROM client_traffics WHERE enable=1 AND total>0 AND (up+down) >= total;" 2>/dev/null)
+    # 1. Fetch expired users using a specific separator and timeout to prevent DB locks
+    # Query logic: enable=1 AND limit reached
+    QUERY="SELECT id, email FROM client_traffics WHERE enable=1 AND total>0 AND (up+down) >= total;"
+    EXPIRED_USERS=$(sqlite3 -batch -init /dev/null "$DB" "$QUERY" 2>/dev/null)
 
-    if [ -z "$EXPIRED_USERS" ]; then
-        # No users found, wait and continue
-        sleep 5
-        continue
+    if [ -n "$EXPIRED_USERS" ]; then
+        RESTART_REQUIRED=false
+        
+        # 2. Process each user found
+        while IFS='|' read -r USER_ID USER_EMAIL; do
+            if [ -z "$USER_ID" ]; then continue; fi
+
+            # Disable user in the database
+            sqlite3 "$DB" "UPDATE client_traffics SET enable=0 WHERE id=$USER_ID;"
+            
+            # Log the action
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] ACTION: Disabled $USER_EMAIL (ID: $USER_ID)" >> "$LOG"
+            RESTART_REQUIRED=true
+        done <<< "$EXPIRED_USERS"
+
+        # 3. Critical Fix: Execute restart using systemctl directly
+        if [ "$RESTART_REQUIRED" = true ]; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] SYSTEM: Executing Xray Restart..." >> "$LOG"
+            
+            # Kill any stuck xray process and restart the service
+            systemctl restart x-ui
+            
+            # Verify if restart was successful
+            if [ $? -eq 0 ]; then
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] SYSTEM: Xray Service Restarted Successfully" >> "$LOG"
+            else
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Failed to restart Xray service" >> "$LOG"
+            fi
+        fi
     fi
 
-    # 2. Process users and disable them
-    RESTART_NEEDED=false
-    while read -r line; do
-        [ -z "$line" ] && continue
-        
-        USER_ID=$(echo "$line" | cut -d'|' -f1)
-        USER_EMAIL=$(echo "$line" | cut -d'|' -f2)
-
-        # Update database to disable the user
-        sqlite3 "$DB" "UPDATE client_traffics SET enable=0 WHERE id=$USER_ID;"
-        
-        # Log the event
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] DISABLED: $USER_EMAIL (ID: $USER_ID)" >> "$LOG"
-        RESTART_NEEDED=true
-    done <<< "$EXPIRED_USERS"
-
-    # 3. Restart Xray core only once after processing all users
-    if [ "$RESTART_NEEDED" = true ]; then
-        x-ui restart > /dev/null 2>&1
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] SYSTEM: Xray Core Restarted" >> "$LOG"
-    fi
-
-    # Wait for 5 seconds before the next check to save CPU resources
+    # Check interval
     sleep 5
 done
 EOF
@@ -80,71 +83,44 @@ Description=3x-ui Traffic Limit Enforcer
 After=network.target x-ui.service
 
 [Service]
+Type=simple
 ExecStart=/bin/bash $SCRIPT_PATH
 Restart=always
-RestartSec=10
+RestartSec=5
+User=root
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-    # Reload systemd and start the service
     systemctl daemon-reload
     systemctl enable traffic-check > /dev/null 2>&1
     systemctl restart traffic-check > /dev/null 2>&1
     
-    echo "SUCCESS: Service is now running."
+    echo "SUCCESS: Service is active and monitoring."
     read -p "Press Enter to return to menu..."
 }
 
 uninstall_service() {
-    echo "Uninstalling and cleaning up..."
+    echo "Uninstalling..."
     systemctl stop traffic-check > /dev/null 2>&1
     systemctl disable traffic-check > /dev/null 2>&1
     rm -f $SERVICE_PATH $SCRIPT_PATH $LOG_FILE
     systemctl daemon-reload
-    echo "SUCCESS: Everything has been removed."
+    echo "SUCCESS: Cleanup complete."
     read -p "Press Enter to return to menu..."
 }
 
 # --- Main Loop ---
 while true; do
     show_menu
-    read -p "Select an option [1-5]: " choice
+    read -p "Select [1-5]: " choice
     case $choice in
         1) install_service ;;
         2) uninstall_service ;;
-        3) 
-            echo "Checking logs..."
-            # Fix: Added better error handling and pauses for log viewing
-            if [ ! -f "$LOG_FILE" ]; then
-                echo "---------------------------------------"
-                echo "ERROR: Log file does not exist yet."
-                echo "Please install the service first (Option 1)."
-                echo "---------------------------------------"
-                read -p "Press Enter to return to menu..."
-            elif [ ! -s "$LOG_FILE" ]; then
-                echo "---------------------------------------"
-                echo "NOTICE: Log file is empty."
-                echo "The service is running but no traffic limits reached yet."
-                echo "---------------------------------------"
-                read -p "Press Enter to return to menu..."
-            else
-                echo "Showing logs (Press Ctrl+C to stop):"
-                echo "---------------------------------------"
-                tail -f "$LOG_FILE"
-            fi
-            ;;
-        4) 
-            clear
-            systemctl status traffic-check
-            echo "---------------------------------------"
-            read -p "Press Enter to return to menu..."
-            ;;
+        3) tail -f "$LOG_FILE" ;;
+        4) systemctl status traffic-check ; read -p "Press Enter..." ;;
         5) exit 0 ;;
-        *) 
-            echo "Invalid option."
-            sleep 1
-            ;;
+        *) echo "Invalid option." ; sleep 1 ;;
     esac
 done
