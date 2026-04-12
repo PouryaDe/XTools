@@ -168,8 +168,9 @@ while true; do
     fi
 
     # ---- 3. Use a single transaction: SELECT + UPDATE ---------
-    #         .timeout makes sqlite3 wait up to 5 s if DB locked
-    TRANSACTION_SQL="
+    #  IMPORTANT: dot-commands like .timeout ONLY work via stdin (heredoc),
+    #  NOT when SQL is passed as a command-line argument to sqlite3.
+    CHANGES_RAW=$(sqlite3 "$DB" << SQLEOF 2>&1
 .timeout ${DB_TIMEOUT_MS}
 BEGIN IMMEDIATE;
 UPDATE client_traffics
@@ -179,9 +180,8 @@ UPDATE client_traffics
    AND (up + down) >= total;
 SELECT changes();
 COMMIT;
-"
-
-    CHANGES_RAW=$(sqlite3 "$DB" "$TRANSACTION_SQL" 2>&1)
+SQLEOF
+)
     TX_STATUS=$?
 
     if [[ $TX_STATUS -ne 0 ]]; then
@@ -220,10 +220,12 @@ COMMIT;
         # ---- 5. Restart x-ui and log the result ----------------
         ts_log "SYSTEM" "Triggering xray restart (${CHANGES} user(s) disabled)..."
 
-        if systemctl restart x-ui 2>&1; then
-            ts_log "SYSTEM" "xray restart: SUCCESS"
+        systemctl restart x-ui 2>&1
+        RESTART_STATUS=$?
+
+        if [[ $RESTART_STATUS -eq 0 ]]; then
+            ts_log "SYSTEM" "xray restart: SUCCESS (exit=0)"
         else
-            RESTART_STATUS=$?
             ts_log "ERROR" "xray restart FAILED (exit=${RESTART_STATUS}) — users were disabled but xray is still running with their old config"
         fi
 
