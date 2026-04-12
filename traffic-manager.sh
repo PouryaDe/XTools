@@ -17,6 +17,8 @@ SCRIPT_PATH="/root/traffic_check.sh"
 SERVICE_PATH="/etc/systemd/system/traffic-check.service"
 LOGROTATE_PATH="/etc/logrotate.d/traffic-check"
 LOG_FILE="/var/log/traffic_check.log"
+DISABLED_LOG="/var/log/traffic_disabled_users.log"
+RESTART_LOG="/var/log/traffic_xui_restarts.log"
 LIMIT_THRESHOLD_MB=10
 CHECK_INTERVAL=5
 DB_TIMEOUT_MS=5000
@@ -110,7 +112,9 @@ show_menu() {
     echo -e "  ${CYAN}${BOLD}║${NC}   ${YELLOW}${BOLD}[3]${NC} View Live Logs  (Ctrl+C to exit)      ${CYAN}${BOLD}║${NC}"
     echo -e "  ${CYAN}${BOLD}║${NC}   ${BLUE}${BOLD}[4]${NC} Check Service Status                  ${CYAN}${BOLD}║${NC}"
     echo -e "  ${CYAN}${BOLD}║${NC}   ${MAGENTA}${BOLD}[5]${NC} List Users Near Limit (<${LIMIT_THRESHOLD_MB}MB)         ${CYAN}${BOLD}║${NC}"
-    echo -e "  ${CYAN}${BOLD}║${NC}   ${DIM}[6] Exit${NC}                                  ${CYAN}${BOLD}║${NC}"
+    echo -e "  ${CYAN}${BOLD}║${NC}   ${RED}${BOLD}[6]${NC} View Disabled Users Log               ${CYAN}${BOLD}║${NC}"
+    echo -e "  ${CYAN}${BOLD}║${NC}   ${YELLOW}${BOLD}[7]${NC} View x-ui Restart Log                 ${CYAN}${BOLD}║${NC}"
+    echo -e "  ${CYAN}${BOLD}║${NC}   ${DIM}[8] Exit${NC}                                  ${CYAN}${BOLD}║${NC}"
     echo -e "  ${CYAN}${BOLD}║${NC}                                              ${CYAN}${BOLD}║${NC}"
     echo -e "  ${CYAN}${BOLD}╚══════════════════════════════════════════════╝${NC}"
     echo ""
@@ -204,12 +208,22 @@ install_service() {
 
 DB="/etc/x-ui/x-ui.db"
 LOG="/var/log/traffic_check.log"
+DISABLED_LOG="/var/log/traffic_disabled_users.log"
+RESTART_LOG="/var/log/traffic_xui_restarts.log"
 DB_TIMEOUT_MS=5000
 CHECK_INTERVAL=5
 
-# ---- Timestamped log ----------------------------------------
+# ---- Timestamped log (general + per-category) ---------------
 ts_log() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [${1}] ${2}" >> "$LOG"
+    local TYPE="$1"
+    local MSG="$2"
+    local ENTRY="[$(date '+%Y-%m-%d %H:%M:%S')] [${TYPE}] ${MSG}"
+    echo "$ENTRY" >> "$LOG"
+    # Mirror specific event types to their dedicated log files
+    case "$TYPE" in
+        DISABLED) echo "$ENTRY" >> "$DISABLED_LOG" ;;
+        RESTART)  echo "$ENTRY" >> "$RESTART_LOG"  ;;
+    esac
 }
 
 # ---- Safe sqlite3: -cmd so .timeout dot-command works -------
@@ -272,20 +286,23 @@ SQLEOF
                     ts_log "WARNING" "Skipped suspicious UID: ${UID}"
                     continue
                 fi
-                ts_log "ACTION" "DISABLED: ${UEMAIL} (ID=${UID})"
+                ts_log "ACTION"   "DISABLED: ${UEMAIL} (ID=${UID})"
+                ts_log "DISABLED" "User disabled — email=${UEMAIL} | id=${UID} | reason=traffic_exceeded"
             done <<< "$DISABLED_LIST"
         fi
 
         # ---- 5. Restart x-ui – capture exit code properly ---
         ts_log "SYSTEM" "Triggering xray restart (${CHANGES} user(s) disabled)..."
 
-        systemctl restart x-ui 2>&1
+        RESTART_OUTPUT=$(systemctl restart x-ui 2>&1)
         RESTART_STATUS=$?
 
         if [[ $RESTART_STATUS -eq 0 ]]; then
-            ts_log "SYSTEM" "xray restart: SUCCESS (exit=0)"
+            ts_log "SYSTEM"  "xray restart: SUCCESS (exit=0)"
+            ts_log "RESTART" "x-ui restarted successfully | trigger=traffic_exceeded | users_disabled=${CHANGES} | exit=0"
         else
-            ts_log "ERROR"  "xray restart FAILED (exit=${RESTART_STATUS}) — xray may still serve disabled users"
+            ts_log "ERROR"   "xray restart FAILED (exit=${RESTART_STATUS}) — xray may still serve disabled users"
+            ts_log "RESTART" "x-ui restart FAILED | trigger=traffic_exceeded | users_disabled=${CHANGES} | exit=${RESTART_STATUS} | output=${RESTART_OUTPUT}"
         fi
 
     else
@@ -320,9 +337,12 @@ WantedBy=multi-user.target
 EOF
     log_message "success" "Systemd service written: $SERVICE_PATH"
 
-    # ── Write logrotate (10 MB, keep 7 rotations) ─────────────
+    # ── Write logrotate (10 MB, keep 7 rotations, all 3 logs) ──
     cat << EOF > "$LOGROTATE_PATH"
-$LOG_FILE {
+$LOG_FILE
+$DISABLED_LOG
+$RESTART_LOG
+{
     size 10M
     rotate 7
     compress
@@ -333,7 +353,7 @@ $LOG_FILE {
     dateformat -%Y%m%d-%H%M%S
 }
 EOF
-    log_message "success" "Logrotate config written: $LOGROTATE_PATH (10 MB / 7 rotations)"
+    log_message "success" "Logrotate config written: $LOGROTATE_PATH (10 MB / 7 rotations, covers 3 log files)"
 
     # ── Enable and start ──────────────────────────────────────
     log_message "info" "Enabling and starting service..."
@@ -417,7 +437,95 @@ view_logs() {
         -e "s/\[WARNING\]/[${YELLOW}WARNING${NC}]/g" \
         -e "s/\[DB_READ\]/[${CYAN}DB_READ${NC}]/g" \
         -e "s/SUCCESS/${GREEN}${BOLD}SUCCESS${NC}/g" \
-        -e "s/FAILED/${RED}${BOLD}FAILED${NC}/g"
+        -e "s/FAILED/${RED}${BOLD}FAILED${NC}/g" \
+        -e "s/\[DISABLED\]/[${RED}${BOLD}DISABLED${NC}]/g" \
+        -e "s/\[RESTART\]/[${YELLOW}${BOLD}RESTART${NC}]/g"
+}
+
+# ============================================================
+# OPTION 6 – Disabled Users Log
+# ============================================================
+
+view_disabled_log() {
+    clear
+    echo ""
+    echo -e "  ${RED}${BOLD}╔══════════════════════════════════════════════╗${NC}"
+    echo -e "  ${RED}${BOLD}║${NC}   ${WHITE}${BOLD}Disabled Users Log${NC}                        ${RED}${BOLD}║${NC}"
+    echo -e "  ${RED}${BOLD}║${NC}   ${DIM}Users disabled due to traffic limit${NC}       ${RED}${BOLD}║${NC}"
+    echo -e "  ${RED}${BOLD}║${NC}   ${DIM}File: $DISABLED_LOG${NC}"
+    echo -e "  ${RED}${BOLD}╚══════════════════════════════════════════════╝${NC}"
+    echo ""
+
+    if [[ ! -f "$DISABLED_LOG" ]]; then
+        log_message "warning" "Log file not found: $DISABLED_LOG"
+        log_message "info"    "No users have been disabled yet, or the service hasn't run."
+        press_enter
+        return
+    fi
+
+    local LINE_COUNT
+    LINE_COUNT=$(wc -l < "$DISABLED_LOG")
+    echo -e "  ${DIM}Total records: ${LINE_COUNT}${NC}"
+    echo ""
+    divider
+    tail -n 100 "$DISABLED_LOG" | sed \
+        -e "s/\[DISABLED\]/[${RED}${BOLD}DISABLED${NC}]/g" \
+        -e "s/email=/${CYAN}email=${NC}/g" \
+        -e "s/id=/${DIM}id=${NC}/g"
+    divider
+    echo ""
+    echo -ne "  ${DIM}Press [f] for live tail, or Enter to return: ${NC}"
+    read -r OPT
+    if [[ "$OPT" == "f" || "$OPT" == "F" ]]; then
+        echo -e "  ${DIM}(Ctrl+C to stop)${NC}"
+        tail -f "$DISABLED_LOG" | sed \
+            -e "s/\[DISABLED\]/[${RED}${BOLD}DISABLED${NC}]/g" \
+            -e "s/email=/${CYAN}email=${NC}/g"
+    fi
+}
+
+# ============================================================
+# OPTION 7 – x-ui Restart Log
+# ============================================================
+
+view_restart_log() {
+    clear
+    echo ""
+    echo -e "  ${YELLOW}${BOLD}╔══════════════════════════════════════════════╗${NC}"
+    echo -e "  ${YELLOW}${BOLD}║${NC}   ${WHITE}${BOLD}x-ui Restart Log${NC}                          ${YELLOW}${BOLD}║${NC}"
+    echo -e "  ${YELLOW}${BOLD}║${NC}   ${DIM}All x-ui restarts triggered by enforcer${NC}   ${YELLOW}${BOLD}║${NC}"
+    echo -e "  ${YELLOW}${BOLD}║${NC}   ${DIM}File: $RESTART_LOG${NC}"
+    echo -e "  ${YELLOW}${BOLD}╚══════════════════════════════════════════════╝${NC}"
+    echo ""
+
+    if [[ ! -f "$RESTART_LOG" ]]; then
+        log_message "warning" "Log file not found: $RESTART_LOG"
+        log_message "info"    "No x-ui restarts have been logged yet."
+        press_enter
+        return
+    fi
+
+    local LINE_COUNT
+    LINE_COUNT=$(wc -l < "$RESTART_LOG")
+    echo -e "  ${DIM}Total records: ${LINE_COUNT}${NC}"
+    echo ""
+    divider
+    tail -n 100 "$RESTART_LOG" | sed \
+        -e "s/\[RESTART\]/[${YELLOW}${BOLD}RESTART${NC}]/g" \
+        -e "s/successfully/${GREEN}${BOLD}successfully${NC}/g" \
+        -e "s/FAILED/${RED}${BOLD}FAILED${NC}/g" \
+        -e "s/users_disabled=/${DIM}users_disabled=${NC}/g"
+    divider
+    echo ""
+    echo -ne "  ${DIM}Press [f] for live tail, or Enter to return: ${NC}"
+    read -r OPT
+    if [[ "$OPT" == "f" || "$OPT" == "F" ]]; then
+        echo -e "  ${DIM}(Ctrl+C to stop)${NC}"
+        tail -f "$RESTART_LOG" | sed \
+            -e "s/\[RESTART\]/[${YELLOW}${BOLD}RESTART${NC}]/g" \
+            -e "s/successfully/${GREEN}${BOLD}successfully${NC}/g" \
+            -e "s/FAILED/${RED}${BOLD}FAILED${NC}/g"
+    fi
 }
 
 # ============================================================
@@ -448,7 +556,9 @@ while true; do
         3) view_logs ;;
         4) check_status ;;
         5) list_near_limit ;;
-        6)
+        6) view_disabled_log ;;
+        7) view_restart_log ;;
+        8)
             echo ""
             log_message "info" "Exiting. Goodbye."
             echo ""
