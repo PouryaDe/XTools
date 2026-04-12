@@ -2,7 +2,7 @@
 
 # ============================================================
 #  3x-ui Advanced Traffic Manager
-#  Version: 2.0 – Production Ready
+#  Version: 3.0 – Production Ready
 # ============================================================
 
 # --- Guard: Must run as root ---
@@ -18,20 +18,23 @@ SERVICE_PATH="/etc/systemd/system/traffic-check.service"
 LOGROTATE_PATH="/etc/logrotate.d/traffic-check"
 LOG_FILE="/var/log/traffic_check.log"
 LIMIT_THRESHOLD_MB=10
-CHECK_INTERVAL=5        # seconds between DB checks
-DB_TIMEOUT_MS=5000      # ms sqlite3 waits if DB is locked
+CHECK_INTERVAL=5
+DB_TIMEOUT_MS=5000
 
-# --- Colors for Professional Logging ---
+# --- Colors ---
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 BLUE='\033[0;34m'
+MAGENTA='\033[0;35m'
+WHITE='\033[1;37m'
+DIM='\033[2m'
 BOLD='\033[1m'
 NC='\033[0m'
 
 # ============================================================
-# FUNCTIONS – Main Script
+# HELPER FUNCTIONS
 # ============================================================
 
 log_message() {
@@ -40,17 +43,17 @@ log_message() {
     local TIMESTAMP
     TIMESTAMP="$(date '+%Y-%m-%d %H:%M:%S')"
     case "$TYPE" in
-        info)    echo -e "${CYAN}[INFO]${NC}    ${TIMESTAMP} - ${MESSAGE}" ;;
-        success) echo -e "${GREEN}[SUCCESS]${NC} ${TIMESTAMP} - ${MESSAGE}" ;;
-        warning) echo -e "${YELLOW}[WARNING]${NC} ${TIMESTAMP} - ${MESSAGE}" ;;
-        error)   echo -e "${RED}[ERROR]${NC}   ${TIMESTAMP} - ${MESSAGE}" ;;
+        info)    echo -e "  ${CYAN}●${NC} ${DIM}${TIMESTAMP}${NC}  ${MESSAGE}" ;;
+        success) echo -e "  ${GREEN}✔${NC} ${DIM}${TIMESTAMP}${NC}  ${GREEN}${MESSAGE}${NC}" ;;
+        warning) echo -e "  ${YELLOW}⚠${NC} ${DIM}${TIMESTAMP}${NC}  ${YELLOW}${MESSAGE}${NC}" ;;
+        error)   echo -e "  ${RED}✖${NC} ${DIM}${TIMESTAMP}${NC}  ${RED}${MESSAGE}${NC}" ;;
     esac
 }
 
 check_db() {
     if [[ ! -f "$DB_PATH" ]]; then
         log_message "error" "Database not found: $DB_PATH"
-        log_message "error" "Make sure x-ui is installed and has been started at least once."
+        log_message "error" "Make sure x-ui is installed and started at least once."
         return 1
     fi
     if [[ ! -r "$DB_PATH" ]]; then
@@ -60,29 +63,74 @@ check_db() {
     return 0
 }
 
-show_menu() {
-    clear
-    echo -e "${CYAN}${BOLD}=======================================${NC}"
-    echo -e "${YELLOW}${BOLD}    3x-ui Advanced Traffic Manager${NC}"
-    echo -e "${CYAN}=======================================${NC}"
-    echo -e " ${BOLD}1)${NC} Install / Update Monitoring Service"
-    echo -e " ${BOLD}2)${NC} Uninstall / Remove All"
-    echo -e " ${BOLD}3)${NC} View Live Logs  (Ctrl+C to exit)"
-    echo -e " ${BOLD}4)${NC} Check Service Status"
-    echo -e " ${GREEN}${BOLD}5)${NC} List Users Near Limit (<${LIMIT_THRESHOLD_MB}MB Remaining)"
-    echo -e " ${BOLD}6)${NC} Exit"
-    echo -e "${CYAN}=======================================${NC}"
+# Safe sqlite3 query – uses -cmd so .timeout works correctly
+# Usage: safe_sqlite "$DB_PATH" "$SQL"
+safe_sqlite() {
+    local DB="$1"
+    local SQL="$2"
+    sqlite3 -cmd ".timeout ${DB_TIMEOUT_MS}" -separator '|' "$DB" "$SQL" 2>&1
 }
 
-# --- Option 5: List users near limit ---
+press_enter() {
+    echo ""
+    read -rp "  $(echo -e "${DIM}Press Enter to return to menu...${NC}")" _
+}
+
+divider() {
+    echo -e "${DIM}  ──────────────────────────────────────────────────────────────${NC}"
+}
+
+# ============================================================
+# MENU
+# ============================================================
+
+get_service_badge() {
+    if systemctl is-active --quiet traffic-check 2>/dev/null; then
+        echo -e "${GREEN}${BOLD}● ACTIVE${NC}"
+    else
+        echo -e "${RED}${BOLD}● STOPPED${NC}"
+    fi
+}
+
+show_menu() {
+    clear
+    local SVC_BADGE
+    SVC_BADGE=$(get_service_badge)
+
+    echo ""
+    echo -e "  ${CYAN}${BOLD}╔══════════════════════════════════════════════╗${NC}"
+    echo -e "  ${CYAN}${BOLD}║${NC}   ${WHITE}${BOLD}3x-ui  Advanced Traffic Manager${NC}         ${CYAN}${BOLD}║${NC}"
+    echo -e "  ${CYAN}${BOLD}║${NC}   ${DIM}v3.0 – Production Ready${NC}                  ${CYAN}${BOLD}║${NC}"
+    echo -e "  ${CYAN}${BOLD}╠══════════════════════════════════════════════╣${NC}"
+    echo -e "  ${CYAN}${BOLD}║${NC}   Service Status: ${SVC_BADGE}                    ${CYAN}${BOLD}║${NC}"
+    echo -e "  ${CYAN}${BOLD}╠══════════════════════════════════════════════╣${NC}"
+    echo -e "  ${CYAN}${BOLD}║${NC}                                              ${CYAN}${BOLD}║${NC}"
+    echo -e "  ${CYAN}${BOLD}║${NC}   ${GREEN}${BOLD}[1]${NC} Install / Update Monitoring Service   ${CYAN}${BOLD}║${NC}"
+    echo -e "  ${CYAN}${BOLD}║${NC}   ${RED}${BOLD}[2]${NC} Uninstall / Remove All                ${CYAN}${BOLD}║${NC}"
+    echo -e "  ${CYAN}${BOLD}║${NC}   ${YELLOW}${BOLD}[3]${NC} View Live Logs  (Ctrl+C to exit)      ${CYAN}${BOLD}║${NC}"
+    echo -e "  ${CYAN}${BOLD}║${NC}   ${BLUE}${BOLD}[4]${NC} Check Service Status                  ${CYAN}${BOLD}║${NC}"
+    echo -e "  ${CYAN}${BOLD}║${NC}   ${MAGENTA}${BOLD}[5]${NC} List Users Near Limit (<${LIMIT_THRESHOLD_MB}MB)         ${CYAN}${BOLD}║${NC}"
+    echo -e "  ${CYAN}${BOLD}║${NC}   ${DIM}[6] Exit${NC}                                  ${CYAN}${BOLD}║${NC}"
+    echo -e "  ${CYAN}${BOLD}║${NC}                                              ${CYAN}${BOLD}║${NC}"
+    echo -e "  ${CYAN}${BOLD}╚══════════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -ne "  ${WHITE}${BOLD}›${NC} Select option: "
+}
+
+# ============================================================
+# OPTION 5 – List users near limit
+# ============================================================
+
 list_near_limit() {
-    echo -e "\n${YELLOW}Checking users with less than ${LIMIT_THRESHOLD_MB} MB remaining...${NC}"
+    clear
+    echo ""
+    echo -e "  ${MAGENTA}${BOLD}╔══════════════════════════════════════════════╗${NC}"
+    echo -e "  ${MAGENTA}${BOLD}║${NC}   ${WHITE}${BOLD}Users Near Traffic Limit${NC}                  ${MAGENTA}${BOLD}║${NC}"
+    echo -e "  ${MAGENTA}${BOLD}║${NC}   ${DIM}Threshold: < ${LIMIT_THRESHOLD_MB} MB remaining${NC}               ${MAGENTA}${BOLD}║${NC}"
+    echo -e "  ${MAGENTA}${BOLD}╚══════════════════════════════════════════════╝${NC}"
+    echo ""
 
-    check_db || { read -p "Press Enter to return..."; return; }
-
-    echo "----------------------------------------------------------------------"
-    printf "%-30s | %-15s | %-15s\n" "Email / Name" "Total Limit" "Remaining"
-    echo "----------------------------------------------------------------------"
+    check_db || { press_enter; return; }
 
     local QUERY
     QUERY="SELECT email,
@@ -95,41 +143,63 @@ list_near_limit() {
              AND (total - (up+down)) < (${LIMIT_THRESHOLD_MB} * 1024 * 1024)
            ORDER BY (total - (up+down)) ASC;"
 
+    # FIX: use -cmd flag (NOT as positional arg) so .timeout works correctly
     local RESULTS
-    RESULTS=$(sqlite3 -separator '|' ".timeout ${DB_TIMEOUT_MS}" "$DB_PATH" "$QUERY" 2>&1)
+    RESULTS=$(sqlite3 -cmd ".timeout ${DB_TIMEOUT_MS}" -separator '|' "$DB_PATH" "$QUERY" 2>&1)
     local EXIT_CODE=$?
 
     if [[ $EXIT_CODE -ne 0 ]]; then
         log_message "error" "sqlite3 query failed: $RESULTS"
-        read -p "Press Enter to return..."
+        press_enter
         return
     fi
 
+    divider
+    printf "  ${BOLD}%-32s${NC} ${DIM}|${NC} ${BOLD}%-12s${NC} ${DIM}|${NC} ${BOLD}%-12s${NC}\n" \
+           "Email / Username" "Total Limit" "Remaining"
+    divider
+
     if [[ -z "$RESULTS" ]]; then
-        echo -e "${GREEN}No users are near the limit.${NC}"
+        echo ""
+        echo -e "  ${GREEN}${BOLD}✔  No users are near the limit right now.${NC}"
+        echo ""
     else
+        local COUNT=0
         while IFS='|' read -r EMAIL TOTAL REMAINING; do
-            printf "${CYAN}%-30s${NC} | %-15s | ${RED}%-15s${NC}\n" \
+            COUNT=$((COUNT + 1))
+            printf "  ${CYAN}%-32s${NC} ${DIM}|${NC} %-12s ${DIM}|${NC} ${RED}${BOLD}%-12s${NC}\n" \
                    "$EMAIL" "$TOTAL" "$REMAINING"
         done <<< "$RESULTS"
+        echo ""
+        echo -e "  ${YELLOW}⚠  Total: ${BOLD}${COUNT}${NC}${YELLOW} user(s) near the limit.${NC}"
     fi
 
-    echo "----------------------------------------------------------------------"
-    read -p "Press Enter to return..."
+    divider
+    press_enter
 }
 
-# --- Option 1: Install / Update ---
+# ============================================================
+# OPTION 1 – Install / Update
+# ============================================================
+
 install_service() {
-    log_message "info" "Installing Traffic Controller..."
+    clear
+    echo ""
+    echo -e "  ${GREEN}${BOLD}╔══════════════════════════════════════════════╗${NC}"
+    echo -e "  ${GREEN}${BOLD}║${NC}   ${WHITE}${BOLD}Installing Monitoring Service${NC}             ${GREEN}${BOLD}║${NC}"
+    echo -e "  ${GREEN}${BOLD}╚══════════════════════════════════════════════╝${NC}"
+    echo ""
 
-    check_db || { read -p "Press Enter to return..."; return; }
+    check_db || { press_enter; return; }
 
-    # ── Write the monitoring script ──────────────────────────────────
+    log_message "info" "Writing monitor script → $SCRIPT_PATH"
+
+    # ── Write the monitoring script ──────────────────────────────
     cat << 'INNER_EOF' > "$SCRIPT_PATH"
 #!/bin/bash
 # ============================================================
-#  traffic_check.sh – Automated Traffic Enforcer
-#  Managed by: traffic-manager.sh (DO NOT EDIT MANUALLY)
+#  traffic_check.sh  –  Automated Traffic Enforcer
+#  Managed by traffic-manager.sh  (DO NOT EDIT MANUALLY)
 # ============================================================
 
 DB="/etc/x-ui/x-ui.db"
@@ -137,39 +207,32 @@ LOG="/var/log/traffic_check.log"
 DB_TIMEOUT_MS=5000
 CHECK_INTERVAL=5
 
-# ---- Helper: timestamped log --------------------------------
+# ---- Timestamped log ----------------------------------------
 ts_log() {
-    local LEVEL="$1"
-    local MSG="$2"
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [${LEVEL}] ${MSG}" >> "$LOG"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [${1}] ${2}" >> "$LOG"
 }
 
-# ---- Helper: safe sqlite3 with timeout ----------------------
+# ---- Safe sqlite3: -cmd so .timeout dot-command works -------
 run_sqlite() {
-    local SQL="$1"
-    sqlite3 \
-        -cmd ".timeout ${DB_TIMEOUT_MS}" \
-        "$DB" \
-        "$SQL" 2>&1
+    sqlite3 -cmd ".timeout ${DB_TIMEOUT_MS}" -separator '|' "$DB" "$1" 2>&1
 }
 
-ts_log "SYSTEM" "Traffic enforcer started (PID=$$)"
+ts_log "SYSTEM" "Traffic enforcer started (PID=$$, interval=${CHECK_INTERVAL}s)"
 
 while true; do
 
-    # ---- 1. Log every DB read with timestamp ------------------
+    # ---- 1. Log every DB read cycle --------------------------
     ts_log "DB_READ" "Scanning client_traffics for exceeded limits..."
 
-    # ---- 2. Verify DB is accessible ---------------------------
+    # ---- 2. Verify DB is accessible --------------------------
     if [[ ! -f "$DB" ]]; then
         ts_log "ERROR" "Database not found: $DB — skipping cycle"
         sleep "$CHECK_INTERVAL"
         continue
     fi
 
-    # ---- 3. Use a single transaction: SELECT + UPDATE ---------
-    #  IMPORTANT: dot-commands like .timeout ONLY work via stdin (heredoc),
-    #  NOT when SQL is passed as a command-line argument to sqlite3.
+    # ---- 3. Transaction: UPDATE + changes() in one pass ------
+    #  heredoc → stdin → dot-commands (.timeout) work correctly
     CHANGES_RAW=$(sqlite3 "$DB" << SQLEOF 2>&1
 .timeout ${DB_TIMEOUT_MS}
 BEGIN IMMEDIATE;
@@ -185,39 +248,35 @@ SQLEOF
     TX_STATUS=$?
 
     if [[ $TX_STATUS -ne 0 ]]; then
-        ts_log "ERROR" "Transaction failed (exit=$TX_STATUS): $CHANGES_RAW"
+        ts_log "ERROR" "Transaction failed (exit=${TX_STATUS}): ${CHANGES_RAW}"
         sleep "$CHECK_INTERVAL"
         continue
     fi
 
-    # changes() returns number of rows updated
+    # Last line of output is the changes() count
     CHANGES=$(echo "$CHANGES_RAW" | tail -n1 | tr -d '[:space:]')
 
     if [[ "$CHANGES" =~ ^[0-9]+$ ]] && [[ "$CHANGES" -gt 0 ]]; then
 
-        ts_log "DB_READ" "Rows disabled in this cycle: $CHANGES"
+        ts_log "DB_READ" "Rows disabled in this cycle: ${CHANGES}"
 
-        # ---- 4. Fetch details of newly-disabled users for the log --
+        # ---- 4. Log details of newly-disabled users ----------
         DISABLED_LIST=$(run_sqlite \
             "SELECT id, email FROM client_traffics
-              WHERE enable=0
-                AND total > 0
-                AND (up + down) >= total
-              LIMIT 50;")
+              WHERE enable=0 AND total>0 AND (up+down)>=total LIMIT 50;")
 
-        if [[ $? -eq 0 && -n "$DISABLED_LIST" ]]; then
+        if [[ -n "$DISABLED_LIST" ]]; then
             while IFS='|' read -r UID UEMAIL; do
                 [[ -z "$UID" ]] && continue
-                # Validate that UID is purely numeric (prevent log injection)
                 if ! [[ "$UID" =~ ^[0-9]+$ ]]; then
-                    ts_log "WARNING" "Skipped suspicious UID value: $UID"
+                    ts_log "WARNING" "Skipped suspicious UID: ${UID}"
                     continue
                 fi
-                ts_log "ACTION" "DISABLED user: ${UEMAIL} (ID=${UID})"
+                ts_log "ACTION" "DISABLED: ${UEMAIL} (ID=${UID})"
             done <<< "$DISABLED_LIST"
         fi
 
-        # ---- 5. Restart x-ui and log the result ----------------
+        # ---- 5. Restart x-ui – capture exit code properly ---
         ts_log "SYSTEM" "Triggering xray restart (${CHANGES} user(s) disabled)..."
 
         systemctl restart x-ui 2>&1
@@ -226,11 +285,11 @@ SQLEOF
         if [[ $RESTART_STATUS -eq 0 ]]; then
             ts_log "SYSTEM" "xray restart: SUCCESS (exit=0)"
         else
-            ts_log "ERROR" "xray restart FAILED (exit=${RESTART_STATUS}) — users were disabled but xray is still running with their old config"
+            ts_log "ERROR"  "xray restart FAILED (exit=${RESTART_STATUS}) — xray may still serve disabled users"
         fi
 
     else
-        ts_log "DB_READ" "No users exceeded limit in this cycle."
+        ts_log "DB_READ" "No users exceeded limit. (cycle OK)"
     fi
 
     sleep "$CHECK_INTERVAL"
@@ -239,9 +298,9 @@ done
 INNER_EOF
 
     chmod +x "$SCRIPT_PATH"
-    log_message "success" "Monitor script written to: $SCRIPT_PATH"
+    log_message "success" "Monitor script written: $SCRIPT_PATH"
 
-    # ── Write the systemd service ─────────────────────────────────────
+    # ── Write systemd service ─────────────────────────────────
     cat << EOF > "$SERVICE_PATH"
 [Unit]
 Description=3x-ui Traffic Limit Enforcer
@@ -259,10 +318,9 @@ StandardError=journal
 [Install]
 WantedBy=multi-user.target
 EOF
+    log_message "success" "Systemd service written: $SERVICE_PATH"
 
-    log_message "success" "Systemd service written to: $SERVICE_PATH"
-
-    # ── Write logrotate config (10 MB, keep 7 rotations) ─────────────
+    # ── Write logrotate (10 MB, keep 7 rotations) ─────────────
     cat << EOF > "$LOGROTATE_PATH"
 $LOG_FILE {
     size 10M
@@ -275,57 +333,107 @@ $LOG_FILE {
     dateformat -%Y%m%d-%H%M%S
 }
 EOF
+    log_message "success" "Logrotate config written: $LOGROTATE_PATH (10 MB / 7 rotations)"
 
-    log_message "success" "Logrotate config written to: $LOGROTATE_PATH"
-
-    # ── Enable and start ─────────────────────────────────────────────
+    # ── Enable and start ──────────────────────────────────────
+    log_message "info" "Enabling and starting service..."
     systemctl daemon-reload
     systemctl enable traffic-check > /dev/null 2>&1
     systemctl restart traffic-check > /dev/null 2>&1
 
+    sleep 1
     if systemctl is-active --quiet traffic-check; then
         log_message "success" "Service traffic-check is ACTIVE and running."
     else
-        log_message "error" "Service failed to start. Check: journalctl -u traffic-check -n 30"
+        log_message "error" "Service failed to start. Run: journalctl -u traffic-check -n 30"
     fi
 
-    read -p "Press Enter to return..."
+    press_enter
 }
 
-# --- Option 2: Uninstall ---
-uninstall_service() {
-    log_message "warning" "Uninstalling traffic-check service..."
+# ============================================================
+# OPTION 2 – Uninstall
+# ============================================================
 
-    systemctl stop traffic-check    2>/dev/null
+uninstall_service() {
+    clear
+    echo ""
+    echo -e "  ${RED}${BOLD}╔══════════════════════════════════════════════╗${NC}"
+    echo -e "  ${RED}${BOLD}║${NC}   ${WHITE}${BOLD}Uninstall Monitoring Service${NC}              ${RED}${BOLD}║${NC}"
+    echo -e "  ${RED}${BOLD}╚══════════════════════════════════════════════╝${NC}"
+    echo ""
+
+    echo -ne "  ${YELLOW}⚠  Are you sure you want to remove everything? [y/N]: ${NC}"
+    read -r CONFIRM
+    if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
+        log_message "info" "Uninstall cancelled."
+        press_enter
+        return
+    fi
+
+    echo ""
+    log_message "info" "Stopping service..."
+    systemctl stop    traffic-check 2>/dev/null
+    log_message "info" "Disabling service..."
     systemctl disable traffic-check 2>/dev/null
+
+    log_message "info" "Removing files..."
     rm -f "$SERVICE_PATH" "$SCRIPT_PATH" "$LOGROTATE_PATH"
+
+    log_message "info" "Reloading systemd daemon..."
     systemctl daemon-reload
 
     log_message "success" "Service fully removed."
     log_message "info"    "Log file kept at: $LOG_FILE (remove manually if needed)"
-    read -p "Press Enter to return..."
+    press_enter
 }
 
-# --- Option 3: Live logs with correct color highlighting ---
+# ============================================================
+# OPTION 3 – Live logs
+# ============================================================
+
 view_logs() {
+    clear
+    echo ""
+    echo -e "  ${YELLOW}${BOLD}╔══════════════════════════════════════════════╗${NC}"
+    echo -e "  ${YELLOW}${BOLD}║${NC}   ${WHITE}${BOLD}Live Log Viewer${NC}                           ${YELLOW}${BOLD}║${NC}"
+    echo -e "  ${YELLOW}${BOLD}║${NC}   ${DIM}Press Ctrl+C to return to menu${NC}            ${YELLOW}${BOLD}║${NC}"
+    echo -e "  ${YELLOW}${BOLD}╚══════════════════════════════════════════════╝${NC}"
+    echo ""
+
     if [[ ! -f "$LOG_FILE" ]]; then
-        log_message "warning" "Log file not found yet: $LOG_FILE"
-        log_message "info"    "The service may not have written any logs yet."
-        read -p "Press Enter to return..."
+        log_message "warning" "Log file not found: $LOG_FILE"
+        log_message "info"    "The service may not have run yet."
+        press_enter
         return
     fi
 
-    echo -e "${YELLOW}Reading Live Logs... (Press Ctrl+C to exit)${NC}\n"
-
-    # Use double-quotes so shell expands color variables before passing to sed
+    # Double-quoted sed so $COLOR vars expand correctly
     tail -f "$LOG_FILE" | sed \
         -e "s/\[ACTION\]/[${GREEN}ACTION${NC}]/g" \
-        -e "s/DISABLED/${RED}DISABLED${NC}/g" \
+        -e "s/DISABLED/${RED}${BOLD}DISABLED${NC}/g" \
         -e "s/\[SYSTEM\]/[${YELLOW}SYSTEM${NC}]/g" \
         -e "s/\[ERROR\]/[${RED}ERROR${NC}]/g" \
         -e "s/\[WARNING\]/[${YELLOW}WARNING${NC}]/g" \
         -e "s/\[DB_READ\]/[${CYAN}DB_READ${NC}]/g" \
-        -e "s/SUCCESS/${GREEN}SUCCESS${NC}/g"
+        -e "s/SUCCESS/${GREEN}${BOLD}SUCCESS${NC}/g" \
+        -e "s/FAILED/${RED}${BOLD}FAILED${NC}/g"
+}
+
+# ============================================================
+# OPTION 4 – Service Status
+# ============================================================
+
+check_status() {
+    clear
+    echo ""
+    echo -e "  ${BLUE}${BOLD}╔══════════════════════════════════════════════╗${NC}"
+    echo -e "  ${BLUE}${BOLD}║${NC}   ${WHITE}${BOLD}Service Status${NC}                            ${BLUE}${BOLD}║${NC}"
+    echo -e "  ${BLUE}${BOLD}╚══════════════════════════════════════════════╝${NC}"
+    echo ""
+    systemctl status traffic-check --no-pager -l
+    echo ""
+    press_enter
 }
 
 # ============================================================
@@ -333,14 +441,23 @@ view_logs() {
 # ============================================================
 while true; do
     show_menu
-    read -rp "Select option: " choice
+    read -r choice
     case "$choice" in
         1) install_service ;;
         2) uninstall_service ;;
         3) view_logs ;;
-        4) systemctl status traffic-check ; read -p "Press Enter..." ;;
+        4) check_status ;;
         5) list_near_limit ;;
-        6) log_message "info" "Exiting. Goodbye." ; exit 0 ;;
-        *) log_message "error" "Invalid option: '$choice'" ; sleep 1 ;;
+        6)
+            echo ""
+            log_message "info" "Exiting. Goodbye."
+            echo ""
+            exit 0
+            ;;
+        *) 
+            echo ""
+            log_message "error" "Invalid option: '${choice}'"
+            sleep 1
+            ;;
     esac
 done
