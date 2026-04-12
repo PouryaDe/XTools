@@ -291,18 +291,36 @@ SQLEOF
             done <<< "$DISABLED_LIST"
         fi
 
-        # ---- 5. Restart x-ui – capture exit code properly ---
-        ts_log "SYSTEM" "Triggering xray restart (${CHANGES} user(s) disabled)..."
+        # ---- 5. Restart x-ui ----------------------------------------
+        # IMPORTANT: systemctl restart called from inside a systemd service
+        # causes a D-Bus deadlock (cgroup loop). --no-block fires the restart
+        # asynchronously so this script doesn't hang.
+        ts_log "SYSTEM" "Triggering x-ui restart (${CHANGES} user(s) disabled)..."
 
-        RESTART_OUTPUT=$(systemctl restart x-ui 2>&1)
+        /bin/systemctl --no-block restart x-ui
         RESTART_STATUS=$?
 
-        if [[ $RESTART_STATUS -eq 0 ]]; then
-            ts_log "SYSTEM"  "xray restart: SUCCESS (exit=0)"
-            ts_log "RESTART" "x-ui restarted successfully | trigger=traffic_exceeded | users_disabled=${CHANGES} | exit=0"
+        if [[ $RESTART_STATUS -ne 0 ]]; then
+            ts_log "ERROR"   "x-ui restart dispatch FAILED (exit=${RESTART_STATUS})"
+            ts_log "RESTART" "x-ui restart FAILED | trigger=traffic_exceeded | users_disabled=${CHANGES} | exit=${RESTART_STATUS}"
         else
-            ts_log "ERROR"   "xray restart FAILED (exit=${RESTART_STATUS}) — xray may still serve disabled users"
-            ts_log "RESTART" "x-ui restart FAILED | trigger=traffic_exceeded | users_disabled=${CHANGES} | exit=${RESTART_STATUS} | output=${RESTART_OUTPUT}"
+            # Poll up to 10 seconds for x-ui to come back active
+            ACTIVE=0
+            for i in 1 2 3 4 5; do
+                sleep 2
+                if systemctl is-active x-ui 2>/dev/null | grep -q "^active$"; then
+                    ACTIVE=1
+                    break
+                fi
+            done
+
+            if [[ $ACTIVE -eq 1 ]]; then
+                ts_log "SYSTEM"  "x-ui restart: SUCCESS — service is active"
+                ts_log "RESTART" "x-ui restarted successfully | trigger=traffic_exceeded | users_disabled=${CHANGES}"
+            else
+                ts_log "ERROR"   "x-ui restart dispatched but service did not become active within 10s"
+                ts_log "RESTART" "x-ui restart timeout | trigger=traffic_exceeded | users_disabled=${CHANGES}"
+            fi
         fi
 
     else
