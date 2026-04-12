@@ -19,7 +19,7 @@ LOGROTATE_PATH="/etc/logrotate.d/traffic-check"
 LOG_FILE="/var/log/traffic_check.log"
 DISABLED_LOG="/var/log/traffic_disabled_users.log"
 RESTART_LOG="/var/log/traffic_xui_restarts.log"
-LIMIT_THRESHOLD_MB=10
+LIMIT_THRESHOLD_MB=50
 CHECK_INTERVAL=5
 DB_TIMEOUT_MS=5000
 
