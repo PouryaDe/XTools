@@ -3,6 +3,8 @@
 # ==========================================
 # CRITICAL: Define PATH for Cron Environment
 # ==========================================
+# Cron runs with a minimal environment. We must explicitly define the PATH
+# so it can locate network binaries like 'ip', 'tc', 'ss', and 'awk'.
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 # Ensure root privileges before proceeding
@@ -23,6 +25,7 @@ CONFIG_FILE="/etc/wg_shaper_config"
 LOG_FILE="/var/log/wg_shaper.log"
 SCRIPT_PATH=$(readlink -f "$0")
 
+# Setup the Cron command to redirect output to our log file instead of /dev/null
 CRON_CMD="* * * * * $SCRIPT_PATH sync >> $LOG_FILE 2>&1"
 
 # ==========================================
@@ -50,10 +53,12 @@ clean_existing_rules() {
 }
 
 get_active_udp_ports() {
+    # Dynamically find open/listening UDP ports within the specified range
     ss -ulnH | awk '{print $4}' | awk -F":" '{print $NF}' | grep -E '^[0-9]+$' | awk -v min="$PORT_MIN" -v max="$PORT_MAX" '$1 >= min && $1 <= max' | sort -n -u
 }
 
 get_shaped_ports() {
+    # Extract existing hex class IDs from tc, convert back to decimal, and list them
     if tc class show dev "$INTERFACE" 2>/dev/null | grep -q "htb"; then
         tc class show dev "$INTERFACE" | grep -oP 'class htb 1:\K[0-9a-f]+' | grep -v '9999' | while read hex; do
             printf "%d\n" "0x$hex"
@@ -67,17 +72,18 @@ apply_port_rules() {
     local UL_LIMIT=$3
     local HEX_PORT=$(printf "%x" "$PORT")
     
-    # Egress (Download)
+    # Egress (Download) - Applied on physical interface
     tc class add dev "$INTERFACE" parent 1: classid 1:"$HEX_PORT" htb rate "$DL_LIMIT" ceil "$DL_LIMIT" 2>>"$LOG_FILE"
     tc qdisc add dev "$INTERFACE" parent 1:"$HEX_PORT" handle "$HEX_PORT": fq_codel limit 1024 2>>"$LOG_FILE"
     tc filter add dev "$INTERFACE" protocol ip parent 1: prio 1 flower ip_proto udp src_port "$PORT" flowid 1:"$HEX_PORT" 2>>"$LOG_FILE"
-    tc filter add dev "$INTERFACE" protocol ipv6 parent 1: prio 2 flower ip_proto udp src_port "$PORT" flowid 1:"$HEX_PORT" 2>>"$LOG_FILE"
 
-    # Ingress (Upload)
+    # Ingress (Upload) - Applied on virtual IFB interface
     tc class add dev "$IFB_DEV" parent 1: classid 1:"$HEX_PORT" htb rate "$UL_LIMIT" ceil "$UL_LIMIT" 2>>"$LOG_FILE"
     tc qdisc add dev "$IFB_DEV" parent 1:"$HEX_PORT" handle "$HEX_PORT": fq_codel limit 1024 2>>"$LOG_FILE"
     tc filter add dev "$IFB_DEV" protocol ip parent 1: prio 1 flower ip_proto udp dst_port "$PORT" flowid 1:"$HEX_PORT" 2>>"$LOG_FILE"
-    tc filter add dev "$IFB_DEV" protocol ipv6 parent 1: prio 2 flower ip_proto udp dst_port "$PORT" flowid 1:"$HEX_PORT" 2>>"$LOG_FILE"
+    
+    # Tiny pause to prevent kernel socket buffer overflow when executing hundreds of rules
+    sleep 0.005
 }
 
 # ==========================================
@@ -85,26 +91,27 @@ apply_port_rules() {
 # ==========================================
 
 sync_limits() {
+    # This function is called by the cron job every minute
     if [ ! -f "$CONFIG_FILE" ]; then
         exit 0
     fi
     
-    # Load configuration
     source "$CONFIG_FILE"
     
-    # Override INTERFACE from config if it exists to preserve correctness in cron
+    # Enforce original interface discovered during activation
     if [ ! -z "$CONF_INTERFACE" ]; then
         INTERFACE="$CONF_INTERFACE"
     fi
     
+    # Ensure INTERFACE is detected even in cron (Fallback check)
     if [ -z "$INTERFACE" ]; then
         echo "[$(date)] ERROR: Network interface could not be detected." >> "$LOG_FILE"
         exit 1
     fi
 
-    # Check if root qdisc actually exists, if not, try to recover it
+    # Auto-recovery: If root qdiscs disappeared, re-initialize them safely
     if ! tc qdisc show dev "$INTERFACE" | grep -q "htb"; then
-        echo "[$(date)] WARNING: Root Qdisc missing on $INTERFACE. Re-initializing..." >> "$LOG_FILE"
+        echo "[$(date)] WARNING: Root Qdisc missing on $INTERFACE. Recovering structure..." >> "$LOG_FILE"
         tc qdisc add dev "$INTERFACE" root handle 1: htb default 9999 2>>"$LOG_FILE"
         tc qdisc add dev "$IFB_DEV" root handle 1: htb default 9999 2>>"$LOG_FILE"
     fi
@@ -113,6 +120,7 @@ sync_limits() {
     SHAPED_PORTS=$(get_shaped_ports)
     
     for PORT in $ACTIVE_PORTS; do
+        # Check if the port is already shaped
         if ! echo "$SHAPED_PORTS" | grep -qw "$PORT"; then
             echo "[$(date)] Auto-Sync: Applying limits to newly detected port -> $PORT" >> "$LOG_FILE"
             apply_port_rules "$PORT" "$CONF_DL" "$CONF_UL"
@@ -135,7 +143,7 @@ enable_limit() {
     DL_LIMIT="${DL_INPUT}mbit"
     UL_LIMIT="${UL_INPUT}mbit"
 
-    # Save config for cron job (including the dynamic interface name)
+    # Save config for cron job including discovered interface
     echo "CONF_INTERFACE=\"$INTERFACE\"" > "$CONFIG_FILE"
     echo "CONF_DL=\"$DL_LIMIT\"" >> "$CONFIG_FILE"
     echo "CONF_UL=\"$UL_LIMIT\"" >> "$CONFIG_FILE"
@@ -144,21 +152,27 @@ enable_limit() {
     clean_existing_rules
     ethtool -K "$INTERFACE" tso off gso off gro off >/dev/null 2>&1
     
-    # Load IFB module and wait for initialization
+    # Load IFB virtual module and wait for core registration
     modprobe ifb numifbs=1 >/dev/null 2>&1
     sleep 1 
     ip link set dev "$IFB_DEV" up >/dev/null 2>&1
+    
+    # Crucial: Bump the virtual transmission queue length to absorb rapid spikes of tc filters
+    ip link set dev "$IFB_DEV" txqueuelen 10000 >/dev/null 2>&1
 
-    # Setup Root Qdiscs
+    # Setup Root Qdiscs and redirect ingress to IFB virtual interface
     tc qdisc add dev "$INTERFACE" root handle 1: htb default 9999 2>>"$LOG_FILE"
     tc qdisc add dev "$IFB_DEV" root handle 1: htb default 9999 2>>"$LOG_FILE"
     tc qdisc add dev "$INTERFACE" handle ffff: ingress 2>>"$LOG_FILE"
     tc filter add dev "$INTERFACE" parent ffff: protocol all u32 match u32 0 0 action mirred egress redirect dev "$IFB_DEV" 2>>"$LOG_FILE"
 
+    # Initialize Log file
     echo "[$(date)] Service Started. Limits set to DL: $DL_LIMIT, UL: $UL_LIMIT" > "$LOG_FILE"
 
+    # Run the sync function to apply rules to currently active ports immediately
     sync_limits
     
+    # Manage Cron Job safely
     (crontab -l 2>/dev/null | grep -v -F "$SCRIPT_PATH sync"; echo "$CRON_CMD") | crontab -
 
     echo -e "${C_GREEN}[+] Limits applied and Auto-Sync Cron Job is active!${C_RESET}"
@@ -197,6 +211,7 @@ show_status() {
         echo -e "${C_YELLOW}Configured Limits:${C_RESET} DL: $CONF_DL / UL: $CONF_UL"
     fi
 
+    # Check active cron
     if crontab -l 2>/dev/null | grep -q -F "$SCRIPT_PATH sync"; then
         echo -e "${C_YELLOW}Auto-Sync Cron:${C_RESET}    ${C_GREEN}ACTIVE (Every 1 Min)${C_RESET}"
     else
