@@ -1,36 +1,30 @@
 #!/bin/bash
 
 # ==========================================
-# CRITICAL: Define PATH for Cron Environment
+# ZERO-CPU HASHLIMIT TRAFFIC SHAPER
+# Architecture:
+# 1. Abandons heavy TC (Traffic Control) trees which cause high CPU ksoftirqd spikes.
+# 2. Uses O(1) Kernel Netfilter Hashlimit module.
+# 3. No background Cron jobs or state files required.
+# 4. Automatically tracks and limits active ports on the fly.
 # ==========================================
-# Cron runs with a minimal environment. We must explicitly define the PATH
-# so it can locate network binaries like 'ip', 'tc', 'ss', and 'awk'.
+
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-# Ensure root privileges before proceeding
 if [ "$EUID" -ne 0 ]; then
     echo -e "\e[31m[-] Error: Please run as root.\e[0m"
     exit 1
 fi
 
 # ==========================================
-# Configuration Variables
+# Configuration
 # ==========================================
-INTERFACE=$(ip -4 route ls | grep default | grep -Po '(?<=dev )(\S+)' | head -1)
-IFB_DEV="ifb0"
 PORT_MIN=10000
 PORT_MAX=50000
 
-CONFIG_FILE="/etc/wg_shaper_config"
-LOG_FILE="/var/log/wg_shaper.log"
-SCRIPT_PATH=$(readlink -f "$0")
+CONFIG_FILE="/etc/wg_hashlimit_config"
 
-# Setup the Cron command to redirect output to our log file instead of /dev/null
-CRON_CMD="* * * * * $SCRIPT_PATH sync >> $LOG_FILE 2>&1"
-
-# ==========================================
 # UI Colors
-# ==========================================
 C_CYAN='\e[36m'
 C_GREEN='\e[32m'
 C_YELLOW='\e[33m'
@@ -42,157 +36,98 @@ C_RESET='\e[0m'
 # Core Functions
 # ==========================================
 
-clean_existing_rules() {
-    # Delete root and ingress qdiscs safely
+clean_old_system() {
+    # 1. Remove old TC rules if any exist
+    INTERFACE=$(ip -4 route ls | grep default | grep -Po '(?<=dev )(\S+)' | head -1)
     tc qdisc del dev "$INTERFACE" root >/dev/null 2>&1
     tc qdisc del dev "$INTERFACE" ingress >/dev/null 2>&1
-    if ip link show "$IFB_DEV" >/dev/null 2>&1; then
-        tc qdisc del dev "$IFB_DEV" root >/dev/null 2>&1
-        ip link set dev "$IFB_DEV" down >/dev/null 2>&1
-    fi
-}
-
-get_active_udp_ports() {
-    # Dynamically find open/listening UDP ports within the specified range
-    ss -ulnH | awk '{print $4}' | awk -F":" '{print $NF}' | grep -E '^[0-9]+$' | awk -v min="$PORT_MIN" -v max="$PORT_MAX" '$1 >= min && $1 <= max' | sort -n -u
-}
-
-get_shaped_ports() {
-    # Extract existing hex class IDs from tc, convert back to decimal, and list them
-    if tc class show dev "$INTERFACE" 2>/dev/null | grep -q "htb"; then
-        tc class show dev "$INTERFACE" | grep -oP 'class htb 1:\K[0-9a-f]+' | grep -v '9999' | while read hex; do
-            printf "%d\n" "0x$hex"
-        done | sort -n -u
-    fi
-}
-
-apply_port_rules() {
-    local PORT=$1
-    local DL_LIMIT=$2
-    local UL_LIMIT=$3
-    local HEX_PORT=$(printf "%x" "$PORT")
-    
-    # Egress (Download) - Applied on physical interface
-    tc class add dev "$INTERFACE" parent 1: classid 1:"$HEX_PORT" htb rate "$DL_LIMIT" ceil "$DL_LIMIT" 2>>"$LOG_FILE"
-    tc qdisc add dev "$INTERFACE" parent 1:"$HEX_PORT" handle "$HEX_PORT": fq_codel limit 1024 2>>"$LOG_FILE"
-    tc filter add dev "$INTERFACE" protocol ip parent 1: prio 1 flower ip_proto udp src_port "$PORT" flowid 1:"$HEX_PORT" 2>>"$LOG_FILE"
-
-    # Ingress (Upload) - Applied on virtual IFB interface
-    tc class add dev "$IFB_DEV" parent 1: classid 1:"$HEX_PORT" htb rate "$UL_LIMIT" ceil "$UL_LIMIT" 2>>"$LOG_FILE"
-    tc qdisc add dev "$IFB_DEV" parent 1:"$HEX_PORT" handle "$HEX_PORT": fq_codel limit 1024 2>>"$LOG_FILE"
-    tc filter add dev "$IFB_DEV" protocol ip parent 1: prio 1 flower ip_proto udp dst_port "$PORT" flowid 1:"$HEX_PORT" 2>>"$LOG_FILE"
-    
-    # Tiny pause to prevent kernel socket buffer overflow when executing hundreds of rules
-    sleep 0.005
-}
-
-# ==========================================
-# Main Actions
-# ==========================================
-
-sync_limits() {
-    # This function is called by the cron job every minute
-    if [ ! -f "$CONFIG_FILE" ]; then
-        exit 0
+    if ip link show ifb0 >/dev/null 2>&1; then
+        tc qdisc del dev ifb0 root >/dev/null 2>&1
+        ip link set dev ifb0 down >/dev/null 2>&1
     fi
     
-    source "$CONFIG_FILE"
+    # 2. Remove old cron jobs
+    crontab -l 2>/dev/null | grep -v "wg_shaper" | grep -v "wg-limiter" | grep -v "sync" | crontab -
     
-    # Enforce original interface discovered during activation
-    if [ ! -z "$CONF_INTERFACE" ]; then
-        INTERFACE="$CONF_INTERFACE"
-    fi
-    
-    # Ensure INTERFACE is detected even in cron (Fallback check)
-    if [ -z "$INTERFACE" ]; then
-        echo "[$(date)] ERROR: Network interface could not be detected." >> "$LOG_FILE"
-        exit 1
-    fi
-
-    # Auto-recovery: If root qdiscs disappeared, re-initialize them safely
-    if ! tc qdisc show dev "$INTERFACE" | grep -q "htb"; then
-        echo "[$(date)] WARNING: Root Qdisc missing on $INTERFACE. Recovering structure..." >> "$LOG_FILE"
-        tc qdisc add dev "$INTERFACE" root handle 1: htb default 9999 2>>"$LOG_FILE"
-        tc qdisc add dev "$IFB_DEV" root handle 1: htb default 9999 2>>"$LOG_FILE"
-    fi
-
-    ACTIVE_PORTS=$(get_active_udp_ports)
-    SHAPED_PORTS=$(get_shaped_ports)
-    
-    for PORT in $ACTIVE_PORTS; do
-        # Check if the port is already shaped
-        if ! echo "$SHAPED_PORTS" | grep -qw "$PORT"; then
-            echo "[$(date)] Auto-Sync: Applying limits to newly detected port -> $PORT" >> "$LOG_FILE"
-            apply_port_rules "$PORT" "$CONF_DL" "$CONF_UL"
-        fi
+    # 3. Clean hashlimit iptables chains
+    for CMD in iptables ip6tables; do
+        $CMD -D INPUT -j WG_LIMIT_IN >/dev/null 2>&1
+        $CMD -D OUTPUT -j WG_LIMIT_OUT >/dev/null 2>&1
+        $CMD -F WG_LIMIT_IN >/dev/null 2>&1
+        $CMD -X WG_LIMIT_IN >/dev/null 2>&1
+        $CMD -F WG_LIMIT_OUT >/dev/null 2>&1
+        $CMD -X WG_LIMIT_OUT >/dev/null 2>&1
     done
+    
+    rm -f /etc/wg_shaper_config
+    rm -f /etc/wg_shaper_state
 }
 
-enable_limit() {
+apply_limits() {
     clear
     echo -e "${C_CYAN}====================================================${C_RESET}"
-    echo -e "${C_CYAN}         Apply Dedicated Limits (Per Port)          ${C_RESET}"
+    echo -e "${C_CYAN}    Apply Zero-CPU Hashlimit (Iptables Engine)      ${C_RESET}"
     echo -e "${C_CYAN}====================================================${C_RESET}"
     
-    read -p "$(echo -e ${C_YELLOW}"[?] Enter DOWNLOAD limit per port (Mbit) [e.g., 20]: "${C_RESET})" DL_INPUT
+    read -p "$(echo -e ${C_YELLOW}"[?] Enter DOWNLOAD limit per port (Mbit) [e.g., 15]: "${C_RESET})" DL_INPUT
     if ! [[ "$DL_INPUT" =~ ^[0-9]+$ ]]; then echo -e "${C_RED}[-] Invalid input.${C_RESET}"; sleep 2; return 1; fi
 
-    read -p "$(echo -e ${C_YELLOW}"[?] Enter UPLOAD limit per port (Mbit) [e.g., 20]: "${C_RESET})" UL_INPUT
+    read -p "$(echo -e ${C_YELLOW}"[?] Enter UPLOAD limit per port (Mbit) [e.g., 15]: "${C_RESET})" UL_INPUT
     if ! [[ "$UL_INPUT" =~ ^[0-9]+$ ]]; then echo -e "${C_RED}[-] Invalid input.${C_RESET}"; sleep 2; return 1; fi
 
-    DL_LIMIT="${DL_INPUT}mbit"
-    UL_LIMIT="${UL_INPUT}mbit"
-
-    # Save config for cron job including discovered interface
-    echo "CONF_INTERFACE=\"$INTERFACE\"" > "$CONFIG_FILE"
-    echo "CONF_DL=\"$DL_LIMIT\"" >> "$CONFIG_FILE"
-    echo "CONF_UL=\"$UL_LIMIT\"" >> "$CONFIG_FILE"
-
-    echo -e "${C_MAGENTA}[*] Initializing network tree...${C_RESET}"
-    clean_existing_rules
-    ethtool -K "$INTERFACE" tso off gso off gro off >/dev/null 2>&1
+    # Convert Mbit to KB/s (1 Mbit = 125 KB/s)
+    DL_KB=$((DL_INPUT * 125))
+    UL_KB=$((UL_INPUT * 125))
     
-    # Load IFB virtual module and wait for core registration
-    modprobe ifb numifbs=1 >/dev/null 2>&1
-    sleep 1 
-    ip link set dev "$IFB_DEV" up >/dev/null 2>&1
+    # Burst buffer to allow smooth TCP ramp-up (1.5 seconds worth of data)
+    DL_BURST=$((DL_KB * 3 / 2))
+    UL_BURST=$((UL_KB * 3 / 2))
+
+    echo -e "${C_MAGENTA}[*] Cleaning previous configurations...${C_RESET}"
+    clean_old_system
+
+    echo -e "${C_MAGENTA}[*] Injecting Kernel Netfilter Rules...${C_RESET}"
     
-    # Crucial: Bump the virtual transmission queue length to absorb rapid spikes of tc filters
-    ip link set dev "$IFB_DEV" txqueuelen 10000 >/dev/null 2>&1
+    # Apply to both IPv4 and IPv6
+    for CMD in iptables ip6tables; do
+        $CMD -N WG_LIMIT_IN
+        $CMD -N WG_LIMIT_OUT
+        
+        $CMD -I INPUT -j WG_LIMIT_IN
+        $CMD -I OUTPUT -j WG_LIMIT_OUT
+        
+        # Client Download = Server OUTPUT (Matching Source Port)
+        $CMD -A WG_LIMIT_OUT -p udp --sport $PORT_MIN:$PORT_MAX -m hashlimit \
+            --hashlimit-above ${DL_KB}kb/s --hashlimit-burst ${DL_BURST}kb \
+            --hashlimit-mode srcport --hashlimit-name wg_dl \
+            --hashlimit-htable-size 8192 --hashlimit-htable-max 32768 --hashlimit-htable-expire 60000 \
+            -j DROP
 
-    # Setup Root Qdiscs and redirect ingress to IFB virtual interface
-    tc qdisc add dev "$INTERFACE" root handle 1: htb default 9999 2>>"$LOG_FILE"
-    tc qdisc add dev "$IFB_DEV" root handle 1: htb default 9999 2>>"$LOG_FILE"
-    tc qdisc add dev "$INTERFACE" handle ffff: ingress 2>>"$LOG_FILE"
-    tc filter add dev "$INTERFACE" parent ffff: protocol all u32 match u32 0 0 action mirred egress redirect dev "$IFB_DEV" 2>>"$LOG_FILE"
+        # Client Upload = Server INPUT (Matching Destination Port)
+        $CMD -A WG_LIMIT_IN -p udp --dport $PORT_MIN:$PORT_MAX -m hashlimit \
+            --hashlimit-above ${UL_KB}kb/s --hashlimit-burst ${UL_BURST}kb \
+            --hashlimit-mode dstport --hashlimit-name wg_ul \
+            --hashlimit-htable-size 8192 --hashlimit-htable-max 32768 --hashlimit-htable-expire 60000 \
+            -j DROP
+    done
 
-    # Initialize Log file
-    echo "[$(date)] Service Started. Limits set to DL: $DL_LIMIT, UL: $UL_LIMIT" > "$LOG_FILE"
+    # Save config for status page
+    echo "DL_MBIT=$DL_INPUT" > "$CONFIG_FILE"
+    echo "UL_MBIT=$UL_INPUT" >> "$CONFIG_FILE"
 
-    # Run the sync function to apply rules to currently active ports immediately
-    sync_limits
-    
-    # Manage Cron Job safely
-    (crontab -l 2>/dev/null | grep -v -F "$SCRIPT_PATH sync"; echo "$CRON_CMD") | crontab -
-
-    echo -e "${C_GREEN}[+] Limits applied and Auto-Sync Cron Job is active!${C_RESET}"
-    read -p "Press Enter to return to main menu..." temp
+    echo -e "${C_GREEN}[+] Ultra-Lightweight Limits applied successfully!${C_RESET}"
+    read -p "Press Enter to return..." temp
 }
 
-disable_limit() {
+disable_limits() {
     clear
     echo -e "${C_CYAN}====================================================${C_RESET}"
-    echo -e "${C_CYAN}             Completely Remove Limits               ${C_RESET}"
+    echo -e "${C_CYAN}             Remove All Network Limits              ${C_RESET}"
     echo -e "${C_CYAN}====================================================${C_RESET}"
     
-    echo -e "${C_MAGENTA}[*] Removing auto-sync Cron Job...${C_RESET}"
-    crontab -l 2>/dev/null | grep -v -F "$SCRIPT_PATH sync" | crontab -
+    echo -e "${C_MAGENTA}[*] Purging all Iptables hashlimit rules...${C_RESET}"
+    clean_old_system
     rm -f "$CONFIG_FILE"
-    echo "[$(date)] Service Stopped and Limits Removed." >> "$LOG_FILE"
-
-    echo -e "${C_MAGENTA}[*] Removing all TC rules and restoring hardware offloading...${C_RESET}"
-    clean_existing_rules
-    ethtool -K "$INTERFACE" tso on gso on gro on >/dev/null 2>&1
     
     echo -e "${C_GREEN}[+] Done. The system is completely clean!${C_RESET}"
     read -p "Press Enter to return..." temp
@@ -201,66 +136,28 @@ disable_limit() {
 show_status() {
     clear
     echo -e "${C_CYAN}====================================================${C_RESET}"
-    echo -e "${C_CYAN}               System Traffic Status                ${C_RESET}"
+    echo -e "${C_CYAN}               Hashlimit Engine Status              ${C_RESET}"
     echo -e "${C_CYAN}====================================================${C_RESET}"
-    
-    echo -e "${C_YELLOW}Network Interface:${C_RESET} $INTERFACE"
     
     if [ -f "$CONFIG_FILE" ]; then
         source "$CONFIG_FILE"
-        echo -e "${C_YELLOW}Configured Limits:${C_RESET} DL: $CONF_DL / UL: $CONF_UL"
-    fi
-
-    # Check active cron
-    if crontab -l 2>/dev/null | grep -q -F "$SCRIPT_PATH sync"; then
-        echo -e "${C_YELLOW}Auto-Sync Cron:${C_RESET}    ${C_GREEN}ACTIVE (Every 1 Min)${C_RESET}"
+        echo -e "${C_YELLOW}Configured Limits:${C_RESET} DL: ${DL_MBIT}Mbit / UL: ${UL_MBIT}Mbit (Per Port)"
+        echo -e "${C_YELLOW}Engine Type:${C_RESET}       ${C_GREEN}Kernel O(1) Hashlimit (Zero-CPU)${C_RESET}"
+        echo -e "${C_CYAN}----------------------------------------------------${C_RESET}"
+        
+        echo -e "${C_MAGENTA}[ Active Download Drop Counter (Client DL) ]${C_RESET}"
+        iptables -L WG_LIMIT_OUT -v -n | grep "DROP" | awk '{print "Packets Dropped: "$1", Bytes Shaped: "$2}'
+        
+        echo -e "${C_MAGENTA}[ Active Upload Drop Counter (Client UL) ]${C_RESET}"
+        iptables -L WG_LIMIT_IN -v -n | grep "DROP" | awk '{print "Packets Dropped: "$1", Bytes Shaped: "$2}'
     else
-        echo -e "${C_YELLOW}Auto-Sync Cron:${C_RESET}    ${C_RED}INACTIVE${C_RESET}"
-    fi
-
-    echo -e "${C_CYAN}----------------------------------------------------${C_RESET}"
-
-    ACTIVE_PORTS_RAW=$(get_active_udp_ports)
-    SHAPED_PORTS_RAW=$(get_shaped_ports)
-    
-    ACTIVE_COUNT=$(echo "$ACTIVE_PORTS_RAW" | wc -w)
-    SHAPED_COUNT=$(echo "$SHAPED_PORTS_RAW" | wc -w)
-    
-    if [ -z "$ACTIVE_PORTS_RAW" ]; then ACTIVE_COUNT=0; fi
-    if [ -z "$SHAPED_PORTS_RAW" ]; then SHAPED_COUNT=0; fi
-
-    echo -e "${C_YELLOW}Total Listening UDP Ports:${C_RESET} $ACTIVE_COUNT"
-    echo -e "${C_YELLOW}Total Shaped (Limited) Ports:${C_RESET} $SHAPED_COUNT"
-    echo -e "${C_CYAN}----------------------------------------------------${C_RESET}"
-
-    if [ "$SHAPED_COUNT" -gt 0 ]; then
-        echo -e "${C_MAGENTA}List of Shaped Ports:${C_RESET}"
-        echo "$SHAPED_PORTS_RAW" | tr '\n' ' ' | fold -w 60 -s | awk '{print "  "$0}'
-    else
-        echo -e "${C_RED}No ports are currently shaped.${C_RESET}"
-    fi
-    
-    echo -e "${C_CYAN}----------------------------------------------------${C_RESET}"
-    if [ -f "$LOG_FILE" ]; then
-        echo -e "${C_MAGENTA}Recent Sync Logs (Last 5 events):${C_RESET}"
-        tail -n 5 "$LOG_FILE" | awk '{print "  "$0}'
+        echo -e "${C_RED}No limits are currently applied.${C_RESET}"
     fi
 
     echo -e "${C_CYAN}====================================================${C_RESET}"
     read -p "Press Enter to return..." temp
 }
 
-# ==========================================
-# CLI Argument Handler for Cron
-# ==========================================
-if [ "$1" == "sync" ]; then
-    sync_limits
-    exit 0
-fi
-
-# ==========================================
-# Main Interactive Menu
-# ==========================================
 while true; do
     clear
     echo -e "${C_GREEN}"
@@ -271,17 +168,17 @@ while true; do
     echo "     \_/\_/  \____|  |____/|_| |_|\__,_| .__/ \___| "
     echo "                                       |_|          "
     echo -e "${C_RESET}"
-    echo -e "${C_CYAN}========= Dynamic Per-Port Traffic Shaping =========${C_RESET}"
-    echo -e "  1) ${C_GREEN}Apply & Auto-Sync Limits${C_RESET} (Active & Future Ports)"
-    echo -e "  2) ${C_RED}Disable Limits${C_RESET} (Stop Cron & Wipe All Rules)"
-    echo -e "  3) ${C_YELLOW}Status & Reports${C_RESET} (View Sync Status & Ports)"
+    echo -e "${C_CYAN}========= Zero-CPU Kernel Traffic Shaping ==========${C_RESET}"
+    echo -e "  1) ${C_GREEN}Apply Limits${C_RESET} (Hashlimit Engine)"
+    echo -e "  2) ${C_RED}Disable Limits${C_RESET} (Restore All)"
+    echo -e "  3) ${C_YELLOW}Status & Reports${C_RESET} (View Dropped Bytes)"
     echo -e "  4) Exit"
     echo -e "${C_CYAN}====================================================${C_RESET}"
     read -p "Select an option [1-4]: " choice
 
     case "$choice" in
-        1) enable_limit ;;
-        2) disable_limit ;;
+        1) apply_limits ;;
+        2) disable_limits ;;
         3) show_status ;;
         4) clear; exit 0 ;;
         *) echo -e "${C_RED}[-] Invalid option.${C_RESET}"; sleep 1 ;;
