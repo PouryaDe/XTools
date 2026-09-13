@@ -1295,10 +1295,10 @@ do_live_logs() {
 
 do_view_config() {
     pick_tunnel || return
-    
+
     # Target the config file directly based on the tunnel name
     local cfg="${CORE_DIR}/${SELECTED_TUNNEL#backhaul-}.toml"
-    
+
     if [ -f "$cfg" ]; then
         echo ""
         print_line
@@ -1311,10 +1311,10 @@ do_view_config() {
 
 do_edit_config() {
     pick_tunnel || return
-    
+
     # Target the config file directly based on the tunnel name
     local cfg="${CORE_DIR}/${SELECTED_TUNNEL#backhaul-}.toml"
-    
+
     if [ -f "$cfg" ]; then
         nano "$cfg"
         msg_ok "Configuration updated. You may need to restart the tunnel service to apply changes."
@@ -1337,11 +1337,11 @@ do_delete() {
     if [ "$confirm" = "1" ]; then
         systemctl stop "${SELECTED_TUNNEL}" 2>/dev/null
         systemctl disable "${SELECTED_TUNNEL}" 2>/dev/null
-        
+
         # Target the config file directly based on the tunnel name
         # e.g., 'backhaul-iran1234' -> 'iran1234.toml'
         local cfg="${CORE_DIR}/${SELECTED_TUNNEL#backhaul-}.toml"
-        
+
         rm -f "${SYSTEMD_DIR}/${SELECTED_TUNNEL}.service"
         if [ -f "$cfg" ]; then
             rm -f "$cfg"
@@ -1349,7 +1349,7 @@ do_delete() {
         else
             msg_ok "${SELECTED_TUNNEL} deleted. (Config file not found or already removed)"
         fi
-        
+
         systemctl daemon-reload
 
     else
@@ -1557,30 +1557,30 @@ scan_and_sync_configs() {
         msg_err "Core directory not found: ${CORE_DIR}"
         return
     fi
-    
+
     local found=0
     local total=0
     for toml_file in "${CORE_DIR}"/*.toml; do
         [ -f "$toml_file" ] || continue
         ((total++))
-        
+
         local filename=$(basename "$toml_file")
         local svc_name="backhaul-${filename%.toml}"
         local svc_path="${SYSTEMD_DIR}/${svc_name}.service"
-        
+
         if [ ! -f "$svc_path" ]; then
             found=1
             msg_info "Missing service for ${filename}. Creating..."
-            
+
             local desc_mode="Tunnel"
             if [[ "$filename" == iran* ]]; then desc_mode="Iran"; fi
             if [[ "$filename" == kharej* ]]; then desc_mode="Kharej"; fi
-            
+
             create_systemd_service "${svc_name}" "${toml_file}" "Backhaul ${desc_mode} - ${filename%.toml}"
             msg_ok "Service created and started: ${svc_name}"
         fi
     done
-    
+
     if [ $total -eq 0 ]; then
         msg_warn "No TOML configuration files found in ${CORE_DIR}."
     elif [ $found -eq 0 ]; then
