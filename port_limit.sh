@@ -6,7 +6,7 @@
 
 set -o pipefail
 
-VERSION="1.1.5"
+VERSION="1.1.6"
 
 # ------------------------------------------------------------------------------
 # Default Settings (can be modified directly here or via the interactive menu)
@@ -17,7 +17,7 @@ CHECK_INTERVAL=60             # Interval in seconds to check for new inbounds (1
 EXCLUDE_PORTS="22"            # Excluded ports (comma-separated, e.g., 22,2053)
 MIN_PORT=10000                # Minimum port threshold (ports below 10000 are completely exempt)
 CUSTOM_LIMITS=""              # Custom limits per port (e.g., "443:20mbit:20mbit,8443:5mbit:5mbit")
-BURST="64k"                   # Burst buffer size for connection establishment (TSO/GSO compatible)
+BURST="128k"                  # Burst buffer size for connection establishment (TSO/GSO 64KB+ compatible)
 DB_PATH="${PORT_LIMIT_DB:-/etc/x-ui/x-ui.db}"         # SQLite database path for 3X-UI panel
 WAN_INTERFACE=""                                      # Leave empty for automatic WAN interface detection
 # ------------------------------------------------------------------------------
@@ -192,16 +192,9 @@ ensure_kernel_modules() {
         fi
     done
 
-    # Check if sch_htb can be loaded or is supported
+    # Check if sch_htb can be loaded or is supported (required for egress HTB shaping)
     if ! grep -q "^sch_htb " /proc/modules 2>/dev/null; then
         if ! modprobe sch_htb 2>/dev/null; then
-            need_install=1
-        fi
-    fi
-
-    # Check if ifb or act_mirred can be loaded
-    if ! grep -q "^ifb " /proc/modules 2>/dev/null; then
-        if ! modprobe ifb numifbs=1 2>/dev/null; then
             need_install=1
         fi
     fi
@@ -395,9 +388,12 @@ clear_rules() {
         tc qdisc del dev "$WAN_INTERFACE" root 2>/dev/null || true
         tc qdisc del dev "$WAN_INTERFACE" ingress 2>/dev/null || true
     fi
-    if [[ -d "/sys/class/net/$IFB_DEVICE" ]]; then
+    if [[ -d "/sys/class/net/$IFB_DEVICE" ]] || ip link show "$IFB_DEVICE" >/dev/null 2>&1; then
         tc qdisc del dev "$IFB_DEVICE" root 2>/dev/null || true
         tc qdisc del dev "$IFB_DEVICE" ingress 2>/dev/null || true
+        ip link set dev "$IFB_DEVICE" down 2>/dev/null || true
+        ip link delete "$IFB_DEVICE" type ifb 2>/dev/null || true
+        modprobe -r ifb 2>/dev/null || true
     fi
 
     rm -f "$STATE_FILE"
@@ -449,15 +445,25 @@ apply_rules() {
 
     log_info "Active controlled ports (${#active_ports[@]}): ${GREEN}${active_ports[*]}${NC}"
 
-    # Reset existing root qdiscs cleanly
+    # Cleanly remove any residual IFB device to eliminate /proc/net/dev traffic multiplication
+    if [[ -d "/sys/class/net/$IFB_DEVICE" ]] || ip link show "$IFB_DEVICE" >/dev/null 2>&1; then
+        tc qdisc del dev "$IFB_DEVICE" root 2>/dev/null || true
+        tc qdisc del dev "$IFB_DEVICE" ingress 2>/dev/null || true
+        ip link set dev "$IFB_DEVICE" down 2>/dev/null || true
+        ip link delete "$IFB_DEVICE" type ifb 2>/dev/null || true
+        modprobe -r ifb 2>/dev/null || true
+    fi
+
+    # Reset existing root and ingress qdiscs on physical WAN interface cleanly
+    tc filter del dev "$iface" parent ffff: 2>/dev/null || true
     tc qdisc del dev "$iface" root 2>/dev/null || true
     tc qdisc del dev "$iface" ingress 2>/dev/null || true
 
     # 1. Egress root qdisc on physical WAN interface (Client Download - traffic leaving server)
-    # Class 1:2 is the unthrottled default class for SSH and OS traffic (avoids port collisions)
-    if ! tc qdisc replace dev "$iface" root handle 1: htb default 2 2>/dev/null; then
+    # Default class 1:999 handles unclassified/system traffic (SSH, web, non-limited ports) at line rate (10 Gbps)
+    if ! tc qdisc replace dev "$iface" root handle 1: htb default 999 2>/dev/null; then
         modprobe sch_htb 2>/dev/null || true
-        if ! tc qdisc replace dev "$iface" root handle 1: htb default 2 2>/dev/null; then
+        if ! tc qdisc replace dev "$iface" root handle 1: htb default 999 2>/dev/null; then
             log_error "Failed to create root HTB queue on WAN interface '$iface'!"
             log_error "Kernel module 'sch_htb' is missing or not supported on this kernel."
             log_error "To install on Ubuntu/Debian, run: sudo apt-get install -y linux-modules-extra-\$(uname -r)"
@@ -465,48 +471,22 @@ apply_rules() {
         fi
     fi
 
-    tc class replace dev "$iface" parent 1: classid 1:1 htb rate 10000mbit ceil 10000mbit 2>/dev/null || \
-    tc class add dev "$iface" parent 1: classid 1:1 htb rate 10000mbit ceil 10000mbit 2>/dev/null || true
+    # Default class 1:999 attached directly to root 1: (unthrottled default for system traffic)
+    tc class replace dev "$iface" parent 1: classid 1:999 htb rate 10000mbit ceil 10000mbit 2>/dev/null || \
+    tc class add dev "$iface" parent 1: classid 1:999 htb rate 10000mbit ceil 10000mbit 2>/dev/null || true
 
-    tc class replace dev "$iface" parent 1:1 classid 1:2 htb rate 10000mbit ceil 10000mbit 2>/dev/null || \
-    tc class add dev "$iface" parent 1:1 classid 1:2 htb rate 10000mbit ceil 10000mbit 2>/dev/null || true
-
-    # Probe leaf qdisc support once
+    # Probe leaf qdisc support once on class 1:999
     local leaf_qdisc="fq_codel"
-    if ! tc qdisc replace dev "$iface" parent 1:2 handle 2: fq_codel 2>/dev/null; then
-        tc qdisc replace dev "$iface" parent 1:2 handle 2: sfq perturb 10 2>/dev/null || true
+    if ! tc qdisc replace dev "$iface" parent 1:999 handle 999: fq_codel 2>/dev/null; then
+        tc qdisc replace dev "$iface" parent 1:999 handle 999: sfq perturb 10 2>/dev/null || true
         leaf_qdisc="sfq perturb 10"
     fi
 
-    # 2. Ingress traffic control via IFB (Client Upload - traffic entering server)
-    local has_ifb=0
-    if setup_ifb; then
-        tc qdisc del dev "$IFB_DEVICE" root 2>/dev/null || true
-        if tc qdisc replace dev "$IFB_DEVICE" root handle 1: htb default 2 2>/dev/null; then
-            tc class replace dev "$IFB_DEVICE" parent 1: classid 1:1 htb rate 10000mbit ceil 10000mbit 2>/dev/null || \
-            tc class add dev "$IFB_DEVICE" parent 1: classid 1:1 htb rate 10000mbit ceil 10000mbit 2>/dev/null || true
-
-            tc class replace dev "$IFB_DEVICE" parent 1:1 classid 1:2 htb rate 10000mbit ceil 10000mbit 2>/dev/null || \
-            tc class add dev "$IFB_DEVICE" parent 1:1 classid 1:2 htb rate 10000mbit ceil 10000mbit 2>/dev/null || true
-
-            tc qdisc replace dev "$IFB_DEVICE" parent 1:2 handle 2: $leaf_qdisc 2>/dev/null || true
-
-            # Redirect incoming WAN ingress traffic to IFB0 device
-            tc qdisc replace dev "$iface" handle ffff: ingress 2>/dev/null || \
-            tc qdisc add dev "$iface" handle ffff: ingress 2>/dev/null || true
-
-            tc filter del dev "$iface" parent ffff: 2>/dev/null || true
-            if tc filter add dev "$iface" parent ffff: protocol all prio 1 u32 match u32 0 0 action mirred egress redirect dev "$IFB_DEVICE" 2>/dev/null; then
-                has_ifb=1
-            else
-                log_warn "Ingress redirection filter (act_mirred) failed. Upload limits skipped, download limits active."
-            fi
-        else
-            log_warn "Root HTB queue on '$IFB_DEVICE' failed. Upload limits skipped, download limits active."
-        fi
-    else
-        log_warn "Virtual interface '$IFB_DEVICE' unavailable. Upload limits skipped, download limits active."
-    fi
+    # 2. Ingress root qdisc directly on physical WAN interface (Client Upload - traffic entering server)
+    # Uses direct kernel Ingress Policing (zero virtual devices, zero /proc/net/dev duplication, zero kernel retransmissions)
+    tc qdisc replace dev "$iface" handle ffff: ingress 2>/dev/null || \
+    tc qdisc add dev "$iface" handle ffff: ingress 2>/dev/null || true
+    tc filter del dev "$iface" parent ffff: 2>/dev/null || true
 
     # Pre-parse custom limits into associative arrays (O(1) memory lookup, zero forks)
     declare -A custom_down_map custom_up_map
@@ -527,6 +507,7 @@ apply_rules() {
     fi
 
     # 3. Generate batch rules in memory for high-performance atomic execution
+    local burst_val="${BURST:-128k}"
     local batch_rules=""
     local idx=1
     for port in "${active_ports[@]}"; do
@@ -537,30 +518,27 @@ apply_rules() {
         local port_down="${custom_down_map[$port]:-$norm_down}"
         local port_up="${custom_up_map[$port]:-$norm_up}"
 
-        # --- Egress shaping (Download): match source port (sport = port) ---
-        batch_rules+="class add dev $iface parent 1:1 classid $class_id htb rate $port_down ceil $port_down burst $BURST"$'\n'
+        # --- Egress shaping (Download): attached directly to parent 1: (no token borrowing, strictly capped) ---
+        batch_rules+="class add dev $iface parent 1: classid $class_id htb rate $port_down ceil $port_down burst $burst_val cburst $burst_val"$'\n'
         batch_rules+="qdisc add dev $iface parent $class_id handle $qdisc_handle $leaf_qdisc"$'\n'
         # Match IPv4 TCP & UDP via sport
         batch_rules+="filter add dev $iface protocol ip parent 1: prio 1 u32 match ip sport $port 0xffff flowid $class_id"$'\n'
         # Match IPv6 TCP & UDP via sport (offset 40)
         batch_rules+="filter add dev $iface protocol ipv6 parent 1: prio 2 u32 match u16 $port 0xffff at 40 flowid $class_id"$'\n'
 
-        # --- Ingress shaping (Upload): only if IFB was successfully initialized ---
-        if [[ $has_ifb -eq 1 ]]; then
-            batch_rules+="class add dev $IFB_DEVICE parent 1:1 classid $class_id htb rate $port_up ceil $port_up burst $BURST"$'\n'
-            batch_rules+="qdisc add dev $IFB_DEVICE parent $class_id handle $qdisc_handle $leaf_qdisc"$'\n'
-            # Match IPv4 TCP & UDP via dport on IFB0
-            batch_rules+="filter add dev $IFB_DEVICE protocol ip parent 1: prio 1 u32 match ip dport $port 0xffff flowid $class_id"$'\n'
-            # Match IPv6 TCP & UDP via dport on IFB0 (offset 42)
-            batch_rules+="filter add dev $IFB_DEVICE protocol ipv6 parent 1: prio 2 u32 match u16 $port 0xffff at 42 flowid $class_id"$'\n'
-        fi
+        # --- Ingress direct policing (Upload): per-port hardware line-rate rate limiting ---
+        # Match IPv4 TCP & UDP via dport on ingress
+        batch_rules+="filter add dev $iface parent ffff: protocol ip prio $idx u32 match ip dport $port 0xffff police rate $port_up burst $burst_val drop flowid :1"$'\n'
+        # Match IPv6 TCP & UDP via dport on ingress (offset 42)
+        batch_rules+="filter add dev $iface parent ffff: protocol ipv6 prio $((idx + 5000)) u32 match u16 $port 0xffff at 42 police rate $port_up burst $burst_val drop flowid :1"$'\n'
 
         idx=$((idx + 1))
     done
 
-    # Execute batch rules via temporary file (guaranteed compatibility across all iproute2 versions)
+    # Execute batch rules via temporary file in secure runtime directory
+    mkdir -p /run/port-limit 2>/dev/null && chmod 700 /run/port-limit 2>/dev/null || true
     local batch_file
-    batch_file=$(mktemp /tmp/port_limit_batch.XXXXXX 2>/dev/null || echo "/tmp/port_limit_batch_$$.tc")
+    batch_file=$(mktemp /run/port-limit/batch.XXXXXX 2>/dev/null || mktemp /tmp/port_limit_batch.XXXXXX 2>/dev/null || echo "/tmp/port_limit_batch_$$.tc")
     printf "%s\n" "$batch_rules" > "$batch_file"
 
     local batch_err
@@ -680,11 +658,23 @@ show_status() {
                 cur_cls=""
             fi
         done <<< "$raw_egress"
+        local raw_ingress
+        raw_ingress=$(LC_ALL=C tc -s filter show dev "$iface" parent ffff: 2>/dev/null)
+        local cur_prio=""
+        while IFS= read -r line; do
+            if [[ "$line" =~ (pref|prio)[[:space:]]+([0-9]+) ]]; then
+                cur_prio="${BASH_REMATCH[2]}"
+            elif [[ -n "$cur_prio" && "$line" =~ Sent[[:space:]]+([0-9]+)[[:space:]]+bytes ]]; then
+                local prev="${ingress_bytes[$cur_prio]:-0}"
+                ingress_bytes["$cur_prio"]=$(( prev + BASH_REMATCH[1] ))
+                cur_prio=""
+            fi
+        done <<< "$raw_ingress"
     fi
 
     if [[ -d "/sys/class/net/$IFB_DEVICE" ]]; then
-        local raw_ingress
-        raw_ingress=$(LC_ALL=C tc -s class show dev "$IFB_DEVICE" 2>/dev/null)
+        local raw_ifb
+        raw_ifb=$(LC_ALL=C tc -s class show dev "$IFB_DEVICE" 2>/dev/null)
         cur_cls=""
         while IFS= read -r line; do
             if [[ "$line" =~ class[[:space:]]+[^[:space:]]+[[:space:]]+([0-9]+:[0-9]+) ]]; then
@@ -693,7 +683,7 @@ show_status() {
                 ingress_bytes["$cur_cls"]="${BASH_REMATCH[1]}"
                 cur_cls=""
             fi
-        done <<< "$raw_ingress"
+        done <<< "$raw_ifb"
     fi
 
     local norm_d norm_u
@@ -710,8 +700,9 @@ show_status() {
 
         local down_bytes
         down_bytes=$(format_bytes "${egress_bytes[$class_id]:-0}")
+        local up_count=$(( ${ingress_bytes[$idx]:-0} + ${ingress_bytes[$((idx + 5000))]:-0} + ${ingress_bytes[$class_id]:-0} ))
         local up_bytes
-        up_bytes=$(format_bytes "${ingress_bytes[$class_id]:-0}")
+        up_bytes=$(format_bytes "$up_count")
 
         printf "%-8s %-12s %-12s %-16s %-16s\n" "$port" "$port_down" "$port_up" "$down_bytes" "$up_bytes"
         idx=$((idx + 1))
