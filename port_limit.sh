@@ -6,7 +6,7 @@
 
 set -o pipefail
 
-VERSION="1.1.6"
+VERSION="1.1.7"
 
 # ------------------------------------------------------------------------------
 # Default Settings (can be modified directly here or via the interactive menu)
@@ -27,6 +27,10 @@ SERVICE_NAME="port-limit"
 INSTALL_PATH="/usr/local/bin/port-limit"
 STATE_FILE="${PORT_LIMIT_STATE:-/run/port-limit.ports}"
 IFB_DEVICE="ifb0"
+
+# Runtime state (not user-configurable)
+DEPS_VERIFIED=0
+CACHED_WAN_IFACE=""
 
 # Standard terminal color codes
 RED='\033[0;31m'
@@ -179,16 +183,13 @@ check_root() {
 
 # Automatically load and verify essential traffic control kernel modules
 ensure_kernel_modules() {
-    local mods=("sch_htb" "cls_u32" "act_mirred" "sch_fq_codel" "sch_sfq" "ifb")
+    # Only modules required for direct HTB egress + ingress policing (no IFB needed)
+    local mods=("sch_htb" "cls_u32" "sch_fq_codel" "sch_sfq")
     local need_install=0
 
     for m in "${mods[@]}"; do
         if ! grep -q "^${m//-/_} " /proc/modules 2>/dev/null; then
-            if [[ "$m" == "ifb" ]]; then
-                modprobe ifb numifbs=1 2>/dev/null || true
-            else
-                modprobe "$m" 2>/dev/null || true
-            fi
+            modprobe "$m" 2>/dev/null || true
         fi
     done
 
@@ -207,7 +208,7 @@ ensure_kernel_modules() {
         apt-get update -qq >/dev/null 2>&1 || true
         apt-get install -y -qq "linux-modules-extra-$kver" "linux-modules-$kver" >/dev/null 2>&1 || true
         for m in "${mods[@]}"; do
-            [[ "$m" == "ifb" ]] && modprobe ifb numifbs=1 2>/dev/null || modprobe "$m" 2>/dev/null || true
+            modprobe "$m" 2>/dev/null || true
         done
     fi
 }
@@ -345,28 +346,7 @@ get_port_limits() {
     echo "$norm_d $norm_u"
 }
 
-## Initialize Intermediate Functional Block (IFB) device with thorough fallback handling
-setup_ifb() {
-    if [[ -d "/sys/class/net/$IFB_DEVICE" ]]; then
-        ip link set dev "$IFB_DEVICE" up 2>/dev/null || true
-        return 0
-    fi
-    if ! grep -q "^ifb " /proc/modules 2>/dev/null; then
-        modprobe ifb numifbs=1 2>/dev/null || true
-    fi
-    if [[ ! -d "/sys/class/net/$IFB_DEVICE" ]]; then
-        ip link add name "$IFB_DEVICE" type ifb 2>/dev/null || true
-    fi
-    if [[ ! -d "/sys/class/net/$IFB_DEVICE" ]]; then
-        modprobe -r ifb 2>/dev/null || rmmod ifb 2>/dev/null || true
-        modprobe ifb numifbs=1 2>/dev/null || true
-    fi
-    if [[ -d "/sys/class/net/$IFB_DEVICE" ]]; then
-        ip link set dev "$IFB_DEVICE" up 2>/dev/null || true
-        return 0
-    fi
-    return 1
-}
+# (IFB virtual device approach removed — direct ingress policing used instead)
 
 # ------------------------------------------------------------------------------
 # Traffic Control (tc) Rule Management
@@ -543,7 +523,8 @@ apply_rules() {
 
     local batch_err
     if ! batch_err=$(tc -force -batch "$batch_file" 2>&1); then
-        # Fallback to direct execution
+        log_warn "tc batch mode failed — falling back to sequential execution:"
+        log_warn "$batch_err"
         while IFS= read -r cmd; do
             [[ -n "$cmd" ]] && tc $cmd 2>/dev/null || true
         done < "$batch_file"
@@ -597,7 +578,15 @@ show_status() {
     echo -e "Default Limits: Download=${GREEN}$DOWNLOAD_LIMIT${NC} | Upload=${GREEN}$UPLOAD_LIMIT${NC}"
     echo -e "Port Filter: ${YELLOW}>= ${MIN_PORT}${NC} (Ports < ${MIN_PORT} are completely exempt)"
     echo -e "Excluded Ports: ${MAGENTA}${EXCLUDE_PORTS:-None}${NC}"
-    echo -e "Check Interval: ${CYAN}${CHECK_INTERVAL}s (1 minute)${NC}"
+    local _interval_label
+    if (( CHECK_INTERVAL >= 3600 )); then
+        _interval_label="$(( CHECK_INTERVAL / 3600 )) hour(s)"
+    elif (( CHECK_INTERVAL >= 60 )); then
+        _interval_label="$(( CHECK_INTERVAL / 60 )) minute(s)"
+    else
+        _interval_label="${CHECK_INTERVAL} second(s)"
+    fi
+    echo -e "Check Interval: ${CYAN}${CHECK_INTERVAL}s (${_interval_label})${NC}"
     echo -e "Panel Database: $DB_PATH"
     echo -e "----------------------------------------------------------------"
 
@@ -806,16 +795,15 @@ install_service() {
     ensure_dependencies
     save_config
 
-    modprobe ifb numifbs=1 2>/dev/null || true
-    mkdir -p /etc/modules-load.d /etc/modprobe.d
-    cat << 'EOF' > /etc/modules-load.d/port-limit-tc.conf
+    mkdir -p /etc/modules-load.d
+    # Load only modules required for HTB egress + direct ingress policing
+    cat <<'EOF' > /etc/modules-load.d/port-limit-tc.conf
 sch_htb
 cls_u32
-act_mirred
 sch_fq_codel
-ifb
 EOF
-    echo "options ifb numifbs=1" > /etc/modprobe.d/port-limit-ifb.conf 2>/dev/null || true
+    # Remove any old IFB-related config left from previous versions
+    rm -f /etc/modprobe.d/port-limit-ifb.conf 2>/dev/null || true
 
     # Resolve physical canonical path of the script
     local real_source
@@ -833,6 +821,11 @@ EOF
             echo -e "${YELLOW}A permanent file on disk is required for the systemd service (${INSTALL_PATH}).${NC}\n"
             read -rp "Please enter the download URL to save to disk [or press Enter to cancel]: " dl_url
             if [[ -n "$dl_url" ]] && command -v curl >/dev/null 2>&1; then
+                # Validate URL starts with https:// for security
+                if [[ ! "$dl_url" =~ ^https:// ]]; then
+                    log_error "URL must start with https:// for security. Aborting."
+                    return 1
+                fi
                 log_info "Downloading script from $dl_url to $INSTALL_PATH..."
                 if curl -fsSL "$dl_url" -o "${INSTALL_PATH}.tmp" && [[ -s "${INSTALL_PATH}.tmp" ]]; then
                     chmod 755 "${INSTALL_PATH}.tmp"
@@ -950,12 +943,10 @@ menu_custom_limits() {
         if [[ -n "$CUSTOM_LIMITS" ]]; then
             IFS=',' read -ra c_arr <<< "$CUSTOM_LIMITS"
             for entry in "${c_arr[@]}"; do
-                entry=$(echo "$entry" | tr -d ' ')
+                entry="${entry// /}"
                 [[ -z "$entry" ]] && continue
-                local cp cd cu
-                cp=$(echo "$entry" | cut -d':' -f1)
-                cd=$(echo "$entry" | cut -d':' -f2)
-                cu=$(echo "$entry" | cut -d':' -f3)
+                local cp cd cu _rest
+                IFS=':' read -r cp cd cu _rest <<< "$entry"
                 echo -e "  • Port ${BOLD}${CYAN}$cp${NC} -> Download: ${GREEN}$cd${NC} | Upload: ${GREEN}$cu${NC}"
             done
         else
@@ -1022,10 +1013,9 @@ menu_custom_limits() {
                 if [[ -n "$CUSTOM_LIMITS" ]]; then
                     IFS=',' read -ra existing_arr <<< "$CUSTOM_LIMITS"
                     for item in "${existing_arr[@]}"; do
-                        item=$(echo "$item" | tr -d ' ')
+                        item="${item// /}"
                         [[ -z "$item" ]] && continue
-                        local item_p
-                        item_p=$(echo "$item" | cut -d':' -f1)
+                        local item_p="${item%%:*}"
                         if [[ "$item_p" != "$p_port" ]]; then
                             new_list+=("$item")
                         fi
@@ -1057,10 +1047,9 @@ menu_custom_limits() {
                 local found=0
                 IFS=',' read -ra existing_arr <<< "$CUSTOM_LIMITS"
                 for item in "${existing_arr[@]}"; do
-                    item=$(echo "$item" | tr -d ' ')
+                    item="${item// /}"
                     [[ -z "$item" ]] && continue
-                    local item_p
-                    item_p=$(echo "$item" | cut -d':' -f1)
+                    local item_p="${item%%:*}"
                     if [[ "$item_p" == "$p_port" ]]; then
                         found=1
                     else
@@ -1195,7 +1184,12 @@ show_menu() {
         echo -e " Default Speed Limits : Down: ${GREEN}$DOWNLOAD_LIMIT${NC} | Up: ${GREEN}$UPLOAD_LIMIT${NC}"
         echo -e " Port Filtering       : >= ${MIN_PORT} (Ports < ${MIN_PORT} are completely exempt)"
         echo -e " Excluded Ports       : ${MAGENTA}${EXCLUDE_PORTS:-None}${NC}"
-        echo -e " Check Interval       : ${CYAN}${CHECK_INTERVAL}s (1 minute)${NC}"
+        local _ci_label
+        if (( CHECK_INTERVAL >= 3600 )); then _ci_label="$(( CHECK_INTERVAL / 3600 ))h"
+        elif (( CHECK_INTERVAL >= 60 )); then  _ci_label="$(( CHECK_INTERVAL / 60 ))m"
+        else                                    _ci_label="${CHECK_INTERVAL}s"
+        fi
+        echo -e " Check Interval       : ${CYAN}${CHECK_INTERVAL}s (${_ci_label})${NC}"
         echo -e "${BOLD}${CYAN}================================================================${NC}"
         echo -e " ${BOLD}1)${NC} ${CYAN}Show current status & traffic stats (Status)${NC}"
         echo -e " ${BOLD}2)${NC} ${YELLOW}Change default download & upload speed limits${NC}"
