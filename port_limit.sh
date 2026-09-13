@@ -6,7 +6,7 @@
 
 set -o pipefail
 
-VERSION="1.1.4"
+VERSION="1.1.5"
 
 # ------------------------------------------------------------------------------
 # Default Settings (can be modified directly here or via the interactive menu)
@@ -434,7 +434,15 @@ apply_rules() {
     fi
 
     if [[ ${#active_ports[@]} -eq 0 ]]; then
-        log_warn "No active inbound ports found in 3X-UI database matching criteria (>= ${MIN_PORT:-10000})."
+        local total_inbounds
+        total_inbounds=$(sqlite3 -readonly "$DB_PATH" "SELECT count(*) FROM inbounds WHERE enable = 1;" 2>/dev/null || echo 0)
+        if (( total_inbounds > 0 )); then
+            log_warn "Found $total_inbounds active inbound(s) in 3X-UI database, but ALL of them have port < ${MIN_PORT:-10000}."
+            log_warn "Ports below ${MIN_PORT:-10000} are completely exempt from rate limits by your setting."
+            log_warn "If your test port is < ${MIN_PORT:-10000}, change the Min Port filter in Menu Option 3 (or enter 0 to include all ports)."
+        else
+            log_warn "No active inbound ports found in 3X-UI database matching criteria (>= ${MIN_PORT:-10000})."
+        fi
         clear_rules
         return 0
     fi
@@ -530,33 +538,39 @@ apply_rules() {
         local port_up="${custom_up_map[$port]:-$norm_up}"
 
         # --- Egress shaping (Download): match source port (sport = port) ---
-        batch_rules+="class replace dev $iface parent 1:1 classid $class_id htb rate $port_down ceil $port_down burst $BURST"$'\n'
-        batch_rules+="qdisc replace dev $iface parent $class_id handle $qdisc_handle $leaf_qdisc"$'\n'
-        batch_rules+="filter replace dev $iface protocol ip parent 1: prio 1 u32 match ip protocol 6 0xff match ip sport $port 0xffff flowid $class_id"$'\n'
-        batch_rules+="filter replace dev $iface protocol ip parent 1: prio 1 u32 match ip protocol 17 0xff match ip sport $port 0xffff flowid $class_id"$'\n'
-        batch_rules+="filter replace dev $iface protocol ipv6 parent 1: prio 2 u32 match u8 6 0xff at 6 match u16 $port 0xffff at 40 flowid $class_id"$'\n'
-        batch_rules+="filter replace dev $iface protocol ipv6 parent 1: prio 2 u32 match u8 17 0xff at 6 match u16 $port 0xffff at 40 flowid $class_id"$'\n'
+        batch_rules+="class add dev $iface parent 1:1 classid $class_id htb rate $port_down ceil $port_down burst $BURST"$'\n'
+        batch_rules+="qdisc add dev $iface parent $class_id handle $qdisc_handle $leaf_qdisc"$'\n'
+        # Match IPv4 TCP & UDP via sport
+        batch_rules+="filter add dev $iface protocol ip parent 1: prio 1 u32 match ip sport $port 0xffff flowid $class_id"$'\n'
+        # Match IPv6 TCP & UDP via sport (offset 40)
+        batch_rules+="filter add dev $iface protocol ipv6 parent 1: prio 2 u32 match u16 $port 0xffff at 40 flowid $class_id"$'\n'
 
         # --- Ingress shaping (Upload): only if IFB was successfully initialized ---
         if [[ $has_ifb -eq 1 ]]; then
-            batch_rules+="class replace dev $IFB_DEVICE parent 1:1 classid $class_id htb rate $port_up ceil $port_up burst $BURST"$'\n'
-            batch_rules+="qdisc replace dev $IFB_DEVICE parent $class_id handle $qdisc_handle $leaf_qdisc"$'\n'
-            batch_rules+="filter replace dev $IFB_DEVICE protocol ip parent 1: prio 1 u32 match ip protocol 6 0xff match ip dport $port 0xffff flowid $class_id"$'\n'
-            batch_rules+="filter replace dev $IFB_DEVICE protocol ip parent 1: prio 1 u32 match ip protocol 17 0xff match ip dport $port 0xffff flowid $class_id"$'\n'
-            batch_rules+="filter replace dev $IFB_DEVICE protocol ipv6 parent 1: prio 2 u32 match u8 6 0xff at 6 match u16 $port 0xffff at 42 flowid $class_id"$'\n'
-            batch_rules+="filter replace dev $IFB_DEVICE protocol ipv6 parent 1: prio 2 u32 match u8 17 0xff at 6 match u16 $port 0xffff at 42 flowid $class_id"$'\n'
+            batch_rules+="class add dev $IFB_DEVICE parent 1:1 classid $class_id htb rate $port_up ceil $port_up burst $BURST"$'\n'
+            batch_rules+="qdisc add dev $IFB_DEVICE parent $class_id handle $qdisc_handle $leaf_qdisc"$'\n'
+            # Match IPv4 TCP & UDP via dport on IFB0
+            batch_rules+="filter add dev $IFB_DEVICE protocol ip parent 1: prio 1 u32 match ip dport $port 0xffff flowid $class_id"$'\n'
+            # Match IPv6 TCP & UDP via dport on IFB0 (offset 42)
+            batch_rules+="filter add dev $IFB_DEVICE protocol ipv6 parent 1: prio 2 u32 match u16 $port 0xffff at 42 flowid $class_id"$'\n'
         fi
 
         idx=$((idx + 1))
     done
 
-    # Execute all port rules in a single atomic tc batch process (ultra-low CPU overhead)
-    if ! tc -force -batch - <<< "$batch_rules" 2>/dev/null; then
-        # Fallback to per-command execution if batch mode is unsupported
+    # Execute batch rules via temporary file (guaranteed compatibility across all iproute2 versions)
+    local batch_file
+    batch_file=$(mktemp /tmp/port_limit_batch.XXXXXX 2>/dev/null || echo "/tmp/port_limit_batch_$$.tc")
+    printf "%s\n" "$batch_rules" > "$batch_file"
+
+    local batch_err
+    if ! batch_err=$(tc -force -batch "$batch_file" 2>&1); then
+        # Fallback to direct execution
         while IFS= read -r cmd; do
             [[ -n "$cmd" ]] && tc $cmd 2>/dev/null || true
-        done <<< "$batch_rules"
+        done < "$batch_file"
     fi
+    rm -f "$batch_file"
 
     printf "%s\n" "${active_ports[@]}" > "$STATE_FILE"
     log_info "${GREEN}Rate limits successfully applied to all active ports.${NC}"
@@ -818,14 +832,40 @@ EOF
     local target_src="$real_source"
     [[ ! -f "$target_src" ]] && target_src="$0"
 
-    if [[ ! -f "$target_src" ]]; then
-        log_error "Source script ($target_src) not found! If installed via curl pipe, please download the file to disk first."
-        return 1
+    # If executed via pipe or process substitution (/dev/fd/*)
+    if [[ "$target_src" =~ ^/dev/fd/ || "$target_src" =~ ^/proc/ || ! -f "$target_src" ]]; then
+        if [[ -f "$INSTALL_PATH" && -s "$INSTALL_PATH" ]]; then
+            log_info "Using existing binary installation at: $INSTALL_PATH"
+            target_src="$INSTALL_PATH"
+        else
+            echo -e "\n${YELLOW}[ATTENTION] The script was executed directly from memory via pipe (bash <(curl ...)).${NC}"
+            echo -e "${YELLOW}A permanent file on disk is required for the systemd service (${INSTALL_PATH}).${NC}\n"
+            read -rp "Please enter the download URL to save to disk [or press Enter to cancel]: " dl_url
+            if [[ -n "$dl_url" ]] && command -v curl >/dev/null 2>&1; then
+                log_info "Downloading script from $dl_url to $INSTALL_PATH..."
+                if curl -fsSL "$dl_url" -o "${INSTALL_PATH}.tmp" && [[ -s "${INSTALL_PATH}.tmp" ]]; then
+                    chmod 755 "${INSTALL_PATH}.tmp"
+                    mv -f "${INSTALL_PATH}.tmp" "$INSTALL_PATH"
+                    target_src="$INSTALL_PATH"
+                    log_info "Script successfully saved to $INSTALL_PATH."
+                else
+                    log_error "Failed to download script from $dl_url."
+                    return 1
+                fi
+            else
+                log_error "Source script ($target_src) cannot be installed from a memory pipe."
+                echo -e "${CYAN}Please download the script to your server first, for example:${NC}"
+                echo -e "  ${BOLD}curl -sSL <YOUR_RAW_URL> -o port_limit.sh && chmod +x port_limit.sh && sudo ./port_limit.sh${NC}\n"
+                return 1
+            fi
+        fi
     fi
 
-    cp -f "$target_src" "${INSTALL_PATH}.tmp"
-    chmod 755 "${INSTALL_PATH}.tmp"
-    mv -f "${INSTALL_PATH}.tmp" "$INSTALL_PATH"
+    if [[ "$target_src" != "$INSTALL_PATH" ]]; then
+        cp -f "$target_src" "${INSTALL_PATH}.tmp"
+        chmod 755 "${INSTALL_PATH}.tmp"
+        mv -f "${INSTALL_PATH}.tmp" "$INSTALL_PATH"
+    fi
 
     cat << EOF > "/etc/systemd/system/${SERVICE_NAME}.service"
 [Unit]
