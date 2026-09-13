@@ -48,7 +48,7 @@ print_header() {
     if [ -f "${BINARY_PATH}" ] && [ -x "${BINARY_PATH}" ]; then
         echo -e "  ${DIM}Binary Status:${NC} ${GREEN}●${NC} ${GREEN}Installed${NC} ${DIM}(${BINARY_PATH})${NC}"
     else
-        echo -e "  ${DIM}Binary Status:${NC} ${RED}●${NC} ${YELLOW}Not Found${NC} ${DIM}(Use option 15 to download)${NC}"
+        echo -e "  ${DIM}Binary Status:${NC} ${RED}●${NC} ${YELLOW}Not Found${NC} ${DIM}(Use option 19 to download)${NC}"
     fi
     echo ""
 }
@@ -166,6 +166,56 @@ detect_public_ip() {
     fi
 
     echo "$ip"
+}
+
+# ─── IP Validation Helper ────────────────────────────────────────
+
+is_valid_ipv4() {
+    local ip="$1"
+    local regex='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+    if [[ ! $ip =~ $regex ]]; then
+        return 1
+    fi
+    local o1 o2 o3 o4
+    IFS='.' read -r o1 o2 o3 o4 <<< "$ip"
+    if [ "$o1" -le 255 ] && [ "$o2" -le 255 ] && [ "$o3" -le 255 ] && [ "$o4" -le 255 ]; then
+        return 0
+    fi
+    return 1
+}
+
+# ─── Duplicate Tunnel ID Checker ─────────────────────────────────
+
+get_tunnel_conflict() {
+    local tid="$1"
+    # Check existing TOML configs in CORE_DIR
+    if [ -d "${CORE_DIR}" ]; then
+        for cfg in "${CORE_DIR}"/*.toml; do
+            [ -f "$cfg" ] || continue
+            # Check local_addr / remote_addr for 10.10.<tid>.
+            if grep -qE "10\.10\.${tid}\.[0-9]+" "$cfg" 2>/dev/null; then
+                basename "$cfg"
+                return 0
+            fi
+            # Check tun name
+            if grep -qE "name\s*=\s*\"(backhaul|back)${tid}\"" "$cfg" 2>/dev/null; then
+                basename "$cfg"
+                return 0
+            fi
+        done
+    fi
+
+    # Check systemd services
+    local default_hp=$((1000 + 10#$tid))
+    if [ -f "${SYSTEMD_DIR}/backhaul-iran${default_hp}.service" ]; then
+        echo "backhaul-iran${default_hp}.service"
+        return 0
+    elif [ -f "${SYSTEMD_DIR}/backhaul-kharej${default_hp}.service" ]; then
+        echo "backhaul-kharej${default_hp}.service"
+        return 0
+    fi
+
+    return 0
 }
 
 # ─── Input Helpers ────────────────────────────────────────────────
@@ -428,18 +478,46 @@ setup_iran() {
 
     # ── Step 1: Tunnel Identity ──
     echo -e "\n ${MAGENTA}${BOLD}[1/5] Tunnel Identity${NC}"
-    read_input "Tunnel ID (e.g. 10, 12, 50)" "" TUNNEL_ID
-    if [ -z "$TUNNEL_ID" ]; then
-        msg_err "Tunnel ID is required!"
-        exit 1
-    fi
+    while true; do
+        read_input "Tunnel ID (e.g. 10, 12, 50)" "" TUNNEL_ID
+        if [[ "$TUNNEL_ID" =~ ^(q|quit|cancel)$ ]]; then
+            msg_warn "Setup cancelled."
+            return
+        fi
+        if [ -z "$TUNNEL_ID" ]; then
+            msg_err "Tunnel ID cannot be empty!"
+        elif ! [[ "$TUNNEL_ID" =~ ^[0-9]+$ ]] || [ "$TUNNEL_ID" -le 0 ] || [ "$TUNNEL_ID" -gt 254 ]; then
+            msg_err "Tunnel ID must be a number between 1 and 254."
+        else
+            local conflict
+            conflict=$(get_tunnel_conflict "$TUNNEL_ID")
+            if [ -n "$conflict" ]; then
+                msg_err "Tunnel ID '${TUNNEL_ID}' is already in use by '${conflict}'! Please choose a different ID."
+            else
+                break
+            fi
+        fi
+    done
     read_input "Tunnel name" "backhaul${TUNNEL_ID}" TUN_NAME
 
     local default_health_port="1001"
     if [[ "$TUNNEL_ID" =~ ^[0-9]+$ ]]; then
         default_health_port=$((1000 + 10#$TUNNEL_ID))
     fi
-    read_input "Health port" "${default_health_port}" HEALTH_PORT
+    while true; do
+        read_input "Health port" "${default_health_port}" HEALTH_PORT
+        if [[ "$HEALTH_PORT" =~ ^(q|quit|cancel)$ ]]; then
+            msg_warn "Setup cancelled."
+            return
+        fi
+        if [ -z "$HEALTH_PORT" ] || ! [[ "$HEALTH_PORT" =~ ^[0-9]+$ ]] || [ "$HEALTH_PORT" -le 0 ] || [ "$HEALTH_PORT" -gt 65535 ]; then
+            msg_err "Health port must be a valid port number (1-65535)."
+        elif [ -f "${CORE_DIR}/iran${HEALTH_PORT}.toml" ] || [ -f "${CORE_DIR}/kharej${HEALTH_PORT}.toml" ]; then
+            msg_err "Health port ${HEALTH_PORT} is already in use by an existing config! Please choose a different port."
+        else
+            break
+        fi
+    done
     read_input "MTU" "1320" MTU
 
     # Auto-generate TUN addresses from ID
@@ -453,24 +531,43 @@ setup_iran() {
     if [ -n "$AUTO_IP" ]; then
         msg_info "Public IP auto-detected: ${BOLD}${AUTO_IP}${NC}"
     fi
-    read_input "Listen IP (this server's public IP)" "${AUTO_IP}" LISTEN_IP
-    if [ -z "$LISTEN_IP" ]; then
-        msg_err "Listen IP is required!"
-        exit 1
-    fi
-    read_input "Destination IP (Kharej public IP)" "" DST_IP
-    if [ -z "$DST_IP" ]; then
-        msg_err "Destination IP is required!"
-        exit 1
-    fi
+    while true; do
+        read_input "Listen IP (this server's public IP)" "${AUTO_IP}" LISTEN_IP
+        if [[ "$LISTEN_IP" =~ ^(q|quit|cancel)$ ]]; then
+            msg_warn "Setup cancelled."
+            return
+        fi
+        if [ -z "$LISTEN_IP" ]; then
+            msg_err "Listen IP cannot be empty!"
+        elif ! is_valid_ipv4 "$LISTEN_IP"; then
+            msg_err "Invalid IP format '${LISTEN_IP}'. Please enter a valid IPv4 address."
+        else
+            break
+        fi
+    done
+
+    while true; do
+        read_input "Destination IP (Kharej public IP)" "" DST_IP
+        if [[ "$DST_IP" =~ ^(q|quit|cancel)$ ]]; then
+            msg_warn "Setup cancelled."
+            return
+        fi
+        if [ -z "$DST_IP" ]; then
+            msg_err "Destination IP cannot be empty!"
+        elif ! is_valid_ipv4 "$DST_IP"; then
+            msg_err "Invalid IP format '${DST_IP}'. Please enter a valid IPv4 address (e.g. 185.129.116.237)."
+        else
+            break
+        fi
+    done
 
     # ── Step 3: Profile (BIP or Spoof Protocols) ──
     echo -e "\n ${MAGENTA}${BOLD}[3/5] IPX Profile${NC}"
-    echo -e "  ${WHITE}1)${NC} bip  ${DIM}(default, no spoofing)${NC}"
-    echo -e "  ${WHITE}2)${NC} udp  ${DIM}(spoof mode)${NC}"
-    echo -e "  ${WHITE}3)${NC} tcp  ${DIM}(spoof mode)${NC}"
-    echo -e "  ${WHITE}4)${NC} icmp ${DIM}(spoof mode)${NC}"
-    read_input "Select profile (1, 2, 3 or 4)" "1" PROFILE_CHOICE
+    echo -e "  ${WHITE}1)${NC} bip"
+    echo -e "  ${WHITE}2)${NC} udp"
+    echo -e "  ${WHITE}3)${NC} tcp  ${DIM}(default)${NC}"
+    echo -e "  ${WHITE}4)${NC} icmp"
+    read_input "Select profile (1, 2, 3 or 4)" "3" PROFILE_CHOICE
     if [ "$PROFILE_CHOICE" = "2" ] || [ "$PROFILE_CHOICE" = "3" ] || [ "$PROFILE_CHOICE" = "4" ]; then
         if [ "$PROFILE_CHOICE" = "2" ]; then
             PROFILE="udp"
@@ -597,18 +694,46 @@ setup_kharej() {
 
     # ── Step 1: Tunnel Identity ──
     echo -e "\n ${MAGENTA}${BOLD}[1/5] Tunnel Identity${NC}"
-    read_input "Tunnel ID (must match Iran, e.g. 10, 12, 50)" "" TUNNEL_ID
-    if [ -z "$TUNNEL_ID" ]; then
-        msg_err "Tunnel ID is required!"
-        exit 1
-    fi
+    while true; do
+        read_input "Tunnel ID (must match Iran, e.g. 10, 12, 50)" "" TUNNEL_ID
+        if [[ "$TUNNEL_ID" =~ ^(q|quit|cancel)$ ]]; then
+            msg_warn "Setup cancelled."
+            return
+        fi
+        if [ -z "$TUNNEL_ID" ]; then
+            msg_err "Tunnel ID cannot be empty!"
+        elif ! [[ "$TUNNEL_ID" =~ ^[0-9]+$ ]] || [ "$TUNNEL_ID" -le 0 ] || [ "$TUNNEL_ID" -gt 254 ]; then
+            msg_err "Tunnel ID must be a number between 1 and 254."
+        else
+            local conflict
+            conflict=$(get_tunnel_conflict "$TUNNEL_ID")
+            if [ -n "$conflict" ]; then
+                msg_err "Tunnel ID '${TUNNEL_ID}' is already in use by '${conflict}'! Please choose a different ID."
+            else
+                break
+            fi
+        fi
+    done
     read_input "Tunnel name" "back${TUNNEL_ID}" TUN_NAME
 
     local default_health_port="1001"
     if [[ "$TUNNEL_ID" =~ ^[0-9]+$ ]]; then
         default_health_port=$((1000 + 10#$TUNNEL_ID))
     fi
-    read_input "Health port" "${default_health_port}" HEALTH_PORT
+    while true; do
+        read_input "Health port" "${default_health_port}" HEALTH_PORT
+        if [[ "$HEALTH_PORT" =~ ^(q|quit|cancel)$ ]]; then
+            msg_warn "Setup cancelled."
+            return
+        fi
+        if [ -z "$HEALTH_PORT" ] || ! [[ "$HEALTH_PORT" =~ ^[0-9]+$ ]] || [ "$HEALTH_PORT" -le 0 ] || [ "$HEALTH_PORT" -gt 65535 ]; then
+            msg_err "Health port must be a valid port number (1-65535)."
+        elif [ -f "${CORE_DIR}/iran${HEALTH_PORT}.toml" ] || [ -f "${CORE_DIR}/kharej${HEALTH_PORT}.toml" ]; then
+            msg_err "Health port ${HEALTH_PORT} is already in use by an existing config! Please choose a different port."
+        else
+            break
+        fi
+    done
     read_input "MTU" "1320" MTU
 
     # Auto-generate TUN addresses from ID (reversed for kharej)
@@ -622,24 +747,43 @@ setup_kharej() {
     if [ -n "$AUTO_IP" ]; then
         msg_info "Public IP auto-detected: ${BOLD}${AUTO_IP}${NC}"
     fi
-    read_input "Listen IP (this server's public IP)" "${AUTO_IP}" LISTEN_IP
-    if [ -z "$LISTEN_IP" ]; then
-        msg_err "Listen IP is required!"
-        exit 1
-    fi
-    read_input "Destination IP (Iran public IP)" "" DST_IP
-    if [ -z "$DST_IP" ]; then
-        msg_err "Destination IP is required!"
-        exit 1
-    fi
+    while true; do
+        read_input "Listen IP (this server's public IP)" "${AUTO_IP}" LISTEN_IP
+        if [[ "$LISTEN_IP" =~ ^(q|quit|cancel)$ ]]; then
+            msg_warn "Setup cancelled."
+            return
+        fi
+        if [ -z "$LISTEN_IP" ]; then
+            msg_err "Listen IP cannot be empty!"
+        elif ! is_valid_ipv4 "$LISTEN_IP"; then
+            msg_err "Invalid IP format '${LISTEN_IP}'. Please enter a valid IPv4 address."
+        else
+            break
+        fi
+    done
+
+    while true; do
+        read_input "Destination IP (Iran public IP)" "" DST_IP
+        if [[ "$DST_IP" =~ ^(q|quit|cancel)$ ]]; then
+            msg_warn "Setup cancelled."
+            return
+        fi
+        if [ -z "$DST_IP" ]; then
+            msg_err "Destination IP cannot be empty!"
+        elif ! is_valid_ipv4 "$DST_IP"; then
+            msg_err "Invalid IP format '${DST_IP}'. Please enter a valid IPv4 address (e.g. 79.127.126.29)."
+        else
+            break
+        fi
+    done
 
     # ── Step 3: Profile (BIP or Spoof Protocols) ──
     echo -e "\n ${MAGENTA}${BOLD}[3/5] IPX Profile${NC}"
-    echo -e "  ${WHITE}1)${NC} bip  ${DIM}(default, no spoofing)${NC}"
-    echo -e "  ${WHITE}2)${NC} udp  ${DIM}(spoof mode)${NC}"
-    echo -e "  ${WHITE}3)${NC} tcp  ${DIM}(spoof mode)${NC}"
-    echo -e "  ${WHITE}4)${NC} icmp ${DIM}(spoof mode)${NC}"
-    read_input "Select profile (1, 2, 3 or 4)" "1" PROFILE_CHOICE
+    echo -e "  ${WHITE}1)${NC} bip"
+    echo -e "  ${WHITE}2)${NC} udp"
+    echo -e "  ${WHITE}3)${NC} tcp  ${DIM}(default)${NC}"
+    echo -e "  ${WHITE}4)${NC} icmp"
+    read_input "Select profile (1, 2, 3 or 4)" "3" PROFILE_CHOICE
     if [ "$PROFILE_CHOICE" = "2" ] || [ "$PROFILE_CHOICE" = "3" ] || [ "$PROFILE_CHOICE" = "4" ]; then
         if [ "$PROFILE_CHOICE" = "2" ]; then
             PROFILE="udp"
@@ -732,6 +876,296 @@ setup_kharej() {
     echo ""
     print_double_line
     echo -e " ${GREEN}${BOLD}  Kharej Client Setup Complete!${NC}"
+    print_double_line
+    echo ""
+    echo -e "  Config:    ${BLUE}${config_file}${NC}"
+    echo -e "  Service:   ${BLUE}${service_name}.service${NC}"
+    echo ""
+
+    echo -e " ${CYAN}Service status:${NC}"
+    systemctl status "${service_name}" --no-pager -l 2>/dev/null | head -5
+    echo ""
+}
+
+fast_setup_iran() {
+    print_header
+    echo -e " ${GREEN}${BOLD}>>> Fast Setup Iran Server (IPX Server Mode)${NC}"
+    echo ""
+    print_line
+
+    ensure_setup_prerequisites || return
+
+    # Auto-detect interface
+    INTERFACE=$(detect_interface)
+
+    # Auto-detect public IP for listen_ip default
+    local AUTO_IP
+    AUTO_IP=$(detect_public_ip)
+
+    echo -e "\n ${CYAN}${BOLD}[Fast Setup] Only 3 inputs required:${NC}\n"
+
+    # 1. Tunnel ID
+    while true; do
+        read_input "Tunnel ID (e.g. 10, 12, 50)" "" TUNNEL_ID
+        if [[ "$TUNNEL_ID" =~ ^(q|quit|cancel)$ ]]; then
+            msg_warn "Setup cancelled."
+            return
+        fi
+        if [ -z "$TUNNEL_ID" ]; then
+            msg_err "Tunnel ID cannot be empty!"
+        elif ! [[ "$TUNNEL_ID" =~ ^[0-9]+$ ]] || [ "$TUNNEL_ID" -le 0 ] || [ "$TUNNEL_ID" -gt 254 ]; then
+            msg_err "Tunnel ID must be a number between 1 and 254."
+        else
+            local conflict
+            conflict=$(get_tunnel_conflict "$TUNNEL_ID")
+            if [ -n "$conflict" ]; then
+                msg_err "Tunnel ID '${TUNNEL_ID}' is already in use by '${conflict}'! Please choose a different ID."
+            else
+                break
+            fi
+        fi
+    done
+
+    # Automated values based on Tunnel ID
+    TUN_NAME="backhaul${TUNNEL_ID}"
+    HEALTH_PORT=$((1000 + 10#$TUNNEL_ID))
+    MTU="1320"
+
+    LOCAL_TUN_ADDR="10.10.${TUNNEL_ID}.1/24"
+    REMOTE_TUN_ADDR="10.10.${TUNNEL_ID}.2/24"
+
+    # 2. Listen IP
+    if [ -n "$AUTO_IP" ]; then
+        msg_info "Public IP auto-detected: ${BOLD}${AUTO_IP}${NC}"
+    fi
+    while true; do
+        read_input "Listen IP (this server's public IP)" "${AUTO_IP}" LISTEN_IP
+        if [[ "$LISTEN_IP" =~ ^(q|quit|cancel)$ ]]; then
+            msg_warn "Setup cancelled."
+            return
+        fi
+        if [ -z "$LISTEN_IP" ]; then
+            msg_err "Listen IP cannot be empty!"
+        elif ! is_valid_ipv4 "$LISTEN_IP"; then
+            msg_err "Invalid IP format '${LISTEN_IP}'. Please enter a valid IPv4 address."
+        else
+            break
+        fi
+    done
+
+    # 3. Destination IP
+    while true; do
+        read_input "Destination IP (Kharej public IP)" "" DST_IP
+        if [[ "$DST_IP" =~ ^(q|quit|cancel)$ ]]; then
+            msg_warn "Setup cancelled."
+            return
+        fi
+        if [ -z "$DST_IP" ]; then
+            msg_err "Destination IP cannot be empty!"
+        elif ! is_valid_ipv4 "$DST_IP"; then
+            msg_err "Invalid IP format '${DST_IP}'. Please enter a valid IPv4 address (e.g. 185.129.116.237)."
+        else
+            break
+        fi
+    done
+
+    # Automated IPX Profile & Security & Tuning
+    PROFILE="tcp"
+    SPOOF_SRC_IP=""
+    SPOOF_DST_IP=""
+    SPOOF_BLOCK=""
+
+    ENCRYPTION="false"
+    ALGORITHM="aes-256-gcm"
+    PSK="${DEFAULT_PSK}"
+    KDF_ITERATIONS="100000"
+
+    HEARTBEAT_INTERVAL="10"
+    HEARTBEAT_TIMEOUT="25"
+
+    local default_workers
+    default_workers=$(nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo 2>/dev/null || echo 1)
+    if [ -z "$default_workers" ] || [ "$default_workers" -lt 1 ]; then
+        default_workers=1
+    fi
+    WORKERS="${default_workers}"
+
+    TUNING_PROFILE="fast"
+    LOG_LEVEL="info"
+
+    # Review
+    show_review_box "iran"
+
+    read -p "  Proceed with setup? (Y/n): " confirm
+    if [[ "$confirm" =~ ^[Nn]$ ]]; then
+        msg_warn "Setup cancelled."
+        return
+    fi
+
+    # Generate
+    echo ""
+    mkdir -p "${CORE_DIR}"
+
+    local config_file="${CORE_DIR}/iran${HEALTH_PORT}.toml"
+    local service_name="backhaul-iran${HEALTH_PORT}"
+
+    generate_iran_config "${config_file}"
+    msg_ok "Config saved: ${config_file}"
+
+    create_systemd_service "${service_name}" "${config_file}" "Backhaul Iran - ${TUN_NAME}"
+    msg_ok "Service created and started: ${service_name}"
+
+    # Final Summary
+    echo ""
+    print_double_line
+    echo -e " ${GREEN}${BOLD}  Iran Server Fast Setup Complete!${NC}"
+    print_double_line
+    echo ""
+    echo -e "  Config:    ${BLUE}${config_file}${NC}"
+    echo -e "  Service:   ${BLUE}${service_name}.service${NC}"
+    echo ""
+    echo -e " ${YELLOW}${BOLD}  For Kharej setup, use:${NC}"
+    echo -e "    Tunnel ID:  ${CYAN}${BOLD}${TUNNEL_ID}${NC}"
+    echo -e "    Dest IP:    ${CYAN}${BOLD}${LISTEN_IP}${NC}"
+    echo ""
+
+    echo -e " ${CYAN}Service status:${NC}"
+    systemctl status "${service_name}" --no-pager -l 2>/dev/null | head -5
+    echo ""
+}
+
+fast_setup_kharej() {
+    print_header
+    echo -e " ${GREEN}${BOLD}>>> Fast Setup Kharej Client (IPX Client Mode)${NC}"
+    echo ""
+    print_line
+
+    ensure_setup_prerequisites || return
+
+    # Auto-detect interface
+    INTERFACE=$(detect_interface)
+
+    # Auto-detect public IP for listen_ip default
+    local AUTO_IP
+    AUTO_IP=$(detect_public_ip)
+
+    echo -e "\n ${CYAN}${BOLD}[Fast Setup] Only 3 inputs required:${NC}\n"
+
+    # 1. Tunnel ID
+    while true; do
+        read_input "Tunnel ID (must match Iran, e.g. 10, 12, 50)" "" TUNNEL_ID
+        if [[ "$TUNNEL_ID" =~ ^(q|quit|cancel)$ ]]; then
+            msg_warn "Setup cancelled."
+            return
+        fi
+        if [ -z "$TUNNEL_ID" ]; then
+            msg_err "Tunnel ID cannot be empty!"
+        elif ! [[ "$TUNNEL_ID" =~ ^[0-9]+$ ]] || [ "$TUNNEL_ID" -le 0 ] || [ "$TUNNEL_ID" -gt 254 ]; then
+            msg_err "Tunnel ID must be a number between 1 and 254."
+        else
+            local conflict
+            conflict=$(get_tunnel_conflict "$TUNNEL_ID")
+            if [ -n "$conflict" ]; then
+                msg_err "Tunnel ID '${TUNNEL_ID}' is already in use by '${conflict}'! Please choose a different ID."
+            else
+                break
+            fi
+        fi
+    done
+
+    # Automated values based on Tunnel ID
+    TUN_NAME="back${TUNNEL_ID}"
+    HEALTH_PORT=$((1000 + 10#$TUNNEL_ID))
+    MTU="1320"
+
+    LOCAL_TUN_ADDR="10.10.${TUNNEL_ID}.2/24"
+    REMOTE_TUN_ADDR="10.10.${TUNNEL_ID}.1/24"
+
+    # 2. Listen IP
+    if [ -n "$AUTO_IP" ]; then
+        msg_info "Public IP auto-detected: ${BOLD}${AUTO_IP}${NC}"
+    fi
+    while true; do
+        read_input "Listen IP (this server's public IP)" "${AUTO_IP}" LISTEN_IP
+        if [[ "$LISTEN_IP" =~ ^(q|quit|cancel)$ ]]; then
+            msg_warn "Setup cancelled."
+            return
+        fi
+        if [ -z "$LISTEN_IP" ]; then
+            msg_err "Listen IP cannot be empty!"
+        elif ! is_valid_ipv4 "$LISTEN_IP"; then
+            msg_err "Invalid IP format '${LISTEN_IP}'. Please enter a valid IPv4 address."
+        else
+            break
+        fi
+    done
+
+    # 3. Destination IP
+    while true; do
+        read_input "Destination IP (Iran public IP)" "" DST_IP
+        if [[ "$DST_IP" =~ ^(q|quit|cancel)$ ]]; then
+            msg_warn "Setup cancelled."
+            return
+        fi
+        if [ -z "$DST_IP" ]; then
+            msg_err "Destination IP cannot be empty!"
+        elif ! is_valid_ipv4 "$DST_IP"; then
+            msg_err "Invalid IP format '${DST_IP}'. Please enter a valid IPv4 address (e.g. 5.160.10.20)."
+        else
+            break
+        fi
+    done
+
+    # Automated IPX Profile & Security & Tuning
+    PROFILE="tcp"
+    SPOOF_SRC_IP=""
+    SPOOF_DST_IP=""
+    SPOOF_BLOCK=""
+
+    ENCRYPTION="false"
+    ALGORITHM="aes-256-gcm"
+    PSK="${DEFAULT_PSK}"
+    KDF_ITERATIONS="100000"
+
+    HEARTBEAT_INTERVAL="10"
+    HEARTBEAT_TIMEOUT="25"
+
+    local default_workers
+    default_workers=$(nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo 2>/dev/null || echo 1)
+    if [ -z "$default_workers" ] || [ "$default_workers" -lt 1 ]; then
+        default_workers=1
+    fi
+    WORKERS="${default_workers}"
+
+    TUNING_PROFILE="fast"
+    LOG_LEVEL="info"
+
+    # Review
+    show_review_box "kharej"
+
+    read -p "  Proceed with setup? (Y/n): " confirm
+    if [[ "$confirm" =~ ^[Nn]$ ]]; then
+        msg_warn "Setup cancelled."
+        return
+    fi
+
+    # Generate
+    echo ""
+    mkdir -p "${CORE_DIR}"
+
+    local config_file="${CORE_DIR}/kharej${HEALTH_PORT}.toml"
+    local service_name="backhaul-kharej${HEALTH_PORT}"
+
+    generate_kharej_config "${config_file}"
+    msg_ok "Config saved: ${config_file}"
+
+    create_systemd_service "${service_name}" "${config_file}" "Backhaul Kharej - ${TUN_NAME}"
+    msg_ok "Service created and started: ${service_name}"
+
+    # Final Summary
+    echo ""
+    print_double_line
+    echo -e " ${GREEN}${BOLD}  Kharej Client Fast Setup Complete!${NC}"
     print_double_line
     echo ""
     echo -e "  Config:    ${BLUE}${config_file}${NC}"
@@ -1154,7 +1588,7 @@ scan_and_sync_configs() {
     else
         echo ""
         msg_ok "Sync completed."
-        echo -e " ${CYAN}Use option 3 to list all tunnels and check their status.${NC}"
+        echo -e " ${CYAN}Use option 5 to list all tunnels and check their status.${NC}"
     fi
 }
 
@@ -1166,31 +1600,33 @@ main_menu() {
         echo -e " ${BOLD}${WHITE}Setup${NC}"
         echo -e "  ${GREEN}1)${NC} Setup Iran Server (IPX Server)"
         echo -e "  ${BLUE}2)${NC} Setup Kharej Client (IPX Client)"
+        echo -e "  ${GREEN}3)${NC} Fast Setup Iran Server"
+        echo -e "  ${BLUE}4)${NC} Fast Setup Kharej Client"
         echo ""
         echo -e " ${BOLD}${WHITE}Tunnels${NC}"
-        echo -e "  ${CYAN}3)${NC} List All Tunnels"
-        echo -e "  ${GREEN}4)${NC} Start a Tunnel"
-        echo -e "  ${YELLOW}5)${NC} Restart a Tunnel"
-        echo -e "  ${YELLOW}6)${NC} Stop a Tunnel"
-        echo -e "  ${MAGENTA}7)${NC} Stop & Disable (keep files)"
-        echo -e "  ${BLUE}16)${NC} Scan Configs & Auto-Create Services"
+        echo -e "  ${CYAN}5)${NC} List All Tunnels"
+        echo -e "  ${GREEN}6)${NC} Start a Tunnel"
+        echo -e "  ${YELLOW}7)${NC} Restart a Tunnel"
+        echo -e "  ${YELLOW}8)${NC} Stop a Tunnel"
+        echo -e "  ${MAGENTA}9)${NC} Stop & Disable (keep files)"
+        echo -e "  ${BLUE}10)${NC} Scan Configs & Auto-Create Services"
         echo ""
         echo -e " ${BOLD}${WHITE}Info & Logs${NC}"
-        echo -e "  ${CYAN}8)${NC} View Last 50 Logs"
-        echo -e "  ${CYAN}9)${NC} View Live Logs"
-        echo -e "  ${BLUE}10)${NC} View Config"
-        echo -e "  ${YELLOW}17)${NC} Edit Config (nano)"
+        echo -e "  ${CYAN}11)${NC} View Last 50 Logs"
+        echo -e "  ${CYAN}12)${NC} View Live Logs"
+        echo -e "  ${BLUE}13)${NC} View Config"
+        echo -e "  ${YELLOW}14)${NC} Edit Config (nano)"
         echo ""
         echo -e " ${BOLD}${WHITE}Watchdog (Kharej)${NC}"
-        echo -e "  ${GREEN}12)${NC} Deploy Watchdog"
-        echo -e "  ${CYAN}13)${NC} Watchdog Status & Logs"
-        echo -e "  ${RED}14)${NC} Remove Watchdog"
+        echo -e "  ${GREEN}15)${NC} Deploy Watchdog"
+        echo -e "  ${CYAN}16)${NC} Watchdog Status & Logs"
+        echo -e "  ${RED}17)${NC} Remove Watchdog"
         echo ""
         echo -e " ${BOLD}${WHITE}Danger${NC}"
-        echo -e "  ${RED}11)${NC} Delete a Tunnel"
+        echo -e "  ${RED}18)${NC} Delete a Tunnel"
         echo ""
         echo -e " ${BOLD}${WHITE}Install${NC}"
-        echo -e "  ${MAGENTA}15)${NC} Download Backhaul Binary"
+        echo -e "  ${MAGENTA}19)${NC} Download Backhaul Binary"
         echo ""
         echo -e "  ${DIM}0)${NC} Exit"
         echo ""
@@ -1199,21 +1635,23 @@ main_menu() {
         case $choice in
             1)  setup_iran ;;
             2)  setup_kharej ;;
-            3)  list_tunnels ;;
-            4)  do_start ;;
-            5)  do_restart ;;
-            6)  do_stop ;;
-            7)  do_disable ;;
-            8)  do_logs ;;
-            9)  do_live_logs ;;
-            10) do_view_config ;;
-            17) do_edit_config ;;
-            11) do_delete ;;
-            12) deploy_watchdog ;;
-            13) watchdog_status ;;
-            14) remove_watchdog ;;
-            15) download_binary ;;
-            16) scan_and_sync_configs ;;
+            3)  fast_setup_iran ;;
+            4)  fast_setup_kharej ;;
+            5)  list_tunnels ;;
+            6)  do_start ;;
+            7)  do_restart ;;
+            8)  do_stop ;;
+            9)  do_disable ;;
+            10) scan_and_sync_configs ;;
+            11) do_logs ;;
+            12) do_live_logs ;;
+            13) do_view_config ;;
+            14) do_edit_config ;;
+            15) deploy_watchdog ;;
+            16) watchdog_status ;;
+            17) remove_watchdog ;;
+            18) do_delete ;;
+            19) download_binary ;;
             0)
                 echo -e "\n ${GREEN}Goodbye!${NC}\n"
                 exit 0
