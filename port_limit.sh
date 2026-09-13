@@ -6,31 +6,46 @@
 
 set -o pipefail
 
-VERSION="1.1.7"
+VERSION="1.1.8"
 
 # ------------------------------------------------------------------------------
 # Default Settings (can be modified directly here or via the interactive menu)
 # ------------------------------------------------------------------------------
-DOWNLOAD_LIMIT="10mbit"       # Client download speed limit (Server egress traffic)
-UPLOAD_LIMIT="10mbit"         # Client upload speed limit (Server ingress traffic)
-CHECK_INTERVAL=60             # Interval in seconds to check for new inbounds (1 minute)
+DOWNLOAD_LIMIT="16mbit"       # Client download speed limit (Server egress traffic)
+UPLOAD_LIMIT="16mbit"         # Client upload speed limit (Server ingress traffic)
+CHECK_INTERVAL=600             # Interval in seconds to check for new inbounds (1 minute)
 EXCLUDE_PORTS="22"            # Excluded ports (comma-separated, e.g., 22,2053)
 MIN_PORT=10000                # Minimum port threshold (ports below 10000 are completely exempt)
 CUSTOM_LIMITS=""              # Custom limits per port (e.g., "443:20mbit:20mbit,8443:5mbit:5mbit")
 BURST="128k"                  # Burst buffer size for connection establishment (TSO/GSO 64KB+ compatible)
-DB_PATH="${PORT_LIMIT_DB:-/etc/x-ui/x-ui.db}"         # SQLite database path for 3X-UI panel
+# [FIX-S8] Sanitize environment overrides: enforce valid absolute paths without traversal
+if [[ -n "${PORT_LIMIT_DB:-}" && "${PORT_LIMIT_DB}" =~ ^/[a-zA-Z0-9_./-]+$ && ! "${PORT_LIMIT_DB}" =~ \.\. ]]; then
+    DB_PATH="$PORT_LIMIT_DB"
+else
+    DB_PATH="/etc/x-ui/x-ui.db"
+fi
 WAN_INTERFACE=""                                      # Leave empty for automatic WAN interface detection
 # ------------------------------------------------------------------------------
 
-CONFIG_FILE="${PORT_LIMIT_CONFIG:-/etc/port-limit.conf}"
+if [[ -n "${PORT_LIMIT_CONFIG:-}" && "${PORT_LIMIT_CONFIG}" =~ ^/[a-zA-Z0-9_./-]+$ && ! "${PORT_LIMIT_CONFIG}" =~ \.\. ]]; then
+    CONFIG_FILE="$PORT_LIMIT_CONFIG"
+else
+    CONFIG_FILE="/etc/port-limit.conf"
+fi
 SERVICE_NAME="port-limit"
 INSTALL_PATH="/usr/local/bin/port-limit"
-STATE_FILE="${PORT_LIMIT_STATE:-/run/port-limit.ports}"
+
+if [[ -n "${PORT_LIMIT_STATE:-}" && "${PORT_LIMIT_STATE}" =~ ^/[a-zA-Z0-9_./-]+$ && ! "${PORT_LIMIT_STATE}" =~ \.\. ]]; then
+    STATE_FILE="$PORT_LIMIT_STATE"
+else
+    STATE_FILE="/run/port-limit.ports"
+fi
 IFB_DEVICE="ifb0"
 
 # Runtime state (not user-configurable)
 DEPS_VERIFIED=0
 CACHED_WAN_IFACE=""
+CACHED_WAN_TIME=0
 
 # Standard terminal color codes
 RED='\033[0;31m'
@@ -138,19 +153,24 @@ load_config() {
                 UPLOAD_LIMIT)
                     local v; if v=$(validate_rate "$val" 2>/dev/null); then UPLOAD_LIMIT="$v"; fi ;;
                 CHECK_INTERVAL)
-                    [[ "$val" =~ ^[0-9]+$ && "$val" -ge 1 ]] && CHECK_INTERVAL="$val" ;;
+                    # [FIX-L7] Cap interval to max 86400s (1 day) to prevent near-infinite accidental values
+                    [[ "$val" =~ ^[0-9]+$ ]] && (( val >= 1 && val <= 86400 )) && CHECK_INTERVAL="$val" ;;
                 EXCLUDE_PORTS)
                     EXCLUDE_PORTS="$(validate_ports_list "$val")" ;;
                 MIN_PORT)
-                    [[ "$val" =~ ^[0-9]+$ && "$val" -ge 1 && "$val" -le 65535 ]] && MIN_PORT="$val" ;;
+                    # [FIX-L5] Allow 0 to mean "no minimum threshold" (apply limits to all ports)
+                    [[ "$val" =~ ^[0-9]+$ ]] && (( val >= 0 && val <= 65535 )) && MIN_PORT="$val" ;;
                 CUSTOM_LIMITS)
                     CUSTOM_LIMITS=$(validate_custom_limits "$val") ;;
                 BURST)
-                    [[ "$val" =~ ^[0-9]+[kKmMgG]?$ ]] && BURST="$val" ;;
+                    # [FIX-L8] Reject zero-burst values that cause silent tc failures
+                    [[ "$val" =~ ^[1-9][0-9]*[kKmMgG]?$ ]] && BURST="$val" ;;
                 DB_PATH)
-                    [[ -n "$val" ]] && DB_PATH="$val" ;;
+                    # [FIX-S5] Only accept absolute paths; reject shell metacharacters
+                    if [[ "$val" =~ ^/[a-zA-Z0-9_./-]+$ ]]; then DB_PATH="$val"; fi ;;
                 WAN_INTERFACE)
-                    WAN_INTERFACE="$val" ;;
+                    # [FIX-S6] Validate interface name against allowed character set (max 15 chars)
+                    if [[ "$val" =~ ^[a-zA-Z0-9_@.-]{1,15}$ ]]; then WAN_INTERFACE="$val"; fi ;;
             esac
         done < "$CONFIG_FILE"
     fi
@@ -162,16 +182,23 @@ load_config
 # ------------------------------------------------------------------------------
 # Logging & Helper Functions
 # ------------------------------------------------------------------------------
+# [FIX-S9] Sanitize log messages to prevent ANSI escape injection / log forging
 log_info() {
-    echo -e "${CYAN}[$(date '+%Y-%m-%d %H:%M:%S')]${NC} ${GREEN}[INFO]${NC} $1" >&2
+    local msg="$1"
+    msg="${msg//$'\r'/}"
+    printf '%b[INFO]%b %s\n' "${CYAN}[$(date '+%Y-%m-%d %H:%M:%S')] ${GREEN}" "${NC}" "$msg" >&2
 }
 
 log_warn() {
-    echo -e "${CYAN}[$(date '+%Y-%m-%d %H:%M:%S')]${NC} ${YELLOW}[WARN]${NC} $1" >&2
+    local msg="$1"
+    msg="${msg//$'\r'/}"
+    printf '%b[WARN]%b %s\n' "${CYAN}[$(date '+%Y-%m-%d %H:%M:%S')] ${YELLOW}" "${NC}" "$msg" >&2
 }
 
 log_error() {
-    echo -e "${CYAN}[$(date '+%Y-%m-%d %H:%M:%S')]${NC} ${RED}[ERROR]${NC} $1" >&2
+    local msg="$1"
+    msg="${msg//$'\r'/}"
+    printf '%b[ERROR]%b %s\n' "${CYAN}[$(date '+%Y-%m-%d %H:%M:%S')] ${RED}" "${NC}" "$msg" >&2
 }
 
 check_root() {
@@ -233,7 +260,12 @@ ensure_dependencies() {
     fi
 
     ensure_kernel_modules
-    DEPS_VERIFIED=1
+    # [FIX-ST5] Only mark verified if critical binaries actually exist
+    if command -v tc >/dev/null 2>&1 && command -v sqlite3 >/dev/null 2>&1; then
+        DEPS_VERIFIED=1
+    else
+        log_warn "Some required tools (tc or sqlite3) could not be verified."
+    fi
 }
 
 # Automatically detect WAN interface, with in-memory caching to avoid repeated ip/awk calls
@@ -242,7 +274,11 @@ detect_wan_interface() {
         echo "$WAN_INTERFACE"
         return 0
     fi
-    if [[ -n "$CACHED_WAN_IFACE" ]] && ip link show "$CACHED_WAN_IFACE" >/dev/null 2>&1; then
+
+    # [FIX-L4] Cache WAN interface with 300s TTL; re-evaluate routing when cache expires or link drops
+    local now
+    now=$(date +%s 2>/dev/null || echo 0)
+    if [[ -n "$CACHED_WAN_IFACE" && $((now - CACHED_WAN_TIME)) -ge 0 && $((now - CACHED_WAN_TIME)) -lt 300 ]] && ip link show "$CACHED_WAN_IFACE" >/dev/null 2>&1; then
         echo "$CACHED_WAN_IFACE"
         return 0
     fi
@@ -256,9 +292,10 @@ detect_wan_interface() {
     fi
     # Priority 3: Active physical links excluding virtual devices
     if [[ -z "$iface" ]]; then
-        iface=$(ip -br link | awk '$2=="UP" && $1!="lo" && !($1~/^(ifb|docker|br-|veth|tun|tap|wg)/){print $1; exit}')
+        iface=$(ip -br link 2>/dev/null | awk '$2=="UP" && $1!="lo" && !($1~/^(ifb|docker|br-|veth|tun|tap|wg)/){print $1; exit}')
     fi
     CACHED_WAN_IFACE="$iface"
+    CACHED_WAN_TIME="$now"
     echo "$iface"
 }
 
@@ -274,6 +311,7 @@ get_active_ports() {
     fi
 
     local min_p="${MIN_PORT:-10000}"
+    [[ "$min_p" =~ ^[0-9]+$ ]] || min_p=10000
     # Filter, deduplicate, and sort by port directly in SQLite query to minimize data and CPU overhead
     local raw_ports
     raw_ports=$(sqlite3 -readonly "$DB_PATH" "PRAGMA busy_timeout = 2000; SELECT DISTINCT port FROM inbounds WHERE enable = 1 AND port >= $min_p AND port <= 65535 ORDER BY port ASC;" 2>/dev/null)
@@ -314,31 +352,32 @@ get_active_ports() {
     fi
 }
 
+# [FIX-ST1] Centralized parser for CUSTOM_LIMITS into global associative arrays.
+# Declares and populates globals: custom_down_map, custom_up_map
+# Eliminates identical inline parsing blocks duplicated across apply_rules, show_status, and get_port_limits.
+_load_custom_limits_maps() {
+    declare -g -A custom_down_map custom_up_map
+    custom_down_map=()
+    custom_up_map=()
+    [[ -z "$CUSTOM_LIMITS" ]] && return 0
+    local c_arr entry cp cd cu val_cd val_cu
+    IFS=',' read -ra c_arr <<< "$CUSTOM_LIMITS"
+    for entry in "${c_arr[@]}"; do
+        entry="${entry// /}"
+        [[ -z "$entry" ]] && continue
+        IFS=':' read -r cp cd cu <<< "$entry"
+        [[ -z "$cp" ]] && continue
+        val_cd=$(validate_rate "$cd" 2>/dev/null) && custom_down_map["$cp"]="$val_cd"
+        val_cu=$(validate_rate "$cu" 2>/dev/null) && custom_up_map["$cp"]="$val_cu"
+    done
+}
+
 # Get rate limits for a specific port (custom override or default, zero-fork pure bash)
 get_port_limits() {
     local port="$1"
-    local down="$DOWNLOAD_LIMIT"
-    local up="$UPLOAD_LIMIT"
-
-    if [[ -n "$CUSTOM_LIMITS" ]]; then
-        IFS=',' read -ra c_arr <<< "$CUSTOM_LIMITS"
-        for entry in "${c_arr[@]}"; do
-            entry="${entry// /}"
-            [[ -z "$entry" ]] && continue
-            local cp cd cu
-            IFS=':' read -r cp cd cu <<< "$entry"
-            if [[ "$cp" == "$port" ]]; then
-                local val_cd val_cu
-                if val_cd=$(validate_rate "$cd" 2>/dev/null); then
-                    down="$val_cd"
-                fi
-                if val_cu=$(validate_rate "$cu" 2>/dev/null); then
-                    up="$val_cu"
-                fi
-                break
-            fi
-        done
-    fi
+    _load_custom_limits_maps
+    local down="${custom_down_map[$port]:-$DOWNLOAD_LIMIT}"
+    local up="${custom_up_map[$port]:-$UPLOAD_LIMIT}"
 
     local norm_d norm_u
     norm_d=$(validate_rate "$down") || norm_d="10mbit"
@@ -380,11 +419,8 @@ clear_rules() {
     log_info "All traffic control limits have been cleared successfully."
 }
 
-# Apply download and upload bandwidth limits for all active inbounds
-apply_rules() {
-    ensure_dependencies
-    load_config
-
+# Internal implementation of rule application (called exclusively with lock held)
+_apply_rules_locked() {
     local iface
     iface=$(detect_wan_interface)
 
@@ -402,6 +438,12 @@ apply_rules() {
 
     local raw_ports
     raw_ports=$(get_active_ports 2>/dev/null)
+    local get_ports_status=$?
+    if [[ $get_ports_status -ne 0 ]]; then
+        log_warn "Database is currently busy or unreachable (exit code: $get_ports_status). Preserving existing tc rules."
+        return 0
+    fi
+
     local active_ports=()
     if [[ -n "$raw_ports" ]]; then
         while IFS= read -r line; do
@@ -413,14 +455,18 @@ apply_rules() {
         local total_inbounds
         total_inbounds=$(sqlite3 -readonly "$DB_PATH" "SELECT count(*) FROM inbounds WHERE enable = 1;" 2>/dev/null || echo 0)
         if (( total_inbounds > 0 )); then
+            # [FIX-L1] Inbounds exist but are ALL below MIN_PORT — preserve existing tc rules.
+            # Clearing rules here would briefly expose traffic during config changes.
             log_warn "Found $total_inbounds active inbound(s) in 3X-UI database, but ALL of them have port < ${MIN_PORT:-10000}."
             log_warn "Ports below ${MIN_PORT:-10000} are completely exempt from rate limits by your setting."
             log_warn "If your test port is < ${MIN_PORT:-10000}, change the Min Port filter in Menu Option 3 (or enter 0 to include all ports)."
+            log_warn "Existing tc rules preserved — no changes made."
+            return 0
         else
             log_warn "No active inbound ports found in 3X-UI database matching criteria (>= ${MIN_PORT:-10000})."
+            clear_rules
+            return 0
         fi
-        clear_rules
-        return 0
     fi
 
     log_info "Active controlled ports (${#active_ports[@]}): ${GREEN}${active_ports[*]}${NC}"
@@ -468,23 +514,8 @@ apply_rules() {
     tc qdisc add dev "$iface" handle ffff: ingress 2>/dev/null || true
     tc filter del dev "$iface" parent ffff: 2>/dev/null || true
 
-    # Pre-parse custom limits into associative arrays (O(1) memory lookup, zero forks)
-    declare -A custom_down_map custom_up_map
-    if [[ -n "$CUSTOM_LIMITS" ]]; then
-        local c_arr
-        IFS=',' read -ra c_arr <<< "$CUSTOM_LIMITS"
-        for entry in "${c_arr[@]}"; do
-            entry="${entry// /}"
-            [[ -z "$entry" ]] && continue
-            local cp cd cu
-            IFS=':' read -r cp cd cu <<< "$entry"
-            if [[ -n "$cp" ]]; then
-                local val_cd val_cu
-                val_cd=$(validate_rate "$cd" 2>/dev/null) && custom_down_map["$cp"]="$val_cd"
-                val_cu=$(validate_rate "$cu" 2>/dev/null) && custom_up_map["$cp"]="$val_cu"
-            fi
-        done
-    fi
+    # [FIX-ST1] Use shared helper to parse custom limits (eliminates code duplication)
+    _load_custom_limits_maps
 
     # 3. Generate batch rules in memory for high-performance atomic execution
     local burst_val="${BURST:-128k}"
@@ -515,24 +546,56 @@ apply_rules() {
         idx=$((idx + 1))
     done
 
-    # Execute batch rules via temporary file in secure runtime directory
-    mkdir -p /run/port-limit 2>/dev/null && chmod 700 /run/port-limit 2>/dev/null || true
+    # [FIX-S4] Directory already created atomically by flock section above
+    # [FIX-S3] Remove predictable PID-based fallback name — fail explicitly if mktemp fails
     local batch_file
-    batch_file=$(mktemp /run/port-limit/batch.XXXXXX 2>/dev/null || mktemp /tmp/port_limit_batch.XXXXXX 2>/dev/null || echo "/tmp/port_limit_batch_$$.tc")
+    batch_file=$(mktemp /run/port-limit/batch.XXXXXX 2>/dev/null || mktemp /tmp/port_limit_batch.XXXXXX 2>/dev/null)
+    if [[ -z "$batch_file" ]]; then
+        log_error "Failed to create a secure temporary file for tc batch rules. Aborting."
+        return 1
+    fi
     printf "%s\n" "$batch_rules" > "$batch_file"
 
     local batch_err
     if ! batch_err=$(tc -force -batch "$batch_file" 2>&1); then
         log_warn "tc batch mode failed — falling back to sequential execution:"
         log_warn "$batch_err"
+        # [FIX-S2] Use array expansion to handle arguments safely instead of unquoted $cmd
+        local tc_args
         while IFS= read -r cmd; do
-            [[ -n "$cmd" ]] && tc $cmd 2>/dev/null || true
+            if [[ -n "$cmd" ]]; then
+                read -ra tc_args <<< "$cmd"
+                tc "${tc_args[@]}" 2>/dev/null || true
+            fi
         done < "$batch_file"
     fi
     rm -f "$batch_file"
 
     printf "%s\n" "${active_ports[@]}" > "$STATE_FILE"
     log_info "${GREEN}Rate limits successfully applied to all active ports.${NC}"
+}
+
+# Apply download and upload bandwidth limits for all active inbounds (lock-protected)
+apply_rules() {
+    ensure_dependencies
+    load_config
+
+    # [FIX-L2] Acquire exclusive lock to prevent concurrent rule application causing corrupted tc state
+    install -d -m 700 /run/port-limit 2>/dev/null || mkdir -p /run/port-limit 2>/dev/null || true
+    exec 9>/run/port-limit/apply.lock 2>/dev/null
+    if ! flock -n 9 2>/dev/null; then
+        log_warn "Another apply_rules instance is already running. Skipping to avoid tc race condition."
+        exec 9>&- 2>/dev/null || true
+        return 0
+    fi
+
+    local ret=0
+    _apply_rules_locked || ret=$?
+
+    # Always release lock and close file descriptor 9 to prevent blocking subsequent calls
+    flock -u 9 2>/dev/null || true
+    exec 9>&- 2>/dev/null || true
+    return $ret
 }
 
 # Format byte counts into human-readable units using pure Bash integer math (zero forks)
@@ -554,7 +617,8 @@ format_bytes() {
         local gib=$(( b * 10 / 1073741824 ))
         echo "$(( gib / 10 )).$(( gib % 10 )) GiB"
     else
-        local tib=$(( b * 10 / 1099511627776 ))
+        # [FIX-L6] Avoid 64-bit signed overflow: divide before multiply to stay within bash integer range
+        local tib=$(( (b / 1099511627776) * 10 + (b % 1099511627776) * 10 / 1099511627776 ))
         echo "$(( tib / 10 )).$(( tib % 10 )) TiB"
     fi
 }
@@ -614,23 +678,8 @@ show_status() {
     printf "%-8s %-12s %-12s %-16s %-16s\n" "Port" "Download" "Upload" "Egress (Sent)" "Ingress (Recv)"
     echo -e "----------------------------------------------------------------"
 
-    # Pre-parse custom limits into associative arrays (O(1) memory lookup)
-    declare -A custom_down_map custom_up_map
-    if [[ -n "$CUSTOM_LIMITS" ]]; then
-        local c_arr
-        IFS=',' read -ra c_arr <<< "$CUSTOM_LIMITS"
-        for entry in "${c_arr[@]}"; do
-            entry="${entry// /}"
-            [[ -z "$entry" ]] && continue
-            local cp cd cu
-            IFS=':' read -r cp cd cu <<< "$entry"
-            if [[ -n "$cp" ]]; then
-                local val_cd val_cu
-                val_cd=$(validate_rate "$cd" 2>/dev/null) && custom_down_map["$cp"]="$val_cd"
-                val_cu=$(validate_rate "$cu" 2>/dev/null) && custom_up_map["$cp"]="$val_cu"
-            fi
-        done
-    fi
+    # [FIX-ST1] Use shared helper to parse custom limits (eliminates code duplication)
+    _load_custom_limits_maps
 
     # Batch query traffic statistics once (replaces hundreds of per-port forks)
     declare -A egress_bytes ingress_bytes
@@ -689,7 +738,8 @@ show_status() {
 
         local down_bytes
         down_bytes=$(format_bytes "${egress_bytes[$class_id]:-0}")
-        local up_count=$(( ${ingress_bytes[$idx]:-0} + ${ingress_bytes[$((idx + 5000))]:-0} + ${ingress_bytes[$class_id]:-0} ))
+        # [FIX-L3] Removed dead $class_id lookup: ingress_bytes is keyed by prio (integer), not class_id string
+        local up_count=$(( ${ingress_bytes[$idx]:-0} + ${ingress_bytes[$((idx + 5000))]:-0} ))
         local up_bytes
         up_bytes=$(format_bytes "$up_count")
 
@@ -707,7 +757,10 @@ get_config_state_string() {
 # Daemon loop to automatically detect database additions/removals and config changes
 run_monitor() {
     log_info "3X-UI auto-detector daemon started (interval: ${CHECK_INTERVAL}s)..."
-    trap 'log_info "Termination signal received. Exiting monitor daemon."; exit 0' SIGINT SIGTERM
+    # [FIX-ST6] Write PID for targeted termination in uninstall — avoids broad pkill -f pattern
+    install -d -m 700 /run/port-limit 2>/dev/null || true
+    echo $$ > /run/port-limit/daemon.pid 2>/dev/null || true
+    trap 'rm -f /run/port-limit/daemon.pid 2>/dev/null; log_info "Termination signal received. Exiting monitor daemon."; exit 0' SIGINT SIGTERM
 
     apply_rules
     local raw_p
@@ -746,12 +799,11 @@ run_monitor() {
     done
 }
 
-# Save settings to configuration file with restricted file permissions
+# Save settings to configuration file with restricted file permissions atomically
 save_config() {
     mkdir -p "$(dirname "$CONFIG_FILE")" 2>/dev/null || true
-    touch "$CONFIG_FILE"
-    chmod 600 "$CONFIG_FILE" 2>/dev/null || true
-    cat << EOF > "$CONFIG_FILE"
+    local tmp_conf="${CONFIG_FILE}.tmp.$$"
+    cat << EOF > "$tmp_conf"
 DOWNLOAD_LIMIT="$DOWNLOAD_LIMIT"
 UPLOAD_LIMIT="$UPLOAD_LIMIT"
 CHECK_INTERVAL=$CHECK_INTERVAL
@@ -762,6 +814,9 @@ BURST="$BURST"
 DB_PATH="$DB_PATH"
 WAN_INTERFACE="$WAN_INTERFACE"
 EOF
+    chmod 600 "$tmp_conf" 2>/dev/null || true
+    mv -f "$tmp_conf" "$CONFIG_FILE" 2>/dev/null || cat "$tmp_conf" > "$CONFIG_FILE"
+    rm -f "$tmp_conf" 2>/dev/null || true
 }
 
 # Quick speed update helper function
@@ -828,12 +883,26 @@ EOF
                 fi
                 log_info "Downloading script from $dl_url to $INSTALL_PATH..."
                 if curl -fsSL "$dl_url" -o "${INSTALL_PATH}.tmp" && [[ -s "${INSTALL_PATH}.tmp" ]]; then
+                    # [FIX-S7] Verify downloaded file integrity and bash syntax before replacing binary
+                    local first_line
+                    first_line=$(head -n 1 "${INSTALL_PATH}.tmp" 2>/dev/null || true)
+                    if [[ ! "$first_line" =~ ^#!(/usr)?/bin/(env[[:space:]]+)?bash ]]; then
+                        log_error "Downloaded file does not have a valid bash shebang. Installation aborted."
+                        rm -f "${INSTALL_PATH}.tmp"
+                        return 1
+                    fi
+                    if ! bash -n "${INSTALL_PATH}.tmp" 2>/dev/null; then
+                        log_error "Downloaded script failed bash syntax verification (bash -n). Installation aborted."
+                        rm -f "${INSTALL_PATH}.tmp"
+                        return 1
+                    fi
                     chmod 755 "${INSTALL_PATH}.tmp"
                     mv -f "${INSTALL_PATH}.tmp" "$INSTALL_PATH"
                     target_src="$INSTALL_PATH"
-                    log_info "Script successfully saved to $INSTALL_PATH."
+                    log_info "Script successfully verified and saved to $INSTALL_PATH."
                 else
                     log_error "Failed to download script from $dl_url."
+                    rm -f "${INSTALL_PATH}.tmp"
                     return 1
                 fi
             else
@@ -890,8 +959,17 @@ uninstall_service() {
     systemctl stop "$SERVICE_NAME" 2>/dev/null || true
     systemctl disable "$SERVICE_NAME" 2>/dev/null || true
 
-    # 2. Terminate any orphan monitor daemon processes running in background
-    pkill -f "port-limit monitor" 2>/dev/null || true
+    # 2. [FIX-ST6] Terminate daemon via PID file to avoid accidentally killing unrelated processes
+    if [[ -f /run/port-limit/daemon.pid ]]; then
+        local _dpid
+        _dpid=$(cat /run/port-limit/daemon.pid 2>/dev/null)
+        if [[ "$_dpid" =~ ^[0-9]+$ ]]; then
+            kill "$_dpid" 2>/dev/null || true
+        fi
+        rm -f /run/port-limit/daemon.pid 2>/dev/null || true
+    fi
+    # Fallback: exact-name match only (much safer than pkill -f pattern)
+    pkill -x "port-limit" 2>/dev/null || true
 
     # 3. Remove systemd service unit and reload daemon
     rm -f "/etc/systemd/system/${SERVICE_NAME}.service"
@@ -1118,19 +1196,21 @@ menu_port_filter() {
                 echo ""
                 echo -e "Current minimum port threshold: ${YELLOW}>= ${MIN_PORT}${NC}"
                 echo -e "${CYAN}(Inbound ports below this number will never have rate limits applied)${NC}"
-                read -rp "Enter new minimum port (1-65535) [0 to cancel]: " inp_min
-                if [[ "$inp_min" == "0" || "$inp_min" == "b" || "$inp_min" == "B" || -z "$inp_min" ]]; then
+                # [FIX-L5] Accept 0 to mean "apply limits to ALL ports" — consistent with log messages
+                echo -e "${CYAN}(Enter 0 to apply rate limits to ALL ports with no minimum threshold)${NC}"
+                read -rp "Enter new minimum port (0-65535) ['b' to cancel]: " inp_min
+                if [[ "$inp_min" == "b" || "$inp_min" == "B" || -z "$inp_min" ]]; then
                     echo -e "${YELLOW}Cancelled.${NC}"
                     sleep 0.5
                     continue
                 fi
-                if [[ "$inp_min" =~ ^[0-9]+$ ]] && (( inp_min >= 1 && inp_min <= 65535 )); then
+                if [[ "$inp_min" =~ ^[0-9]+$ ]] && (( inp_min >= 0 && inp_min <= 65535 )); then
                     MIN_PORT="$inp_min"
                     save_config
                     log_info "Minimum port threshold set to: >= $MIN_PORT"
                     apply_rules
                 else
-                    echo -e "${RED}[ERROR] Invalid port number. Must be between 1 and 65535.${NC}"
+                    echo -e "${RED}[ERROR] Invalid port number. Must be between 0 and 65535.${NC}"
                 fi
                 echo ""
                 read -rp "Press Enter [or enter 0] to continue..."
