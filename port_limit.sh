@@ -6,7 +6,7 @@
 
 set -o pipefail
 
-VERSION="1.1.3"
+VERSION="1.1.4"
 
 # ------------------------------------------------------------------------------
 # Default Settings (can be modified directly here or via the interactive menu)
@@ -42,10 +42,11 @@ NC='\033[0m'
 # Security & Input Validation Functions
 # ------------------------------------------------------------------------------
 
-# Validate rate unit and format to prevent command injection and zero-rate errors
+# Validate rate unit and format to prevent command injection and zero-rate errors (Zero-fork pure bash)
 validate_rate() {
     local rate="$1"
-    rate=$(echo "$rate" | tr '[:upper:]' '[:lower:]' | tr -d ' ')
+    rate="${rate,,}"
+    rate="${rate// /}"
     rate="${rate//mbps/mbit}"
     rate="${rate//kbps/kbit}"
     rate="${rate//gbps/gbit}"
@@ -67,13 +68,13 @@ validate_rate() {
     return 0
 }
 
-# Validate and sanitize comma-separated list of ports
+# Validate and sanitize comma-separated list of ports (Zero-fork pure bash)
 validate_ports_list() {
     local list="$1"
     local cleaned=()
     IFS=',' read -ra arr <<< "$list"
     for p in "${arr[@]}"; do
-        p=$(echo "$p" | tr -d ' ')
+        p="${p// /}"
         [[ -z "$p" ]] && continue
         if [[ "$p" =~ ^[0-9]+$ ]] && (( p >= 1 && p <= 65535 )); then
             cleaned+=("$p")
@@ -87,18 +88,16 @@ validate_ports_list() {
     fi
 }
 
-# Validate and sanitize custom limits
+# Validate and sanitize custom limits (Zero-fork pure bash)
 validate_custom_limits() {
     local list="$1"
     local cleaned=()
     IFS=',' read -ra arr <<< "$list"
     for entry in "${arr[@]}"; do
-        entry=$(echo "$entry" | tr -d ' ')
+        entry="${entry// /}"
         [[ -z "$entry" ]] && continue
         local cp cd cu
-        cp=$(echo "$entry" | cut -d':' -f1)
-        cd=$(echo "$entry" | cut -d':' -f2)
-        cu=$(echo "$entry" | cut -d':' -f3)
+        IFS=':' read -r cp cd cu <<< "$entry"
         if [[ "$cp" =~ ^[0-9]+$ ]] && (( cp >= 1 && cp <= 65535 )); then
             local val_cd val_cu
             if val_cd=$(validate_rate "$cd" 2>/dev/null) && val_cu=$(validate_rate "$cu" 2>/dev/null); then
@@ -114,45 +113,42 @@ validate_custom_limits() {
     fi
 }
 
-# Safely parse configuration file without using dangerous 'source'
+# Safely parse configuration file without spawning external grep/cut/tr subshells (Zero-fork pure bash)
 load_config() {
     if [[ -f "$CONFIG_FILE" ]]; then
-        local val
-        val=$(grep -E '^DOWNLOAD_LIMIT=' "$CONFIG_FILE" | cut -d'=' -f2- | tr -d '"'\'' ')
-        if [[ -n "$val" ]] && validate_rate "$val" >/dev/null 2>&1; then
-            DOWNLOAD_LIMIT="$(validate_rate "$val")"
-        fi
+        local line key val
+        while IFS='=' read -r key val || [[ -n "$key" ]]; do
+            # Strip comments and surrounding spaces
+            key="${key%%#*}"
+            key="${key// /}"
+            [[ -z "$key" ]] && continue
+            val="${val%%#*}"
+            val="${val//\"/}"
+            val="${val//\'/}"
+            val="${val#"${val%%[! ]*}"}"
+            val="${val%"${val##*[! ]}"}"
 
-        val=$(grep -E '^UPLOAD_LIMIT=' "$CONFIG_FILE" | cut -d'=' -f2- | tr -d '"'\'' ')
-        if [[ -n "$val" ]] && validate_rate "$val" >/dev/null 2>&1; then
-            UPLOAD_LIMIT="$(validate_rate "$val")"
-        fi
-
-        val=$(grep -E '^CHECK_INTERVAL=' "$CONFIG_FILE" | cut -d'=' -f2- | tr -d '"'\'' ')
-        [[ -n "$val" && "$val" =~ ^[0-9]+$ && "$val" -ge 1 ]] && CHECK_INTERVAL="$val"
-
-        if grep -q -E '^EXCLUDE_PORTS=' "$CONFIG_FILE"; then
-            val=$(grep -E '^EXCLUDE_PORTS=' "$CONFIG_FILE" | cut -d'=' -f2- | tr -d '"'\'' ')
-            EXCLUDE_PORTS="$(validate_ports_list "$val")"
-        fi
-
-        val=$(grep -E '^MIN_PORT=' "$CONFIG_FILE" | cut -d'=' -f2- | tr -d '"'\'' ')
-        [[ -n "$val" && "$val" =~ ^[0-9]+$ && "$val" -ge 1 && "$val" -le 65535 ]] && MIN_PORT="$val"
-
-        if grep -q -E '^CUSTOM_LIMITS=' "$CONFIG_FILE"; then
-            val=$(grep -E '^CUSTOM_LIMITS=' "$CONFIG_FILE" | cut -d'=' -f2- | tr -d '"'\'' ')
-            CUSTOM_LIMITS=$(validate_custom_limits "$val")
-        fi
-
-        val=$(grep -E '^BURST=' "$CONFIG_FILE" | cut -d'=' -f2- | tr -d '"'\'' ')
-        [[ -n "$val" && "$val" =~ ^[0-9]+[kKmMgG]?$ ]] && BURST="$val"
-
-        val=$(grep -E '^DB_PATH=' "$CONFIG_FILE" | cut -d'=' -f2- | tr -d '"'\'' ')
-        [[ -n "$val" ]] && DB_PATH="$val"
-
-        if grep -q -E '^WAN_INTERFACE=' "$CONFIG_FILE"; then
-            WAN_INTERFACE=$(grep -E '^WAN_INTERFACE=' "$CONFIG_FILE" | cut -d'=' -f2- | tr -d '"'\'' ')
-        fi
+            case "$key" in
+                DOWNLOAD_LIMIT)
+                    local v; if v=$(validate_rate "$val" 2>/dev/null); then DOWNLOAD_LIMIT="$v"; fi ;;
+                UPLOAD_LIMIT)
+                    local v; if v=$(validate_rate "$val" 2>/dev/null); then UPLOAD_LIMIT="$v"; fi ;;
+                CHECK_INTERVAL)
+                    [[ "$val" =~ ^[0-9]+$ && "$val" -ge 1 ]] && CHECK_INTERVAL="$val" ;;
+                EXCLUDE_PORTS)
+                    EXCLUDE_PORTS="$(validate_ports_list "$val")" ;;
+                MIN_PORT)
+                    [[ "$val" =~ ^[0-9]+$ && "$val" -ge 1 && "$val" -le 65535 ]] && MIN_PORT="$val" ;;
+                CUSTOM_LIMITS)
+                    CUSTOM_LIMITS=$(validate_custom_limits "$val") ;;
+                BURST)
+                    [[ "$val" =~ ^[0-9]+[kKmMgG]?$ ]] && BURST="$val" ;;
+                DB_PATH)
+                    [[ -n "$val" ]] && DB_PATH="$val" ;;
+                WAN_INTERFACE)
+                    WAN_INTERFACE="$val" ;;
+            esac
+        done < "$CONFIG_FILE"
     fi
 }
 
@@ -181,8 +177,53 @@ check_root() {
     fi
 }
 
-# Automatically install required packages if missing
+# Automatically load and verify essential traffic control kernel modules
+ensure_kernel_modules() {
+    local mods=("sch_htb" "cls_u32" "act_mirred" "sch_fq_codel" "sch_sfq" "ifb")
+    local need_install=0
+
+    for m in "${mods[@]}"; do
+        if ! grep -q "^${m//-/_} " /proc/modules 2>/dev/null; then
+            if [[ "$m" == "ifb" ]]; then
+                modprobe ifb numifbs=1 2>/dev/null || true
+            else
+                modprobe "$m" 2>/dev/null || true
+            fi
+        fi
+    done
+
+    # Check if sch_htb can be loaded or is supported
+    if ! grep -q "^sch_htb " /proc/modules 2>/dev/null; then
+        if ! modprobe sch_htb 2>/dev/null; then
+            need_install=1
+        fi
+    fi
+
+    # Check if ifb or act_mirred can be loaded
+    if ! grep -q "^ifb " /proc/modules 2>/dev/null; then
+        if ! modprobe ifb numifbs=1 2>/dev/null; then
+            need_install=1
+        fi
+    fi
+
+    if [[ $need_install -eq 1 ]] && command -v apt-get >/dev/null 2>&1; then
+        local kver
+        kver=$(uname -r)
+        log_info "Traffic control kernel modules missing. Installing linux-modules-extra for $kver..."
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -qq >/dev/null 2>&1 || true
+        apt-get install -y -qq "linux-modules-extra-$kver" "linux-modules-$kver" >/dev/null 2>&1 || true
+        for m in "${mods[@]}"; do
+            [[ "$m" == "ifb" ]] && modprobe ifb numifbs=1 2>/dev/null || modprobe "$m" 2>/dev/null || true
+        done
+    fi
+}
+
+# Automatically install required packages if missing (cached check)
 ensure_dependencies() {
+    if [[ $DEPS_VERIFIED -eq 1 ]]; then
+        return 0
+    fi
     local needed=()
     command -v tc >/dev/null 2>&1 || needed+=("iproute2")
     command -v sqlite3 >/dev/null 2>&1 || needed+=("sqlite3")
@@ -196,14 +237,22 @@ ensure_dependencies() {
         apt-get install -y -qq "${needed[@]}" >/dev/null 2>&1
         log_info "Prerequisite packages installed successfully."
     fi
+
+    ensure_kernel_modules
+    DEPS_VERIFIED=1
 }
 
-# Automatically detect WAN interface, filtering out virtual adapters (Docker, WireGuard, etc.)
+# Automatically detect WAN interface, with in-memory caching to avoid repeated ip/awk calls
 detect_wan_interface() {
     if [[ -n "$WAN_INTERFACE" ]] && ip link show "$WAN_INTERFACE" >/dev/null 2>&1; then
         echo "$WAN_INTERFACE"
         return 0
     fi
+    if [[ -n "$CACHED_WAN_IFACE" ]] && ip link show "$CACHED_WAN_IFACE" >/dev/null 2>&1; then
+        echo "$CACHED_WAN_IFACE"
+        return 0
+    fi
+
     local iface
     # Priority 1: Default IPv4 route
     iface=$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++)if($i=="dev"){print $(i+1);exit}}')
@@ -215,10 +264,11 @@ detect_wan_interface() {
     if [[ -z "$iface" ]]; then
         iface=$(ip -br link | awk '$2=="UP" && $1!="lo" && !($1~/^(ifb|docker|br-|veth|tun|tap|wg)/){print $1; exit}')
     fi
+    CACHED_WAN_IFACE="$iface"
     echo "$iface"
 }
 
-# Safely extract active inbounds from 3X-UI SQLite database with busy lock handling
+# Safely extract active inbounds from 3X-UI SQLite database with busy lock handling and C-level port filtering
 get_active_ports() {
     if [[ ! -f "$DB_PATH" ]]; then
         log_warn "3X-UI database file not found at: $DB_PATH"
@@ -229,9 +279,10 @@ get_active_ports() {
         ensure_dependencies
     fi
 
-    # Using standard SQLite PRAGMA busy_timeout=2000 to handle active write transactions
+    local min_p="${MIN_PORT:-10000}"
+    # Filter, deduplicate, and sort by port directly in SQLite query to minimize data and CPU overhead
     local raw_ports
-    raw_ports=$(sqlite3 -readonly "$DB_PATH" "PRAGMA busy_timeout = 2000; SELECT port FROM inbounds WHERE enable = 1;" 2>/dev/null)
+    raw_ports=$(sqlite3 -readonly "$DB_PATH" "PRAGMA busy_timeout = 2000; SELECT DISTINCT port FROM inbounds WHERE enable = 1 AND port >= $min_p AND port <= 65535 ORDER BY port ASC;" 2>/dev/null)
     local sqlite_status=$?
 
     if [[ $sqlite_status -ne 0 ]]; then
@@ -244,31 +295,32 @@ get_active_ports() {
         return 0
     fi
 
-    local filtered=()
-    IFS=',' read -ra exc_array <<< "$EXCLUDE_PORTS"
+    declare -A exc_map=()
+    if [[ -n "$EXCLUDE_PORTS" ]]; then
+        local exc_array
+        IFS=',' read -ra exc_array <<< "$EXCLUDE_PORTS"
+        for exc in "${exc_array[@]}"; do
+            exc="${exc// /}"
+            [[ -n "$exc" ]] && exc_map["$exc"]=1
+        done
+    fi
 
-    local min_p="${MIN_PORT:-10000}"
+    local filtered=()
     while read -r p; do
-        p=$(echo "$p" | tr -d ' \r\n')
+        p="${p//[[:space:]]/}"
         if [[ "$p" =~ ^[0-9]+$ ]] && (( p >= min_p && p <= 65535 )); then
-            local is_exc=0
-            for exc in "${exc_array[@]}"; do
-                exc=$(echo "$exc" | tr -d ' ')
-                if [[ "$p" == "$exc" ]]; then
-                    is_exc=1
-                    break
-                fi
-            done
-            if [[ $is_exc -eq 0 ]]; then
+            if [[ -z "${exc_map[$p]:-}" ]]; then
                 filtered+=("$p")
             fi
         fi
     done <<< "$raw_ports"
 
-    printf "%s\n" "${filtered[@]}" | sort -n -u
+    if [[ ${#filtered[@]} -gt 0 ]]; then
+        printf "%s\n" "${filtered[@]}"
+    fi
 }
 
-# Get rate limits for a specific port (custom override or default)
+# Get rate limits for a specific port (custom override or default, zero-fork pure bash)
 get_port_limits() {
     local port="$1"
     local down="$DOWNLOAD_LIMIT"
@@ -277,17 +329,16 @@ get_port_limits() {
     if [[ -n "$CUSTOM_LIMITS" ]]; then
         IFS=',' read -ra c_arr <<< "$CUSTOM_LIMITS"
         for entry in "${c_arr[@]}"; do
-            entry=$(echo "$entry" | tr -d ' ')
+            entry="${entry// /}"
+            [[ -z "$entry" ]] && continue
             local cp cd cu
-            cp=$(echo "$entry" | cut -d':' -f1)
-            cd=$(echo "$entry" | cut -d':' -f2)
-            cu=$(echo "$entry" | cut -d':' -f3)
+            IFS=':' read -r cp cd cu <<< "$entry"
             if [[ "$cp" == "$port" ]]; then
                 local val_cd val_cu
-                if val_cd=$(validate_rate "$cd"); then
+                if val_cd=$(validate_rate "$cd" 2>/dev/null); then
                     down="$val_cd"
                 fi
-                if val_cu=$(validate_rate "$cu"); then
+                if val_cu=$(validate_rate "$cu" 2>/dev/null); then
                     up="$val_cu"
                 fi
                 break
@@ -301,15 +352,27 @@ get_port_limits() {
     echo "$norm_d $norm_u"
 }
 
-# Initialize Intermediate Functional Block (IFB) device for Ingress rate limiting
+## Initialize Intermediate Functional Block (IFB) device with thorough fallback handling
 setup_ifb() {
-    if ! lsmod | grep -q "^ifb "; then
+    if [[ -d "/sys/class/net/$IFB_DEVICE" ]]; then
+        ip link set dev "$IFB_DEVICE" up 2>/dev/null || true
+        return 0
+    fi
+    if ! grep -q "^ifb " /proc/modules 2>/dev/null; then
         modprobe ifb numifbs=1 2>/dev/null || true
     fi
-    if ! ip link show "$IFB_DEVICE" >/dev/null 2>&1; then
+    if [[ ! -d "/sys/class/net/$IFB_DEVICE" ]]; then
         ip link add name "$IFB_DEVICE" type ifb 2>/dev/null || true
     fi
-    ip link set dev "$IFB_DEVICE" up 2>/dev/null || true
+    if [[ ! -d "/sys/class/net/$IFB_DEVICE" ]]; then
+        modprobe -r ifb 2>/dev/null || rmmod ifb 2>/dev/null || true
+        modprobe ifb numifbs=1 2>/dev/null || true
+    fi
+    if [[ -d "/sys/class/net/$IFB_DEVICE" ]]; then
+        ip link set dev "$IFB_DEVICE" up 2>/dev/null || true
+        return 0
+    fi
+    return 1
 }
 
 # ------------------------------------------------------------------------------
@@ -332,7 +395,7 @@ clear_rules() {
         tc qdisc del dev "$WAN_INTERFACE" root 2>/dev/null || true
         tc qdisc del dev "$WAN_INTERFACE" ingress 2>/dev/null || true
     fi
-    if ip link show "$IFB_DEVICE" >/dev/null 2>&1; then
+    if [[ -d "/sys/class/net/$IFB_DEVICE" ]]; then
         tc qdisc del dev "$IFB_DEVICE" root 2>/dev/null || true
         tc qdisc del dev "$IFB_DEVICE" ingress 2>/dev/null || true
     fi
@@ -361,99 +424,166 @@ apply_rules() {
     log_info "WAN Interface: ${BOLD}$iface${NC}"
     log_info "Default Speed Limits: Download=${BOLD}$norm_down${NC} | Upload=${BOLD}$norm_up${NC}"
 
-    local ports_output
-    ports_output=$(get_active_ports)
-    local status_code=$?
-
-    # Prevent accidental rule flush if database read returned error
-    if [[ $status_code -ne 0 ]]; then
-        log_warn "Failed to read database (code: $status_code), leaving existing rules unchanged."
-        return 0
-    fi
-
+    local raw_ports
+    raw_ports=$(get_active_ports 2>/dev/null)
     local active_ports=()
-    if [[ -n "$ports_output" ]]; then
+    if [[ -n "$raw_ports" ]]; then
         while IFS= read -r line; do
             [[ -n "$line" ]] && active_ports+=("$line")
-        done <<< "$ports_output"
+        done <<< "$raw_ports"
     fi
 
     if [[ ${#active_ports[@]} -eq 0 ]]; then
-        log_warn "No active inbound ports found in 3X-UI database."
+        log_warn "No active inbound ports found in 3X-UI database matching criteria (>= ${MIN_PORT:-10000})."
         clear_rules
         return 0
     fi
 
     log_info "Active controlled ports (${#active_ports[@]}): ${GREEN}${active_ports[*]}${NC}"
 
-    setup_ifb
-
-    # Reset existing qdiscs
+    # Reset existing root qdiscs cleanly
     tc qdisc del dev "$iface" root 2>/dev/null || true
     tc qdisc del dev "$iface" ingress 2>/dev/null || true
-    tc qdisc del dev "$IFB_DEVICE" root 2>/dev/null || true
 
     # 1. Egress root qdisc on physical WAN interface (Client Download - traffic leaving server)
     # Class 1:2 is the unthrottled default class for SSH and OS traffic (avoids port collisions)
-    tc qdisc add dev "$iface" root handle 1: htb default 2
-    tc class add dev "$iface" parent 1: classid 1:1 htb rate 10000mbit ceil 10000mbit
-    tc class add dev "$iface" parent 1:1 classid 1:2 htb rate 10000mbit ceil 10000mbit
-    tc qdisc add dev "$iface" parent 1:2 handle 2: fq_codel 2>/dev/null || \
-    tc qdisc add dev "$iface" parent 1:2 handle 2: sfq perturb 10 2>/dev/null || true
+    if ! tc qdisc replace dev "$iface" root handle 1: htb default 2 2>/dev/null; then
+        modprobe sch_htb 2>/dev/null || true
+        if ! tc qdisc replace dev "$iface" root handle 1: htb default 2 2>/dev/null; then
+            log_error "Failed to create root HTB queue on WAN interface '$iface'!"
+            log_error "Kernel module 'sch_htb' is missing or not supported on this kernel."
+            log_error "To install on Ubuntu/Debian, run: sudo apt-get install -y linux-modules-extra-\$(uname -r)"
+            return 1
+        fi
+    fi
 
-    # 2. Redirect incoming WAN ingress traffic to IFB0 device for Ingress shaping
-    tc qdisc add dev "$iface" handle ffff: ingress
-    tc filter add dev "$iface" parent ffff: protocol all prio 1 u32 match u32 0 0 action mirred egress redirect dev "$IFB_DEVICE"
+    tc class replace dev "$iface" parent 1: classid 1:1 htb rate 10000mbit ceil 10000mbit 2>/dev/null || \
+    tc class add dev "$iface" parent 1: classid 1:1 htb rate 10000mbit ceil 10000mbit 2>/dev/null || true
 
-    # 3. Ingress root qdisc on IFB0 (Client Upload - traffic entering server)
-    tc qdisc add dev "$IFB_DEVICE" root handle 1: htb default 2
-    tc class add dev "$IFB_DEVICE" parent 1: classid 1:1 htb rate 10000mbit ceil 10000mbit
-    tc class add dev "$IFB_DEVICE" parent 1:1 classid 1:2 htb rate 10000mbit ceil 10000mbit
-    tc qdisc add dev "$IFB_DEVICE" parent 1:2 handle 2: fq_codel 2>/dev/null || \
-    tc qdisc add dev "$IFB_DEVICE" parent 1:2 handle 2: sfq perturb 10 2>/dev/null || true
+    tc class replace dev "$iface" parent 1:1 classid 1:2 htb rate 10000mbit ceil 10000mbit 2>/dev/null || \
+    tc class add dev "$iface" parent 1:1 classid 1:2 htb rate 10000mbit ceil 10000mbit 2>/dev/null || true
 
-    # 4. Create isolated HTB classes and u32 filters per port (minor ID starts at offset 10)
+    # Probe leaf qdisc support once
+    local leaf_qdisc="fq_codel"
+    if ! tc qdisc replace dev "$iface" parent 1:2 handle 2: fq_codel 2>/dev/null; then
+        tc qdisc replace dev "$iface" parent 1:2 handle 2: sfq perturb 10 2>/dev/null || true
+        leaf_qdisc="sfq perturb 10"
+    fi
+
+    # 2. Ingress traffic control via IFB (Client Upload - traffic entering server)
+    local has_ifb=0
+    if setup_ifb; then
+        tc qdisc del dev "$IFB_DEVICE" root 2>/dev/null || true
+        if tc qdisc replace dev "$IFB_DEVICE" root handle 1: htb default 2 2>/dev/null; then
+            tc class replace dev "$IFB_DEVICE" parent 1: classid 1:1 htb rate 10000mbit ceil 10000mbit 2>/dev/null || \
+            tc class add dev "$IFB_DEVICE" parent 1: classid 1:1 htb rate 10000mbit ceil 10000mbit 2>/dev/null || true
+
+            tc class replace dev "$IFB_DEVICE" parent 1:1 classid 1:2 htb rate 10000mbit ceil 10000mbit 2>/dev/null || \
+            tc class add dev "$IFB_DEVICE" parent 1:1 classid 1:2 htb rate 10000mbit ceil 10000mbit 2>/dev/null || true
+
+            tc qdisc replace dev "$IFB_DEVICE" parent 1:2 handle 2: $leaf_qdisc 2>/dev/null || true
+
+            # Redirect incoming WAN ingress traffic to IFB0 device
+            tc qdisc replace dev "$iface" handle ffff: ingress 2>/dev/null || \
+            tc qdisc add dev "$iface" handle ffff: ingress 2>/dev/null || true
+
+            tc filter del dev "$iface" parent ffff: 2>/dev/null || true
+            if tc filter add dev "$iface" parent ffff: protocol all prio 1 u32 match u32 0 0 action mirred egress redirect dev "$IFB_DEVICE" 2>/dev/null; then
+                has_ifb=1
+            else
+                log_warn "Ingress redirection filter (act_mirred) failed. Upload limits skipped, download limits active."
+            fi
+        else
+            log_warn "Root HTB queue on '$IFB_DEVICE' failed. Upload limits skipped, download limits active."
+        fi
+    else
+        log_warn "Virtual interface '$IFB_DEVICE' unavailable. Upload limits skipped, download limits active."
+    fi
+
+    # Pre-parse custom limits into associative arrays (O(1) memory lookup, zero forks)
+    declare -A custom_down_map custom_up_map
+    if [[ -n "$CUSTOM_LIMITS" ]]; then
+        local c_arr
+        IFS=',' read -ra c_arr <<< "$CUSTOM_LIMITS"
+        for entry in "${c_arr[@]}"; do
+            entry="${entry// /}"
+            [[ -z "$entry" ]] && continue
+            local cp cd cu
+            IFS=':' read -r cp cd cu <<< "$entry"
+            if [[ -n "$cp" ]]; then
+                local val_cd val_cu
+                val_cd=$(validate_rate "$cd" 2>/dev/null) && custom_down_map["$cp"]="$val_cd"
+                val_cu=$(validate_rate "$cu" 2>/dev/null) && custom_up_map["$cp"]="$val_cu"
+            fi
+        done
+    fi
+
+    # 3. Generate batch rules in memory for high-performance atomic execution
+    local batch_rules=""
     local idx=1
     for port in "${active_ports[@]}"; do
         local class_minor=$((idx + 10))
         local class_id="1:$class_minor"
         local qdisc_handle="${class_minor}:"
 
-        read -r port_down port_up < <(get_port_limits "$port")
+        local port_down="${custom_down_map[$port]:-$norm_down}"
+        local port_up="${custom_up_map[$port]:-$norm_up}"
 
         # --- Egress shaping (Download): match source port (sport = port) ---
-        tc class add dev "$iface" parent 1:1 classid "$class_id" htb rate "$port_down" ceil "$port_down" burst "$BURST"
-        tc qdisc add dev "$iface" parent "$class_id" handle "$qdisc_handle" fq_codel 2>/dev/null || \
-        tc qdisc add dev "$iface" parent "$class_id" handle "$qdisc_handle" sfq perturb 10 2>/dev/null || true
+        batch_rules+="class replace dev $iface parent 1:1 classid $class_id htb rate $port_down ceil $port_down burst $BURST"$'\n'
+        batch_rules+="qdisc replace dev $iface parent $class_id handle $qdisc_handle $leaf_qdisc"$'\n'
+        batch_rules+="filter replace dev $iface protocol ip parent 1: prio 1 u32 match ip protocol 6 0xff match ip sport $port 0xffff flowid $class_id"$'\n'
+        batch_rules+="filter replace dev $iface protocol ip parent 1: prio 1 u32 match ip protocol 17 0xff match ip sport $port 0xffff flowid $class_id"$'\n'
+        batch_rules+="filter replace dev $iface protocol ipv6 parent 1: prio 2 u32 match u8 6 0xff at 6 match u16 $port 0xffff at 40 flowid $class_id"$'\n'
+        batch_rules+="filter replace dev $iface protocol ipv6 parent 1: prio 2 u32 match u8 17 0xff at 6 match u16 $port 0xffff at 40 flowid $class_id"$'\n'
 
-        # IPv4 TCP / UDP
-        tc filter add dev "$iface" protocol ip parent 1: prio 1 u32 match ip protocol 6 0xff match ip sport "$port" 0xffff flowid "$class_id"
-        tc filter add dev "$iface" protocol ip parent 1: prio 1 u32 match ip protocol 17 0xff match ip sport "$port" 0xffff flowid "$class_id"
-        # IPv6 TCP / UDP (matches NextHeader at byte 6, sport at byte 40)
-        tc filter add dev "$iface" protocol ipv6 parent 1: prio 2 u32 match u8 6 0xff at 6 match u16 "$port" 0xffff at 40 flowid "$class_id" 2>/dev/null || \
-        tc filter add dev "$iface" protocol ipv6 parent 1: prio 2 flower ip_proto tcp src_port "$port" classid "$class_id" 2>/dev/null || true
-        tc filter add dev "$iface" protocol ipv6 parent 1: prio 2 u32 match u8 17 0xff at 6 match u16 "$port" 0xffff at 40 flowid "$class_id" 2>/dev/null || \
-        tc filter add dev "$iface" protocol ipv6 parent 1: prio 2 flower ip_proto udp src_port "$port" classid "$class_id" 2>/dev/null || true
-
-        # --- Ingress shaping (Upload): match destination port (dport = port) on IFB0 ---
-        tc class add dev "$IFB_DEVICE" parent 1:1 classid "$class_id" htb rate "$port_up" ceil "$port_up" burst "$BURST"
-        tc qdisc add dev "$IFB_DEVICE" parent "$class_id" handle "$qdisc_handle" fq_codel 2>/dev/null || \
-        tc qdisc add dev "$IFB_DEVICE" parent "$class_id" handle "$qdisc_handle" sfq perturb 10 2>/dev/null || true
-
-        # IPv4 TCP / UDP on IFB0
-        tc filter add dev "$IFB_DEVICE" protocol ip parent 1: prio 1 u32 match ip protocol 6 0xff match ip dport "$port" 0xffff flowid "$class_id"
-        tc filter add dev "$IFB_DEVICE" protocol ip parent 1: prio 1 u32 match ip protocol 17 0xff match ip dport "$port" 0xffff flowid "$class_id"
-        # IPv6 TCP / UDP on IFB0 (matches NextHeader at byte 6, dport at byte 42)
-        tc filter add dev "$IFB_DEVICE" protocol ipv6 parent 1: prio 2 u32 match u8 6 0xff at 6 match u16 "$port" 0xffff at 42 flowid "$class_id" 2>/dev/null || \
-        tc filter add dev "$IFB_DEVICE" protocol ipv6 parent 1: prio 2 flower ip_proto tcp dst_port "$port" classid "$class_id" 2>/dev/null || true
-        tc filter add dev "$IFB_DEVICE" protocol ipv6 parent 1: prio 2 u32 match u8 17 0xff at 6 match u16 "$port" 0xffff at 42 flowid "$class_id" 2>/dev/null || \
-        tc filter add dev "$IFB_DEVICE" protocol ipv6 parent 1: prio 2 flower ip_proto udp dst_port "$port" classid "$class_id" 2>/dev/null || true
+        # --- Ingress shaping (Upload): only if IFB was successfully initialized ---
+        if [[ $has_ifb -eq 1 ]]; then
+            batch_rules+="class replace dev $IFB_DEVICE parent 1:1 classid $class_id htb rate $port_up ceil $port_up burst $BURST"$'\n'
+            batch_rules+="qdisc replace dev $IFB_DEVICE parent $class_id handle $qdisc_handle $leaf_qdisc"$'\n'
+            batch_rules+="filter replace dev $IFB_DEVICE protocol ip parent 1: prio 1 u32 match ip protocol 6 0xff match ip dport $port 0xffff flowid $class_id"$'\n'
+            batch_rules+="filter replace dev $IFB_DEVICE protocol ip parent 1: prio 1 u32 match ip protocol 17 0xff match ip dport $port 0xffff flowid $class_id"$'\n'
+            batch_rules+="filter replace dev $IFB_DEVICE protocol ipv6 parent 1: prio 2 u32 match u8 6 0xff at 6 match u16 $port 0xffff at 42 flowid $class_id"$'\n'
+            batch_rules+="filter replace dev $IFB_DEVICE protocol ipv6 parent 1: prio 2 u32 match u8 17 0xff at 6 match u16 $port 0xffff at 42 flowid $class_id"$'\n'
+        fi
 
         idx=$((idx + 1))
     done
 
+    # Execute all port rules in a single atomic tc batch process (ultra-low CPU overhead)
+    if ! tc -force -batch - <<< "$batch_rules" 2>/dev/null; then
+        # Fallback to per-command execution if batch mode is unsupported
+        while IFS= read -r cmd; do
+            [[ -n "$cmd" ]] && tc $cmd 2>/dev/null || true
+        done <<< "$batch_rules"
+    fi
+
     printf "%s\n" "${active_ports[@]}" > "$STATE_FILE"
     log_info "${GREEN}Rate limits successfully applied to all active ports.${NC}"
+}
+
+# Format byte counts into human-readable units using pure Bash integer math (zero forks)
+format_bytes() {
+    local b="${1:-0}"
+    if [[ ! "$b" =~ ^[0-9]+$ ]] || [[ "$b" -eq 0 ]]; then
+        echo "0 B"
+        return
+    fi
+    if (( b < 1024 )); then
+        echo "${b} B"
+    elif (( b < 1048576 )); then
+        local kib=$(( b * 10 / 1024 ))
+        echo "$(( kib / 10 )).$(( kib % 10 )) KiB"
+    elif (( b < 1073741824 )); then
+        local mib=$(( b * 10 / 1048576 ))
+        echo "$(( mib / 10 )).$(( mib % 10 )) MiB"
+    elif (( b < 1099511627776 )); then
+        local gib=$(( b * 10 / 1073741824 ))
+        echo "$(( gib / 10 )).$(( gib % 10 )) GiB"
+    else
+        local tib=$(( b * 10 / 1099511627776 ))
+        echo "$(( tib / 10 )).$(( tib % 10 )) TiB"
+    fi
 }
 
 # Display system status and real-time bandwidth consumption statistics
@@ -503,30 +633,71 @@ show_status() {
     printf "%-8s %-12s %-12s %-16s %-16s\n" "Port" "Download" "Upload" "Egress (Sent)" "Ingress (Recv)"
     echo -e "----------------------------------------------------------------"
 
+    # Pre-parse custom limits into associative arrays (O(1) memory lookup)
+    declare -A custom_down_map custom_up_map
+    if [[ -n "$CUSTOM_LIMITS" ]]; then
+        local c_arr
+        IFS=',' read -ra c_arr <<< "$CUSTOM_LIMITS"
+        for entry in "${c_arr[@]}"; do
+            entry="${entry// /}"
+            [[ -z "$entry" ]] && continue
+            local cp cd cu
+            IFS=':' read -r cp cd cu <<< "$entry"
+            if [[ -n "$cp" ]]; then
+                local val_cd val_cu
+                val_cd=$(validate_rate "$cd" 2>/dev/null) && custom_down_map["$cp"]="$val_cd"
+                val_cu=$(validate_rate "$cu" 2>/dev/null) && custom_up_map["$cp"]="$val_cu"
+            fi
+        done
+    fi
+
+    # Batch query traffic statistics once (replaces hundreds of per-port forks)
+    declare -A egress_bytes ingress_bytes
+    local cur_cls=""
+
+    if [[ -n "$iface" ]]; then
+        local raw_egress
+        raw_egress=$(LC_ALL=C tc -s class show dev "$iface" 2>/dev/null)
+        while IFS= read -r line; do
+            if [[ "$line" =~ class[[:space:]]+[^[:space:]]+[[:space:]]+([0-9]+:[0-9]+) ]]; then
+                cur_cls="${BASH_REMATCH[1]}"
+            elif [[ -n "$cur_cls" && "$line" =~ Sent[[:space:]]+([0-9]+)[[:space:]]+bytes ]]; then
+                egress_bytes["$cur_cls"]="${BASH_REMATCH[1]}"
+                cur_cls=""
+            fi
+        done <<< "$raw_egress"
+    fi
+
+    if [[ -d "/sys/class/net/$IFB_DEVICE" ]]; then
+        local raw_ingress
+        raw_ingress=$(LC_ALL=C tc -s class show dev "$IFB_DEVICE" 2>/dev/null)
+        cur_cls=""
+        while IFS= read -r line; do
+            if [[ "$line" =~ class[[:space:]]+[^[:space:]]+[[:space:]]+([0-9]+:[0-9]+) ]]; then
+                cur_cls="${BASH_REMATCH[1]}"
+            elif [[ -n "$cur_cls" && "$line" =~ Sent[[:space:]]+([0-9]+)[[:space:]]+bytes ]]; then
+                ingress_bytes["$cur_cls"]="${BASH_REMATCH[1]}"
+                cur_cls=""
+            fi
+        done <<< "$raw_ingress"
+    fi
+
+    local norm_d norm_u
+    norm_d=$(validate_rate "$DOWNLOAD_LIMIT") || norm_d="10mbit"
+    norm_u=$(validate_rate "$UPLOAD_LIMIT") || norm_u="10mbit"
+
     local idx=1
     for port in "${active_ports[@]}"; do
         local class_minor=$((idx + 10))
         local class_id="1:$class_minor"
-        read -r port_down port_up < <(get_port_limits "$port")
 
-        local down_bytes="0 B"
-        local up_bytes="0 B"
+        local port_down="${custom_down_map[$port]:-$norm_d}"
+        local port_up="${custom_up_map[$port]:-$norm_u}"
 
-        if [[ -n "$iface" ]]; then
-            local egress_stat
-            egress_stat=$(LC_ALL=C tc -s class show dev "$iface" classid "$class_id" 2>/dev/null | grep -i -o 'Sent [0-9]* bytes' | awk '{print $2}')
-            if [[ -n "$egress_stat" ]]; then
-                down_bytes=$(numfmt --to=iec-i --suffix=B "$egress_stat" 2>/dev/null || echo "${egress_stat} B")
-            fi
-        fi
-
-        if ip link show "$IFB_DEVICE" >/dev/null 2>&1; then
-            local ingress_stat
-            ingress_stat=$(LC_ALL=C tc -s class show dev "$IFB_DEVICE" classid "$class_id" 2>/dev/null | grep -i -o 'Sent [0-9]* bytes' | awk '{print $2}')
-            if [[ -n "$ingress_stat" ]]; then
-                up_bytes=$(numfmt --to=iec-i --suffix=B "$ingress_stat" 2>/dev/null || echo "${ingress_stat} B")
-            fi
-        fi
+        local down_bytes
+        down_bytes=$(format_bytes "${egress_bytes[$class_id]:-0}")
+        local up_bytes
+        up_bytes=$(format_bytes "${ingress_bytes[$class_id]:-0}")
 
         printf "%-8s %-12s %-12s %-16s %-16s\n" "$port" "$port_down" "$port_up" "$down_bytes" "$up_bytes"
         idx=$((idx + 1))
@@ -545,8 +716,9 @@ run_monitor() {
     trap 'log_info "Termination signal received. Exiting monitor daemon."; exit 0' SIGINT SIGTERM
 
     apply_rules
-    local last_ports
-    last_ports=$(get_active_ports 2>/dev/null | tr '\n' ' ')
+    local raw_p
+    raw_p=$(get_active_ports 2>/dev/null)
+    local last_ports="${raw_p//$'\n'/ }"
     local last_cfg_state
     last_cfg_state=$(get_config_state_string)
 
@@ -557,14 +729,15 @@ run_monitor() {
         local current_cfg_state
         current_cfg_state=$(get_config_state_string)
 
-        local current_ports
-        current_ports=$(get_active_ports 2>/dev/null | tr '\n' ' ')
+        raw_p=$(get_active_ports 2>/dev/null)
         local status_code=$?
 
         # Skip iteration if database was temporarily busy or unreachable
         if [[ $status_code -ne 0 ]]; then
             continue
         fi
+
+        local current_ports="${raw_p//$'\n'/ }"
 
         # Re-apply rules if ports changed or speed parameters were updated
         if [[ "$current_ports" != "$last_ports" || "$current_cfg_state" != "$last_cfg_state" ]]; then
@@ -629,8 +802,15 @@ install_service() {
     save_config
 
     modprobe ifb numifbs=1 2>/dev/null || true
-    mkdir -p /etc/modules-load.d
-    echo "ifb" > /etc/modules-load.d/ifb.conf
+    mkdir -p /etc/modules-load.d /etc/modprobe.d
+    cat << 'EOF' > /etc/modules-load.d/port-limit-tc.conf
+sch_htb
+cls_u32
+act_mirred
+sch_fq_codel
+ifb
+EOF
+    echo "options ifb numifbs=1" > /etc/modprobe.d/port-limit-ifb.conf 2>/dev/null || true
 
     # Resolve physical canonical path of the script
     local real_source
@@ -705,7 +885,7 @@ uninstall_service() {
     fi
 
     # 6. Remove kernel module load configuration and unload module from kernel
-    rm -f /etc/modules-load.d/ifb.conf
+    rm -f /etc/modules-load.d/ifb.conf /etc/modules-load.d/port-limit-tc.conf /etc/modprobe.d/port-limit-ifb.conf 2>/dev/null || true
     modprobe -r ifb 2>/dev/null || rmmod ifb 2>/dev/null || true
 
     # 7. Clean up any crontab or cron file remnants
