@@ -6,6 +6,8 @@
 
 set -o pipefail
 
+VERSION="1.1.0"
+
 # ------------------------------------------------------------------------------
 # Default Settings (can be modified directly here or via the interactive menu)
 # ------------------------------------------------------------------------------
@@ -450,7 +452,7 @@ show_status() {
     iface=$(detect_wan_interface)
 
     echo -e "${BOLD}${CYAN}================================================================${NC}"
-    echo -e "${BOLD}${CYAN}       3X-UI Inbound Ports Real-Time Traffic & Rate Limits      ${NC}"
+    echo -e "${BOLD}${CYAN}  3X-UI Inbound Ports Real-Time Traffic & Rate Limits (v${VERSION})   ${NC}"
     echo -e "${BOLD}${CYAN}================================================================${NC}"
 
     local s_status="${RED}Inactive${NC}"
@@ -687,13 +689,186 @@ uninstall_service() {
 }
 
 # ------------------------------------------------------------------------------
-# Terminal User Interface (Interactive Menu)
+# Terminal User Interface (Interactive Menus & Navigation)
 # ------------------------------------------------------------------------------
-show_menu() {
+
+# Dedicated Submenu for Custom Per-Port Bandwidth Limits
+menu_custom_limits() {
     while true; do
         clear
         echo -e "${BOLD}${CYAN}================================================================${NC}"
-        echo -e "${BOLD}${GREEN}    3X-UI Inbound Port Rate Limiter (Port-Limit All-in-One)     ${NC}"
+        echo -e "${BOLD}${GREEN}              Custom Per-Port Speed Limits Menu                 ${NC}"
+        echo -e "${BOLD}${CYAN}================================================================${NC}"
+        echo -e "Current configured custom limits:"
+        if [[ -n "$CUSTOM_LIMITS" ]]; then
+            IFS=',' read -ra c_arr <<< "$CUSTOM_LIMITS"
+            for entry in "${c_arr[@]}"; do
+                entry=$(echo "$entry" | tr -d ' ')
+                [[ -z "$entry" ]] && continue
+                local cp cd cu
+                cp=$(echo "$entry" | cut -d':' -f1)
+                cd=$(echo "$entry" | cut -d':' -f2)
+                cu=$(echo "$entry" | cut -d':' -f3)
+                echo -e "  • Port ${BOLD}${CYAN}$cp${NC} -> Download: ${GREEN}$cd${NC} | Upload: ${GREEN}$cu${NC}"
+            done
+        else
+            echo -e "  ${YELLOW}(No custom limits configured - all inbounds use default limits)${NC}"
+        fi
+        echo -e "${BOLD}${CYAN}----------------------------------------------------------------${NC}"
+        echo -e " ${BOLD}1)${NC} Add or update custom limit for a port"
+        echo -e " ${BOLD}2)${NC} Remove custom limit for a specific port"
+        echo -e " ${BOLD}3)${NC} Clear all custom limits"
+        echo -e " ${BOLD}0)${NC} ${BOLD}${YELLOW}Return to Main Menu${NC}"
+        echo -e "${BOLD}${CYAN}================================================================${NC}"
+        read -rp "Please select an option [0-3]: " sub_choice
+
+        case "$sub_choice" in
+            1)
+                echo ""
+                echo -e "${CYAN}Enter port details (or '0' / 'b' at any prompt to cancel and return):${NC}"
+                read -rp "Target Port (1-65535) [0 to return]: " p_port
+                if [[ "$p_port" == "0" || "$p_port" == "b" || "$p_port" == "B" || -z "$p_port" ]]; then
+                    echo -e "${YELLOW}Cancelled. Returning to custom limits menu...${NC}"
+                    sleep 0.5
+                    continue
+                fi
+                if [[ ! "$p_port" =~ ^[0-9]+$ ]] || (( p_port < 1 || p_port > 65535 )); then
+                    echo -e "${RED}[ERROR] Invalid port number.${NC}"
+                    sleep 1
+                    continue
+                fi
+
+                read -rp "Download limit for port $p_port (e.g. 20mbit or 20) [0 to return]: " p_down
+                if [[ "$p_down" == "0" || "$p_down" == "b" || "$p_down" == "B" || -z "$p_down" ]]; then
+                    echo -e "${YELLOW}Cancelled. Returning to custom limits menu...${NC}"
+                    sleep 0.5
+                    continue
+                fi
+                local v_down
+                if ! v_down=$(validate_rate "$p_down"); then
+                    echo -e "${RED}[ERROR] Invalid download rate format.${NC}"
+                    sleep 1
+                    continue
+                fi
+
+                read -rp "Upload limit for port $p_port (e.g. 20mbit or 20) [0 to return]: " p_up
+                if [[ "$p_up" == "0" || "$p_up" == "b" || "$p_up" == "B" || -z "$p_up" ]]; then
+                    echo -e "${YELLOW}Cancelled. Returning to custom limits menu...${NC}"
+                    sleep 0.5
+                    continue
+                fi
+                local v_up
+                if ! v_up=$(validate_rate "$p_up"); then
+                    echo -e "${RED}[ERROR] Invalid upload rate format.${NC}"
+                    sleep 1
+                    continue
+                fi
+
+                # Update or add entry to CUSTOM_LIMITS
+                local new_list=()
+                if [[ -n "$CUSTOM_LIMITS" ]]; then
+                    IFS=',' read -ra existing_arr <<< "$CUSTOM_LIMITS"
+                    for item in "${existing_arr[@]}"; do
+                        item=$(echo "$item" | tr -d ' ')
+                        [[ -z "$item" ]] && continue
+                        local item_p
+                        item_p=$(echo "$item" | cut -d':' -f1)
+                        if [[ "$item_p" != "$p_port" ]]; then
+                            new_list+=("$item")
+                        fi
+                    done
+                fi
+                new_list+=("$p_port:$v_down:$v_up")
+                local IFS=','
+                CUSTOM_LIMITS="${new_list[*]}"
+                save_config
+                log_info "Custom limit for port $p_port set to Down: $v_down | Up: $v_up"
+                apply_rules
+                echo ""
+                read -rp "Press Enter [or enter 0] to continue..."
+                ;;
+            2)
+                echo ""
+                if [[ -z "$CUSTOM_LIMITS" ]]; then
+                    echo -e "${YELLOW}No custom limits are currently set.${NC}"
+                    sleep 1
+                    continue
+                fi
+                read -rp "Enter port number to remove [0 to return]: " p_port
+                if [[ "$p_port" == "0" || "$p_port" == "b" || "$p_port" == "B" || -z "$p_port" ]]; then
+                    echo -e "${YELLOW}Cancelled. Returning to custom limits menu...${NC}"
+                    sleep 0.5
+                    continue
+                fi
+                local new_list=()
+                local found=0
+                IFS=',' read -ra existing_arr <<< "$CUSTOM_LIMITS"
+                for item in "${existing_arr[@]}"; do
+                    item=$(echo "$item" | tr -d ' ')
+                    [[ -z "$item" ]] && continue
+                    local item_p
+                    item_p=$(echo "$item" | cut -d':' -f1)
+                    if [[ "$item_p" == "$p_port" ]]; then
+                        found=1
+                    else
+                        new_list+=("$item")
+                    fi
+                done
+                if [[ $found -eq 1 ]]; then
+                    local IFS=','
+                    CUSTOM_LIMITS="${new_list[*]}"
+                    save_config
+                    log_info "Custom limit for port $p_port removed."
+                    apply_rules
+                else
+                    echo -e "${YELLOW}Port $p_port was not found in custom limits.${NC}"
+                fi
+                echo ""
+                read -rp "Press Enter [or enter 0] to continue..."
+                ;;
+            3)
+                echo ""
+                echo -e "${BOLD}${YELLOW}Are you sure you want to clear ALL custom per-port limits?${NC}"
+                echo -e " ${BOLD}1)${NC} Confirm and clear all"
+                echo -e " ${BOLD}0)${NC} ${YELLOW}Cancel and return${NC}"
+                read -rp "Please select an option [0-1]: " clr_cust
+                if [[ "$clr_cust" == "1" ]]; then
+                    CUSTOM_LIMITS=""
+                    save_config
+                    log_info "All custom limits cleared."
+                    apply_rules
+                    echo ""
+                    read -rp "Press Enter [or enter 0] to continue..."
+                else
+                    echo -e "${YELLOW}Cancelled.${NC}"
+                    sleep 0.5
+                fi
+                ;;
+            0|b|B|q|Q)
+                return 0
+                ;;
+            *)
+                echo -e "${RED}Invalid option.${NC}"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+show_menu() {
+    while true; do
+        clear
+        local s_status="${RED}Inactive${NC}"
+        if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+            s_status="${GREEN}Active (Running)${NC}"
+        fi
+
+        echo -e "${BOLD}${CYAN}================================================================${NC}"
+        echo -e "${BOLD}${GREEN}   3X-UI Inbound Port Rate Limiter - PortLimit (v${VERSION})     ${NC}"
+        echo -e "${BOLD}${CYAN}================================================================${NC}"
+        echo -e " Auto-Monitor Service : $s_status"
+        echo -e " Default Speed Limits : Down: ${GREEN}$DOWNLOAD_LIMIT${NC} | Up: ${GREEN}$UPLOAD_LIMIT${NC}"
+        echo -e " Excluded Ports       : ${MAGENTA}${EXCLUDE_PORTS:-None}${NC}"
         echo -e "${BOLD}${CYAN}================================================================${NC}"
         echo -e " ${BOLD}1)${NC} ${CYAN}Show current status & traffic stats (Status)${NC}"
         echo -e " ${BOLD}2)${NC} ${YELLOW}Change default download & upload speed limits${NC}"
@@ -713,67 +888,114 @@ show_menu() {
                 echo ""
                 show_status
                 echo ""
-                read -rp "Press Enter to return to menu..."
+                read -rp "Press Enter [or enter 0] to return to main menu..."
                 ;;
             2)
                 echo ""
+                echo -e "${BOLD}${CYAN}================================================================${NC}"
+                echo -e "${BOLD}${GREEN}        Change Default Download & Upload Speed Limits           ${NC}"
+                echo -e "${BOLD}${CYAN}================================================================${NC}"
                 echo -e "Current limits: Download = ${GREEN}$DOWNLOAD_LIMIT${NC} | Upload = ${GREEN}$UPLOAD_LIMIT${NC}"
-                read -rp "New download speed (e.g. 10mbit or 10): " inp_down
-                read -rp "New upload speed (e.g. 10mbit or 10): " inp_up
-                if [[ -n "$inp_down" && -n "$inp_up" ]]; then
-                    set_speed "$inp_down" "$inp_up"
+                echo -e "${YELLOW}(Enter '0' or 'b' at any prompt to cancel and return to main menu)${NC}\n"
+                read -rp "New download speed (e.g. 10mbit, 20m, or 10) [0 to return]: " inp_down
+                if [[ "$inp_down" == "0" || "$inp_down" == "b" || "$inp_down" == "B" || -z "$inp_down" ]]; then
+                    echo -e "${YELLOW}Cancelled. Returning to main menu...${NC}"
+                    sleep 0.5
+                    continue
                 fi
+                read -rp "New upload speed (e.g. 10mbit, 20m, or 10) [0 to return]: " inp_up
+                if [[ "$inp_up" == "0" || "$inp_up" == "b" || "$inp_up" == "B" || -z "$inp_up" ]]; then
+                    echo -e "${YELLOW}Cancelled. Returning to main menu...${NC}"
+                    sleep 0.5
+                    continue
+                fi
+                set_speed "$inp_down" "$inp_up"
                 echo ""
-                read -rp "Press Enter to return to menu..."
+                read -rp "Press Enter [or enter 0] to return to main menu..."
                 ;;
             3)
                 echo ""
-                echo -e "Current excluded ports: ${MAGENTA}$EXCLUDE_PORTS${NC}"
-                read -rp "New excluded ports (comma-separated, e.g. 22,2053): " inp_exc
-                local valid_exc
-                valid_exc=$(validate_ports_list "$inp_exc")
-                EXCLUDE_PORTS="$valid_exc"
+                echo -e "${BOLD}${CYAN}================================================================${NC}"
+                echo -e "${BOLD}${GREEN}                   Configure Excluded Ports                     ${NC}"
+                echo -e "${BOLD}${CYAN}================================================================${NC}"
+                echo -e "Current excluded ports: ${MAGENTA}${EXCLUDE_PORTS:-None}${NC}"
+                echo -e "${YELLOW}(Enter '0' or 'b' to cancel and return, or 'none' to clear)${NC}\n"
+                read -rp "New excluded ports (comma-separated, e.g. 22,2053) [0 to return]: " inp_exc
+                if [[ "$inp_exc" == "0" || "$inp_exc" == "b" || "$inp_exc" == "B" || -z "$inp_exc" ]]; then
+                    echo -e "${YELLOW}Cancelled. Returning to main menu...${NC}"
+                    sleep 0.5
+                    continue
+                fi
+                if [[ "$inp_exc" == "none" || "$inp_exc" == "NONE" || "$inp_exc" == "clear" ]]; then
+                    EXCLUDE_PORTS=""
+                else
+                    local valid_exc
+                    valid_exc=$(validate_ports_list "$inp_exc")
+                    EXCLUDE_PORTS="$valid_exc"
+                fi
                 save_config
-                log_info "Excluded ports saved: $EXCLUDE_PORTS"
+                log_info "Excluded ports saved: ${EXCLUDE_PORTS:-None}"
                 apply_rules
                 echo ""
-                read -rp "Press Enter to return to menu..."
+                read -rp "Press Enter [or enter 0] to return to main menu..."
                 ;;
             4)
-                echo ""
-                echo -e "Current custom limits: ${BLUE}${CUSTOM_LIMITS:-None}${NC}"
-                echo "Format: PORT:DOWN:UP (e.g. 443:20mbit:20mbit,8443:5mbit:5mbit)"
-                read -rp "Enter custom limits (leave empty to clear): " inp_cust
-                local valid_cust
-                valid_cust=$(validate_custom_limits "$inp_cust")
-                if [[ -n "$inp_cust" && -z "$valid_cust" ]]; then
-                    echo -e "${RED}[ERROR] Invalid format entered!${NC}"
-                else
-                    CUSTOM_LIMITS="$valid_cust"
-                    save_config
-                    log_info "Custom port limits saved."
-                    apply_rules
-                fi
-                echo ""
-                read -rp "Press Enter to return to menu..."
+                menu_custom_limits
                 ;;
             5)
                 echo ""
                 apply_rules
                 echo ""
-                read -rp "Press Enter to return to menu..."
+                read -rp "Press Enter [or enter 0] to return to main menu..."
                 ;;
             6)
                 echo ""
-                install_service
+                echo -e "${BOLD}${CYAN}================================================================${NC}"
+                echo -e "${BOLD}${GREEN}            Install & Enable Background Service                 ${NC}"
+                echo -e "${BOLD}${CYAN}================================================================${NC}"
+                echo -e "This will configure kernel modules, install 'port-limit' to system PATH,"
+                echo -e "and enable 'port-limit.service' under systemd to monitor inbounds automatically."
                 echo ""
-                read -rp "Press Enter to return to menu..."
+                echo -e " ${BOLD}1)${NC} Confirm and Install Service"
+                echo -e " ${BOLD}0)${NC} ${YELLOW}Return to Main Menu${NC}"
+                echo -e "${BOLD}${CYAN}================================================================${NC}"
+                read -rp "Please select an option [0-1]: " svc_choice
+                case "$svc_choice" in
+                    1)
+                        echo ""
+                        install_service
+                        echo ""
+                        read -rp "Press Enter [or enter 0] to return to main menu..."
+                        ;;
+                    *)
+                        echo -e "${YELLOW}Cancelled. Returning to main menu...${NC}"
+                        sleep 0.5
+                        ;;
+                esac
                 ;;
             7)
                 echo ""
-                clear_rules
+                echo -e "${BOLD}${YELLOW}================================================================${NC}"
+                echo -e "${BOLD}${YELLOW}                Clear All Traffic Rate Limits                   ${NC}"
+                echo -e "${BOLD}${YELLOW}================================================================${NC}"
+                echo -e "This will remove all 'tc' traffic queues and unthrottle all traffic."
                 echo ""
-                read -rp "Press Enter to return to menu..."
+                echo -e " ${BOLD}1)${NC} Confirm and Clear All Limits"
+                echo -e " ${BOLD}0)${NC} ${YELLOW}Return to Main Menu${NC}"
+                echo -e "${BOLD}${YELLOW}================================================================${NC}"
+                read -rp "Please select an option [0-1]: " clr_choice
+                case "$clr_choice" in
+                    1)
+                        echo ""
+                        clear_rules
+                        echo ""
+                        read -rp "Press Enter [or enter 0] to return to main menu..."
+                        ;;
+                    *)
+                        echo -e "${YELLOW}Cancelled. Returning to main menu...${NC}"
+                        sleep 0.5
+                        ;;
+                esac
                 ;;
             8)
                 echo ""
@@ -782,17 +1004,33 @@ show_menu() {
                 journalctl -u "$SERVICE_NAME" -f -n 50 2>/dev/null || true
                 trap - SIGINT
                 echo ""
-                read -rp "Press Enter to return to menu..."
+                read -rp "Press Enter [or enter 0] to return to main menu..."
                 ;;
             9)
                 echo ""
-                read -rp "Are you sure you want to completely uninstall port-limit? (y/N): " confirm
-                if [[ "$confirm" =~ ^[Yy]$ ]]; then
-                    uninstall_service
-                    exit 0
-                fi
+                echo -e "${BOLD}${RED}================================================================${NC}"
+                echo -e "${BOLD}${RED}                Uninstall Port-Limit Completely                 ${NC}"
+                echo -e "${BOLD}${RED}================================================================${NC}"
+                echo -e "This will stop the service, remove all traffic control rules,"
+                echo -e "delete configuration files, and remove the port-limit executable."
+                echo ""
+                echo -e " ${BOLD}1)${NC} Confirm Complete Uninstallation"
+                echo -e " ${BOLD}0)${NC} ${YELLOW}Return to Main Menu${NC}"
+                echo -e "${BOLD}${RED}================================================================${NC}"
+                read -rp "Please select an option [0-1]: " uninst_choice
+                case "$uninst_choice" in
+                    1)
+                        echo ""
+                        uninstall_service
+                        exit 0
+                        ;;
+                    *)
+                        echo -e "${YELLOW}Cancelled. Returning to main menu...${NC}"
+                        sleep 0.5
+                        ;;
+                esac
                 ;;
-            0)
+            0|q|Q|exit)
                 exit 0
                 ;;
             *)
@@ -808,10 +1046,11 @@ show_menu() {
 # ------------------------------------------------------------------------------
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-    # Exclude help command from root check
+    # Exclude help and version commands from root check
     case "${1:-}" in
         help|--help|-h)
-            echo "Port-Limit Management Tool Usage:"
+            echo "Port-Limit Management Tool v$VERSION"
+            echo "Usage:"
             echo "  port-limit                    Open interactive management menu"
             echo "  port-limit status             Show port status and real-time traffic stats"
             echo "  port-limit apply              Apply or refresh traffic limits"
@@ -821,6 +1060,11 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
             echo "  port-limit uninstall          Completely uninstall script and service"
             echo "  port-limit set-speed <D> <U>  Quickly update default speeds (e.g. port-limit set-speed 10mbit 10mbit)"
             echo "  port-limit monitor            Run background port monitoring daemon (used by systemd)"
+            echo "  port-limit version            Display version information"
+            exit 0
+            ;;
+        version|--version|-v)
+            echo "Port-Limit version $VERSION"
             exit 0
             ;;
     esac
