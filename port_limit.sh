@@ -6,15 +6,16 @@
 
 set -o pipefail
 
-VERSION="1.1.0"
+VERSION="1.1.3"
 
 # ------------------------------------------------------------------------------
 # Default Settings (can be modified directly here or via the interactive menu)
 # ------------------------------------------------------------------------------
 DOWNLOAD_LIMIT="10mbit"       # Client download speed limit (Server egress traffic)
 UPLOAD_LIMIT="10mbit"         # Client upload speed limit (Server ingress traffic)
-CHECK_INTERVAL=10             # Interval in seconds to check for new inbounds
+CHECK_INTERVAL=60             # Interval in seconds to check for new inbounds (1 minute)
 EXCLUDE_PORTS="22"            # Excluded ports (comma-separated, e.g., 22,2053)
+MIN_PORT=10000                # Minimum port threshold (ports below 10000 are completely exempt)
 CUSTOM_LIMITS=""              # Custom limits per port (e.g., "443:20mbit:20mbit,8443:5mbit:5mbit")
 BURST="64k"                   # Burst buffer size for connection establishment (TSO/GSO compatible)
 DB_PATH="${PORT_LIMIT_DB:-/etc/x-ui/x-ui.db}"         # SQLite database path for 3X-UI panel
@@ -135,6 +136,9 @@ load_config() {
             EXCLUDE_PORTS="$(validate_ports_list "$val")"
         fi
 
+        val=$(grep -E '^MIN_PORT=' "$CONFIG_FILE" | cut -d'=' -f2- | tr -d '"'\'' ')
+        [[ -n "$val" && "$val" =~ ^[0-9]+$ && "$val" -ge 1 && "$val" -le 65535 ]] && MIN_PORT="$val"
+
         if grep -q -E '^CUSTOM_LIMITS=' "$CONFIG_FILE"; then
             val=$(grep -E '^CUSTOM_LIMITS=' "$CONFIG_FILE" | cut -d'=' -f2- | tr -d '"'\'' ')
             CUSTOM_LIMITS=$(validate_custom_limits "$val")
@@ -243,9 +247,10 @@ get_active_ports() {
     local filtered=()
     IFS=',' read -ra exc_array <<< "$EXCLUDE_PORTS"
 
+    local min_p="${MIN_PORT:-10000}"
     while read -r p; do
         p=$(echo "$p" | tr -d ' \r\n')
-        if [[ "$p" =~ ^[0-9]+$ ]] && (( p >= 1 && p <= 65535 )); then
+        if [[ "$p" =~ ^[0-9]+$ ]] && (( p >= min_p && p <= 65535 )); then
             local is_exc=0
             for exc in "${exc_array[@]}"; do
                 exc=$(echo "$exc" | tr -d ' ')
@@ -318,8 +323,14 @@ clear_rules() {
     log_info "Removing traffic control queues and rate limit rules..."
 
     if [[ -n "$iface" ]]; then
+        tc filter del dev "$iface" parent ffff: 2>/dev/null || true
         tc qdisc del dev "$iface" root 2>/dev/null || true
         tc qdisc del dev "$iface" ingress 2>/dev/null || true
+    fi
+    if [[ -n "$WAN_INTERFACE" && "$WAN_INTERFACE" != "$iface" ]]; then
+        tc filter del dev "$WAN_INTERFACE" parent ffff: 2>/dev/null || true
+        tc qdisc del dev "$WAN_INTERFACE" root 2>/dev/null || true
+        tc qdisc del dev "$WAN_INTERFACE" ingress 2>/dev/null || true
     fi
     if ip link show "$IFB_DEVICE" >/dev/null 2>&1; then
         tc qdisc del dev "$IFB_DEVICE" root 2>/dev/null || true
@@ -462,7 +473,9 @@ show_status() {
     echo -e "Auto-Monitor Service: $s_status"
     echo -e "WAN Interface: ${YELLOW}${iface:-Unknown}${NC}"
     echo -e "Default Limits: Download=${GREEN}$DOWNLOAD_LIMIT${NC} | Upload=${GREEN}$UPLOAD_LIMIT${NC}"
+    echo -e "Port Filter: ${YELLOW}>= ${MIN_PORT}${NC} (Ports < ${MIN_PORT} are completely exempt)"
     echo -e "Excluded Ports: ${MAGENTA}${EXCLUDE_PORTS:-None}${NC}"
+    echo -e "Check Interval: ${CYAN}${CHECK_INTERVAL}s (1 minute)${NC}"
     echo -e "Panel Database: $DB_PATH"
     echo -e "----------------------------------------------------------------"
 
@@ -523,7 +536,7 @@ show_status() {
 
 # Generate a fingerprint string of current config parameters to track modifications
 get_config_state_string() {
-    echo "${DOWNLOAD_LIMIT}|${UPLOAD_LIMIT}|${EXCLUDE_PORTS}|${CUSTOM_LIMITS}|${BURST}|${WAN_INTERFACE}|${DB_PATH}"
+    echo "${DOWNLOAD_LIMIT}|${UPLOAD_LIMIT}|${CHECK_INTERVAL}|${EXCLUDE_PORTS}|${MIN_PORT}|${CUSTOM_LIMITS}|${BURST}|${WAN_INTERFACE}|${DB_PATH}"
 }
 
 # Daemon loop to automatically detect database additions/removals and config changes
@@ -576,6 +589,7 @@ DOWNLOAD_LIMIT="$DOWNLOAD_LIMIT"
 UPLOAD_LIMIT="$UPLOAD_LIMIT"
 CHECK_INTERVAL=$CHECK_INTERVAL
 EXCLUDE_PORTS="$EXCLUDE_PORTS"
+MIN_PORT=$MIN_PORT
 CUSTOM_LIMITS="$CUSTOM_LIMITS"
 BURST="$BURST"
 DB_PATH="$DB_PATH"
@@ -666,26 +680,48 @@ EOF
 
 uninstall_service() {
     check_root
-    echo -e "${BOLD}${YELLOW}Removing service and resetting network configurations...${NC}"
+    echo -e "${BOLD}${YELLOW}Removing service, resetting network configurations, and cleaning up files...${NC}"
 
+    # 1. Stop and disable systemd service
     systemctl stop "$SERVICE_NAME" 2>/dev/null || true
     systemctl disable "$SERVICE_NAME" 2>/dev/null || true
-    rm -f "/etc/systemd/system/${SERVICE_NAME}.service"
-    systemctl daemon-reload
 
+    # 2. Terminate any orphan monitor daemon processes running in background
+    pkill -f "port-limit monitor" 2>/dev/null || true
+
+    # 3. Remove systemd service unit and reload daemon
+    rm -f "/etc/systemd/system/${SERVICE_NAME}.service"
+    rm -f "/etc/systemd/system/multi-user.target.wants/${SERVICE_NAME}.service"
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl reset-failed "$SERVICE_NAME" 2>/dev/null || true
+
+    # 4. Remove all tc queues and rate limits
     clear_rules
 
-    rm -f /etc/modules-load.d/ifb.conf
-    rm -f "$CONFIG_FILE"
-    rm -f "$STATE_FILE"
-    rm -f "$INSTALL_PATH"
-
+    # 5. Bring down and delete IFB virtual device
     if ip link show "$IFB_DEVICE" >/dev/null 2>&1; then
         ip link set dev "$IFB_DEVICE" down 2>/dev/null || true
         ip link delete "$IFB_DEVICE" type ifb 2>/dev/null || true
     fi
 
-    echo -e "${BOLD}${GREEN}✓ Script and service uninstalled completely.${NC}"
+    # 6. Remove kernel module load configuration and unload module from kernel
+    rm -f /etc/modules-load.d/ifb.conf
+    modprobe -r ifb 2>/dev/null || rmmod ifb 2>/dev/null || true
+
+    # 7. Clean up any crontab or cron file remnants
+    if command -v crontab >/dev/null 2>&1; then
+        crontab -l 2>/dev/null | grep -v "port-limit" | crontab - 2>/dev/null || true
+    fi
+    rm -f /etc/cron.d/port-limit /etc/cron.daily/port-limit /etc/cron.hourly/port-limit 2>/dev/null || true
+
+    # 8. Clean up all configuration, state, temporary, and executable files
+    rm -f "$CONFIG_FILE" "${CONFIG_FILE}.bak" 2>/dev/null || true
+    rm -f "$STATE_FILE" /run/port-limit* 2>/dev/null || true
+    rm -f "$INSTALL_PATH" "${INSTALL_PATH}.tmp" 2>/dev/null || true
+
+    echo -e "${BOLD}${GREEN}================================================================${NC}"
+    echo -e "${BOLD}${GREEN}  ✓ Port-Limit and all associated components completely uninstalled!${NC}"
+    echo -e "${BOLD}${GREEN}================================================================${NC}"
 }
 
 # ------------------------------------------------------------------------------
@@ -735,6 +771,12 @@ menu_custom_limits() {
                 if [[ ! "$p_port" =~ ^[0-9]+$ ]] || (( p_port < 1 || p_port > 65535 )); then
                     echo -e "${RED}[ERROR] Invalid port number.${NC}"
                     sleep 1
+                    continue
+                fi
+
+                if (( p_port < MIN_PORT )); then
+                    echo -e "${RED}[ERROR] Port $p_port is below minimum threshold ($MIN_PORT). Ports under $MIN_PORT are exempt from rate limiting.${NC}"
+                    sleep 1.5
                     continue
                 fi
 
@@ -855,6 +897,78 @@ menu_custom_limits() {
     done
 }
 
+# Dedicated Submenu for Port Filtering & Exclusions
+menu_port_filter() {
+    while true; do
+        clear
+        echo -e "${BOLD}${CYAN}================================================================${NC}"
+        echo -e "${BOLD}${GREEN}               Configure Port Filtering & Exclusions            ${NC}"
+        echo -e "${BOLD}${CYAN}================================================================${NC}"
+        echo -e " Minimum Controlled Port : ${YELLOW}>= ${MIN_PORT}${NC} ${GREEN}(All ports < ${MIN_PORT} are completely exempt)${NC}"
+        echo -e " Excluded Ports List     : ${MAGENTA}${EXCLUDE_PORTS:-None}${NC}"
+        echo -e "${BOLD}${CYAN}----------------------------------------------------------------${NC}"
+        echo -e " ${BOLD}1)${NC} Change minimum port threshold (Current: >= ${MIN_PORT})"
+        echo -e " ${BOLD}2)${NC} Configure excluded ports list (e.g. 22,2053)"
+        echo -e " ${BOLD}0)${NC} ${BOLD}${YELLOW}Return to Main Menu${NC}"
+        echo -e "${BOLD}${CYAN}================================================================${NC}"
+        read -rp "Please select an option [0-2]: " pf_choice
+
+        case "$pf_choice" in
+            1)
+                echo ""
+                echo -e "Current minimum port threshold: ${YELLOW}>= ${MIN_PORT}${NC}"
+                echo -e "${CYAN}(Inbound ports below this number will never have rate limits applied)${NC}"
+                read -rp "Enter new minimum port (1-65535) [0 to cancel]: " inp_min
+                if [[ "$inp_min" == "0" || "$inp_min" == "b" || "$inp_min" == "B" || -z "$inp_min" ]]; then
+                    echo -e "${YELLOW}Cancelled.${NC}"
+                    sleep 0.5
+                    continue
+                fi
+                if [[ "$inp_min" =~ ^[0-9]+$ ]] && (( inp_min >= 1 && inp_min <= 65535 )); then
+                    MIN_PORT="$inp_min"
+                    save_config
+                    log_info "Minimum port threshold set to: >= $MIN_PORT"
+                    apply_rules
+                else
+                    echo -e "${RED}[ERROR] Invalid port number. Must be between 1 and 65535.${NC}"
+                fi
+                echo ""
+                read -rp "Press Enter [or enter 0] to continue..."
+                ;;
+            2)
+                echo ""
+                echo -e "Current excluded ports: ${MAGENTA}${EXCLUDE_PORTS:-None}${NC}"
+                echo -e "${YELLOW}(Enter '0' or 'b' to cancel and return, or 'none' to clear)${NC}\n"
+                read -rp "New excluded ports (comma-separated, e.g. 22,2053) [0 to return]: " inp_exc
+                if [[ "$inp_exc" == "0" || "$inp_exc" == "b" || "$inp_exc" == "B" || -z "$inp_exc" ]]; then
+                    echo -e "${YELLOW}Cancelled.${NC}"
+                    sleep 0.5
+                    continue
+                fi
+                if [[ "$inp_exc" == "none" || "$inp_exc" == "NONE" || "$inp_exc" == "clear" ]]; then
+                    EXCLUDE_PORTS=""
+                else
+                    local valid_exc
+                    valid_exc=$(validate_ports_list "$inp_exc")
+                    EXCLUDE_PORTS="$valid_exc"
+                fi
+                save_config
+                log_info "Excluded ports saved: ${EXCLUDE_PORTS:-None}"
+                apply_rules
+                echo ""
+                read -rp "Press Enter [or enter 0] to continue..."
+                ;;
+            0|b|B|q|Q)
+                return 0
+                ;;
+            *)
+                echo -e "${RED}Invalid option.${NC}"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
 show_menu() {
     while true; do
         clear
@@ -868,11 +982,13 @@ show_menu() {
         echo -e "${BOLD}${CYAN}================================================================${NC}"
         echo -e " Auto-Monitor Service : $s_status"
         echo -e " Default Speed Limits : Down: ${GREEN}$DOWNLOAD_LIMIT${NC} | Up: ${GREEN}$UPLOAD_LIMIT${NC}"
+        echo -e " Port Filtering       : >= ${MIN_PORT} (Ports < ${MIN_PORT} are completely exempt)"
         echo -e " Excluded Ports       : ${MAGENTA}${EXCLUDE_PORTS:-None}${NC}"
+        echo -e " Check Interval       : ${CYAN}${CHECK_INTERVAL}s (1 minute)${NC}"
         echo -e "${BOLD}${CYAN}================================================================${NC}"
         echo -e " ${BOLD}1)${NC} ${CYAN}Show current status & traffic stats (Status)${NC}"
         echo -e " ${BOLD}2)${NC} ${YELLOW}Change default download & upload speed limits${NC}"
-        echo -e " ${BOLD}3)${NC} ${MAGENTA}Configure excluded ports (Exclude Ports)${NC}"
+        echo -e " ${BOLD}3)${NC} ${MAGENTA}Configure port filtering & exclusions (Min Port: >= ${MIN_PORT})${NC}"
         echo -e " ${BOLD}4)${NC} ${BLUE}Configure custom per-port speed limits (Custom Limits)${NC}"
         echo -e " ${BOLD}5)${NC} ${GREEN}Apply / reload traffic control rules now (Apply / Reload)${NC}"
         echo -e " ${BOLD}6)${NC} ${YELLOW}Install & enable background service (Install Service)${NC}"
@@ -914,30 +1030,7 @@ show_menu() {
                 read -rp "Press Enter [or enter 0] to return to main menu..."
                 ;;
             3)
-                echo ""
-                echo -e "${BOLD}${CYAN}================================================================${NC}"
-                echo -e "${BOLD}${GREEN}                   Configure Excluded Ports                     ${NC}"
-                echo -e "${BOLD}${CYAN}================================================================${NC}"
-                echo -e "Current excluded ports: ${MAGENTA}${EXCLUDE_PORTS:-None}${NC}"
-                echo -e "${YELLOW}(Enter '0' or 'b' to cancel and return, or 'none' to clear)${NC}\n"
-                read -rp "New excluded ports (comma-separated, e.g. 22,2053) [0 to return]: " inp_exc
-                if [[ "$inp_exc" == "0" || "$inp_exc" == "b" || "$inp_exc" == "B" || -z "$inp_exc" ]]; then
-                    echo -e "${YELLOW}Cancelled. Returning to main menu...${NC}"
-                    sleep 0.5
-                    continue
-                fi
-                if [[ "$inp_exc" == "none" || "$inp_exc" == "NONE" || "$inp_exc" == "clear" ]]; then
-                    EXCLUDE_PORTS=""
-                else
-                    local valid_exc
-                    valid_exc=$(validate_ports_list "$inp_exc")
-                    EXCLUDE_PORTS="$valid_exc"
-                fi
-                save_config
-                log_info "Excluded ports saved: ${EXCLUDE_PORTS:-None}"
-                apply_rules
-                echo ""
-                read -rp "Press Enter [or enter 0] to return to main menu..."
+                menu_port_filter
                 ;;
             4)
                 menu_custom_limits
