@@ -1600,6 +1600,8 @@ main_menu() {
         echo -e " ${BOLD}${WHITE}Setup${NC}"
         echo -e "  ${GREEN}1)${NC} Setup Iran Server (IPX Server)"
         echo -e "  ${BLUE}2)${NC} Setup Kharej Client (IPX Client)"
+        echo ""
+        echo -e " ${BOLD}${WHITE}Fast Setup${NC}"
         echo -e "  ${GREEN}3)${NC} Fast Setup Iran Server"
         echo -e "  ${BLUE}4)${NC} Fast Setup Kharej Client"
         echo ""
