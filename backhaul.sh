@@ -1,9 +1,11 @@
 #!/bin/bash
 
 # ╔════════════════════════════════════════════════════════════════╗
-# ║  BACKHAUL TUNNEL SETUP - TUN/IPX Mode                        ║
+# ║  BACKHAUL TUNNEL SETUP - TUN/IPX Mode v2.0                   ║
 # ║  Iran (Server) & Kharej (Client) Setup Script                ║
 # ╚════════════════════════════════════════════════════════════════╝
+
+SCRIPT_VERSION="2.0"
 
 # ─── Colors ───────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -40,9 +42,15 @@ print_header() {
     echo ""
     echo -e "${CYAN}${BOLD}"
     echo " ╔════════════════════════════════════════════════╗"
-    echo " ║     BACKHAUL TUNNEL SETUP - TUN/IPX Mode      ║"
+    echo " ║     BACKHAUL TUNNEL SETUP - TUN/IPX v2.0       ║"
     echo " ╚════════════════════════════════════════════════╝"
     echo -e "${NC}"
+    if [ -f "${BINARY_PATH}" ] && [ -x "${BINARY_PATH}" ]; then
+        echo -e "  ${DIM}Binary Status:${NC} ${GREEN}●${NC} ${GREEN}Installed${NC} ${DIM}(${BINARY_PATH})${NC}"
+    else
+        echo -e "  ${DIM}Binary Status:${NC} ${RED}●${NC} ${YELLOW}Not Found${NC} ${DIM}(Use option 15 to download)${NC}"
+    fi
+    echo ""
 }
 
 msg_info() {
@@ -70,13 +78,10 @@ check_root() {
 
 check_binary() {
     if [ ! -f "${BINARY_PATH}" ]; then
-        msg_warn "Binary not found at ${BINARY_PATH}"
-        msg_info "Use menu option 15 to download, or place 'backhaul_premium' in ${CORE_DIR}/"
         return 1
     fi
     if [ ! -x "${BINARY_PATH}" ]; then
         chmod +x "${BINARY_PATH}"
-        msg_info "Made binary executable."
     fi
     return 0
 }
@@ -88,36 +93,15 @@ download_binary() {
     echo -e " ${GREEN}${BOLD}>>> Download Backhaul Premium Binary${NC}"
     print_line
     echo ""
-    echo -e "  ${WHITE}1)${NC} Download from ${CYAN}Iran Mirror${NC}       ${DIM}(79.175.188.86 — direct binary)${NC}"
-    echo -e "  ${WHITE}2)${NC} Download from ${BLUE}GitHub Mirror${NC}     ${DIM}(github.com/alireza-2030 — direct binary)${NC}"
-    echo -e "  ${WHITE}3)${NC} Download from ${CYAN}Iran Official${NC}    ${DIM}(ir.backhaul-dev.com — tar.gz)${NC}"
-    echo -e "  ${WHITE}4)${NC} Download from ${BLUE}Foreign Official${NC} ${DIM}(en.backhaul-dev.com — tar.gz)${NC}"
+    echo -e "  ${WHITE}1)${NC} Download from ${BLUE}GitHub Mirror${NC}  ${DIM}(github.com/alireza-2030 — direct binary)${NC}"
     echo -e "  ${DIM}0)${NC} Cancel"
     echo ""
-    read -p "  Select mirror: " mirror_choice
+    read -p "  Select (1 or 0): " mirror_choice
 
     mkdir -p "${CORE_DIR}"
 
     case $mirror_choice in
         1)
-            # Iran mirror — direct binary
-            local url="http://79.175.188.86:8090/backhaul-premium/bin/backhaul_premium"
-            msg_info "Downloading: ${url}"
-            echo ""
-            if curl -L --max-time 60 --progress-bar -o "${BINARY_PATH}" "${url}"; then
-                local fsize=$(stat -c%s "${BINARY_PATH}" 2>/dev/null || stat -f%z "${BINARY_PATH}" 2>/dev/null)
-                if [ "${fsize:-0}" -gt 1000000 ]; then
-                    chmod +x "${BINARY_PATH}"
-                    msg_ok "Binary installed: ${BINARY_PATH}"
-                else
-                    msg_err "Downloaded file is too small, download may have failed."
-                    rm -f "${BINARY_PATH}" 2>/dev/null
-                fi
-            else
-                msg_err "Download failed."
-            fi
-            ;;
-        2)
             # GitHub mirror — direct binary
             local url="https://raw.githubusercontent.com/alireza-2030/backhaul-manager/main/backhaul-final/dist/backhaul_premium"
             msg_info "Downloading: ${url}"
@@ -133,58 +117,6 @@ download_binary() {
                 fi
             else
                 msg_err "Download failed."
-            fi
-            ;;
-        3|4)
-            # Official mirrors — tar.gz format
-            local base_url=""
-            if [ "$mirror_choice" = "3" ]; then
-                base_url="http://ir.backhaul-dev.com:2095"
-            else
-                base_url="http://en.backhaul-dev.com:2095"
-            fi
-
-            local arch=$(uname -m)
-            local filename=""
-            case $arch in
-                x86_64)  filename="backhaul_premium_amd64.tar.gz" ;;
-                aarch64) filename="backhaul_premium_arm64.tar.gz" ;;
-                *)       msg_err "Unsupported architecture: ${arch}"; return ;;
-            esac
-
-            local url="${base_url}/${filename}"
-            local tmp_file="/tmp/${filename}"
-
-            msg_info "Downloading: ${url}"
-            echo ""
-
-            if curl -L --ipv4 -o "${tmp_file}" "${url}" --progress-bar; then
-                msg_ok "Download complete."
-                msg_info "Extracting..."
-                rm -f "${BINARY_PATH}" 2>/dev/null
-                tar xzf "${tmp_file}" -C "${CORE_DIR}" 2>/dev/null
-                if [ -f "${CORE_DIR}/backhaul_premium" ]; then
-                    chmod +x "${BINARY_PATH}"
-                    msg_ok "Binary installed: ${BINARY_PATH}"
-                elif [ -f "${CORE_DIR}/backhaul" ]; then
-                    mv "${CORE_DIR}/backhaul" "${BINARY_PATH}"
-                    chmod +x "${BINARY_PATH}"
-                    msg_ok "Binary installed: ${BINARY_PATH}"
-                else
-                    local found
-                    found=$(find "${CORE_DIR}" -maxdepth 1 -name "backhaul*" -type f ! -name "*.toml" ! -name "*.gz" | head -1)
-                    if [ -n "$found" ] && [ "$found" != "${BINARY_PATH}" ]; then
-                        mv "$found" "${BINARY_PATH}"
-                        chmod +x "${BINARY_PATH}"
-                        msg_ok "Binary installed: ${BINARY_PATH}"
-                    else
-                        msg_err "Could not find binary after extraction."
-                    fi
-                fi
-                rm -f "${tmp_file}" 2>/dev/null
-            else
-                msg_err "Download failed. Check your connection."
-                rm -f "${tmp_file}" 2>/dev/null
             fi
             ;;
         0) return ;;
@@ -245,10 +177,10 @@ read_input() {
 
     if [ -n "$default" ]; then
         read -p "  ${prompt} [${default}]: " input_val
-        eval "${var_name}=\"${input_val:-$default}\""
+        printf -v "$var_name" "%s" "${input_val:-$default}"
     else
         read -p "  ${prompt}: " input_val
-        eval "${var_name}=\"${input_val}\""
+        printf -v "$var_name" "%s" "${input_val}"
     fi
 }
 
@@ -285,24 +217,31 @@ show_review_box() {
     echo -e "    Interface:       ${WHITE}${BOLD}${INTERFACE}${NC}  ${DIM}(auto-detected)${NC}"
     echo -e "    Mode:            ${YELLOW}${BOLD}$([ \"$mode\" = \"iran\" ] && echo 'server' || echo 'client')${NC}"
     if [ "$PROFILE" = "udp" ] || [ "$PROFILE" = "tcp" ] || [ "$PROFILE" = "icmp" ]; then
-        echo ""
-        print_line
-        echo -e "  ${CYAN}Spoof:${NC}"
-        echo -e "    Spoof Src IP:    ${MAGENTA}${BOLD}${SPOOF_SRC_IP}${NC}"
-        echo -e "    Spoof Dst IP:    ${MAGENTA}${BOLD}${SPOOF_DST_IP}${NC}"
+        if [ -n "$SPOOF_SRC_IP" ] || [ -n "$SPOOF_DST_IP" ]; then
+            echo ""
+            print_line
+            echo -e "  ${CYAN}Spoof:${NC}"
+            [ -n "$SPOOF_SRC_IP" ] && echo -e "    Spoof Src IP:    ${MAGENTA}${BOLD}${SPOOF_SRC_IP}${NC}"
+            [ -n "$SPOOF_DST_IP" ] && echo -e "    Spoof Dst IP:    ${MAGENTA}${BOLD}${SPOOF_DST_IP}${NC}"
+        fi
     fi
     echo ""
     print_line
     echo -e "  ${CYAN}Security:${NC}"
     echo -e "    Encryption:      ${WHITE}${ENCRYPTION}${NC}"
-    echo -e "    Algorithm:       ${WHITE}${ALGORITHM}${NC}"
-    echo -e "    PSK:             ${YELLOW}${BOLD}${PSK}${NC}"
-    echo -e "    KDF Iterations:  ${WHITE}${KDF_ITERATIONS}${NC}"
+    if [ "$ENCRYPTION" = "true" ]; then
+        echo -e "    Algorithm:       ${WHITE}${ALGORITHM}${NC}"
+        echo -e "    PSK:             ${YELLOW}${BOLD}${PSK}${NC}"
+        echo -e "    KDF Iterations:  ${WHITE}${KDF_ITERATIONS}${NC}"
+    fi
     echo ""
     print_line
     echo -e "  ${CYAN}Transport & Tuning:${NC}"
     echo -e "    Heartbeat:       ${WHITE}${HEARTBEAT_INTERVAL}s interval / ${HEARTBEAT_TIMEOUT}s timeout${NC}"
     echo -e "    Tuning Profile:  ${YELLOW}${BOLD}${TUNING_PROFILE}${NC}"
+    echo -e "    Workers:         ${WHITE}${WORKERS}${NC}"
+    echo -e "    Channel Size:    ${WHITE}60000${NC}"
+    echo -e "    Batch Size:      ${WHITE}4096${NC}"
     echo -e "    Log Level:       ${WHITE}${LOG_LEVEL}${NC}"
     echo ""
     print_double_line
@@ -343,10 +282,10 @@ kdf_iterations = ${KDF_ITERATIONS}
 [tuning]
 auto_tuning = true
 tuning_profile = "${TUNING_PROFILE}"
-workers = 0
-channel_size = 10_000
+workers = ${WORKERS}
+channel_size = 60000
 so_sndbuf = 0
-batch_size = 2048
+batch_size = 4096
 
 [logging]
 log_level = "${LOG_LEVEL}"
@@ -390,10 +329,10 @@ kdf_iterations = ${KDF_ITERATIONS}
 [tuning]
 auto_tuning = true
 tuning_profile = "${TUNING_PROFILE}"
-workers = 0
-channel_size = 10_000
+workers = ${WORKERS}
+channel_size = 60000
 so_sndbuf = 0
-batch_size = 2048
+batch_size = 4096
 
 [logging]
 log_level = "${LOG_LEVEL}"
@@ -408,7 +347,7 @@ create_systemd_service() {
 
     cat > "${service_path}" << EOF
 [Unit]
-Description=Backhaul Premium Tunnel - Optimized v1.0 (${description})
+Description=Backhaul Premium Tunnel - Optimized v${SCRIPT_VERSION} (${description})
 After=network.target network-online.target
 Wants=network-online.target
 
@@ -426,6 +365,7 @@ RestartSec=3
 LimitNOFILE=1048576
 TasksMax=infinity
 LimitMEMLOCK=infinity
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 
 # Logging configuration
 StandardOutput=journal
@@ -442,11 +382,42 @@ EOF
 
 # ─── Setup Functions ─────────────────────────────────────────────
 
+ensure_setup_prerequisites() {
+    # Check binary
+    if [ ! -f "${BINARY_PATH}" ]; then
+        msg_warn "Backhaul binary not found at ${BINARY_PATH}."
+        read -p "  Would you like to download it now? (Y/n): " dl_confirm
+        if [[ ! "$dl_confirm" =~ ^[Nn]$ ]]; then
+            download_binary
+            if [ ! -f "${BINARY_PATH}" ]; then
+                msg_err "Binary is required to continue setup."
+                return 1
+            fi
+        else
+            msg_err "Cannot proceed without Backhaul binary."
+            return 1
+        fi
+    fi
+
+    # Enable IPv4 forwarding for TUN mode if not already active
+    if [ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" != "1" ]; then
+        sysctl -w net.ipv4.ip_forward=1 &>/dev/null
+        if [ -f /etc/sysctl.conf ] && ! grep -q '^net.ipv4.ip_forward=1' /etc/sysctl.conf 2>/dev/null; then
+            echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf 2>/dev/null
+        fi
+        msg_ok "Kernel IP forwarding enabled."
+    fi
+
+    return 0
+}
+
 setup_iran() {
     print_header
     echo -e " ${GREEN}${BOLD}>>> Setup Iran Server (IPX Server Mode)${NC}"
     echo ""
     print_line
+
+    ensure_setup_prerequisites || return
 
     # Auto-detect interface
     INTERFACE=$(detect_interface)
@@ -463,7 +434,12 @@ setup_iran() {
         exit 1
     fi
     read_input "Tunnel name" "backhaul${TUNNEL_ID}" TUN_NAME
-    read_input "Health port" "1234" HEALTH_PORT
+
+    local default_health_port="1001"
+    if [[ "$TUNNEL_ID" =~ ^[0-9]+$ ]]; then
+        default_health_port=$((1000 + 10#$TUNNEL_ID))
+    fi
+    read_input "Health port" "${default_health_port}" HEALTH_PORT
     read_input "MTU" "1320" MTU
 
     # Auto-generate TUN addresses from ID
@@ -503,17 +479,14 @@ setup_iran() {
         else
             PROFILE="icmp"
         fi
-        read_input "Spoof Source IP" "79.127.126.29" SPOOF_SRC_IP
-        if [ -z "$SPOOF_SRC_IP" ]; then
-            msg_err "Spoof Source IP is required in ${PROFILE} mode!"
-            exit 1
-        fi
-        read_input "Spoof Destination IP" "185.129.116.237" SPOOF_DST_IP
-        if [ -z "$SPOOF_DST_IP" ]; then
-            msg_err "Spoof Destination IP is required in ${PROFILE} mode!"
-            exit 1
-        fi
-        printf -v SPOOF_BLOCK 'spoof_src_ip = "%s"\nspoof_dst_ip = "%s"\n' "${SPOOF_SRC_IP}" "${SPOOF_DST_IP}"
+        read_input "Spoof Source IP (optional, Enter to skip)" "" SPOOF_SRC_IP
+        read_input "Spoof Destination IP (optional, Enter to skip)" "" SPOOF_DST_IP
+
+        local _src_line=""
+        local _dst_line=""
+        [ -n "$SPOOF_SRC_IP" ] && printf -v _src_line 'spoof_src_ip = "%s"\n' "${SPOOF_SRC_IP}"
+        [ -n "$SPOOF_DST_IP" ] && printf -v _dst_line 'spoof_dst_ip = "%s"\n' "${SPOOF_DST_IP}"
+        SPOOF_BLOCK="${_src_line}${_dst_line}"
     else
         PROFILE="bip"
         SPOOF_SRC_IP=""
@@ -523,26 +496,45 @@ setup_iran() {
 
     # ── Step 4: Security ──
     echo -e "\n ${MAGENTA}${BOLD}[4/5] Security${NC}"
-    read_input "Enable encryption (true/false)" "true" ENCRYPTION
-    read_input "Algorithm" "aes-256-gcm" ALGORITHM
-    echo -e "  ${DIM}Default PSK: ${DEFAULT_PSK}${NC}"
-    read_input "PSK (Enter to use default)" "${DEFAULT_PSK}" PSK
-    read_input "KDF iterations" "100000" KDF_ITERATIONS
+    read_input "Enable encryption (true/false)" "false" ENCRYPTION
+    if [[ "$ENCRYPTION" =~ ^([Tt]|true|TRUE|1|[Yy]|yes|YES)$ ]]; then
+        ENCRYPTION="true"
+        read_input "Algorithm" "aes-256-gcm" ALGORITHM
+        echo -e "  ${DIM}Default PSK: ${DEFAULT_PSK}${NC}"
+        read_input "PSK (Enter to use default)" "${DEFAULT_PSK}" PSK
+        read_input "KDF iterations" "100000" KDF_ITERATIONS
+    else
+        ENCRYPTION="false"
+        ALGORITHM="aes-256-gcm"
+        PSK="${DEFAULT_PSK}"
+        KDF_ITERATIONS="100000"
+    fi
 
     # ── Step 5: Transport & Tuning ──
-    echo -e "\n ${MAGENTA}${BOLD}[5/5] Transport & Tuning & Logging${NC}"
-    read_input "Heartbeat interval (sec)" "10" HEARTBEAT_INTERVAL
-    read_input "Heartbeat timeout (sec)" "25" HEARTBEAT_TIMEOUT
-    echo -e "  Tuning Profile:"
-    echo -e "    ${WHITE}1)${NC} balanced  ${DIM}(default)${NC}"
-    echo -e "    ${WHITE}2)${NC} fast"
-    read_input "Select tuning profile (1 or 2)" "1" TUNING_CHOICE
-    if [ "$TUNING_CHOICE" = "2" ]; then
-        TUNING_PROFILE="fast"
-    else
-        TUNING_PROFILE="balanced"
+    echo -e "\n ${MAGENTA}${BOLD}[5/5] Transport & Tuning${NC}"
+    HEARTBEAT_INTERVAL="10"
+    HEARTBEAT_TIMEOUT="25"
+
+    local default_workers
+    default_workers=$(nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo 2>/dev/null || echo 1)
+    if [ -z "$default_workers" ] || [ "$default_workers" -lt 1 ]; then
+        default_workers=1
     fi
-    read_input "Log level (info/debug/warn/error)" "info" LOG_LEVEL
+    read_input "Workers count" "${default_workers}" WORKERS
+    if [ -z "$WORKERS" ] || ! [[ "$WORKERS" =~ ^[0-9]+$ ]]; then
+        WORKERS="${default_workers}"
+    fi
+
+    echo -e "  Tuning Profile:"
+    echo -e "    ${WHITE}1)${NC} balanced"
+    echo -e "    ${WHITE}2)${NC} fast  ${DIM}(default)${NC}"
+    read_input "Select tuning profile (1 or 2)" "2" TUNING_CHOICE
+    if [ "$TUNING_CHOICE" = "1" ]; then
+        TUNING_PROFILE="balanced"
+    else
+        TUNING_PROFILE="fast"
+    fi
+    LOG_LEVEL="info"
 
     # ── Review ──
     show_review_box "iran"
@@ -578,7 +570,9 @@ setup_iran() {
     echo -e " ${YELLOW}${BOLD}  For Kharej setup, use:${NC}"
     echo -e "    Tunnel ID:  ${CYAN}${BOLD}${TUNNEL_ID}${NC}"
     echo -e "    Dest IP:    ${CYAN}${BOLD}${LISTEN_IP}${NC}"
-    echo -e "    PSK:        ${CYAN}${BOLD}${PSK}${NC}"
+    if [ "$ENCRYPTION" = "true" ]; then
+        echo -e "    PSK:        ${CYAN}${BOLD}${PSK}${NC}"
+    fi
     echo ""
 
     echo -e " ${CYAN}Service status:${NC}"
@@ -591,6 +585,8 @@ setup_kharej() {
     echo -e " ${GREEN}${BOLD}>>> Setup Kharej Client (IPX Client Mode)${NC}"
     echo ""
     print_line
+
+    ensure_setup_prerequisites || return
 
     # Auto-detect interface
     INTERFACE=$(detect_interface)
@@ -607,7 +603,12 @@ setup_kharej() {
         exit 1
     fi
     read_input "Tunnel name" "back${TUNNEL_ID}" TUN_NAME
-    read_input "Health port" "1234" HEALTH_PORT
+
+    local default_health_port="1001"
+    if [[ "$TUNNEL_ID" =~ ^[0-9]+$ ]]; then
+        default_health_port=$((1000 + 10#$TUNNEL_ID))
+    fi
+    read_input "Health port" "${default_health_port}" HEALTH_PORT
     read_input "MTU" "1320" MTU
 
     # Auto-generate TUN addresses from ID (reversed for kharej)
@@ -648,17 +649,14 @@ setup_kharej() {
             PROFILE="icmp"
         fi
         msg_info "Note: In Kharej, spoof src/dst are SWAPPED vs Iran side."
-        read_input "Spoof Source IP (Iran's spoof_dst_ip)" "185.129.116.237" SPOOF_SRC_IP
-        if [ -z "$SPOOF_SRC_IP" ]; then
-            msg_err "Spoof Source IP is required in ${PROFILE} mode!"
-            exit 1
-        fi
-        read_input "Spoof Destination IP (Iran's spoof_src_ip)" "79.127.126.29" SPOOF_DST_IP
-        if [ -z "$SPOOF_DST_IP" ]; then
-            msg_err "Spoof Destination IP is required in ${PROFILE} mode!"
-            exit 1
-        fi
-        printf -v SPOOF_BLOCK 'spoof_src_ip = "%s"\nspoof_dst_ip = "%s"\n' "${SPOOF_SRC_IP}" "${SPOOF_DST_IP}"
+        read_input "Spoof Source IP (Iran's spoof_dst_ip, optional)" "" SPOOF_SRC_IP
+        read_input "Spoof Destination IP (Iran's spoof_src_ip, optional)" "" SPOOF_DST_IP
+
+        local _src_line=""
+        local _dst_line=""
+        [ -n "$SPOOF_SRC_IP" ] && printf -v _src_line 'spoof_src_ip = "%s"\n' "${SPOOF_SRC_IP}"
+        [ -n "$SPOOF_DST_IP" ] && printf -v _dst_line 'spoof_dst_ip = "%s"\n' "${SPOOF_DST_IP}"
+        SPOOF_BLOCK="${_src_line}${_dst_line}"
     else
         PROFILE="bip"
         SPOOF_SRC_IP=""
@@ -668,26 +666,45 @@ setup_kharej() {
 
     # ── Step 4: Security ──
     echo -e "\n ${MAGENTA}${BOLD}[4/5] Security${NC}"
-    read_input "Enable encryption (true/false)" "true" ENCRYPTION
-    read_input "Algorithm" "aes-256-gcm" ALGORITHM
-    echo -e "  ${DIM}Default PSK: ${DEFAULT_PSK}${NC}"
-    read_input "PSK (Enter to use default, must match Iran)" "${DEFAULT_PSK}" PSK
-    read_input "KDF iterations" "100000" KDF_ITERATIONS
+    read_input "Enable encryption (true/false)" "false" ENCRYPTION
+    if [[ "$ENCRYPTION" =~ ^([Tt]|true|TRUE|1|[Yy]|yes|YES)$ ]]; then
+        ENCRYPTION="true"
+        read_input "Algorithm" "aes-256-gcm" ALGORITHM
+        echo -e "  ${DIM}Default PSK: ${DEFAULT_PSK}${NC}"
+        read_input "PSK (Enter to use default, must match Iran)" "${DEFAULT_PSK}" PSK
+        read_input "KDF iterations" "100000" KDF_ITERATIONS
+    else
+        ENCRYPTION="false"
+        ALGORITHM="aes-256-gcm"
+        PSK="${DEFAULT_PSK}"
+        KDF_ITERATIONS="100000"
+    fi
 
     # ── Step 5: Transport & Tuning ──
-    echo -e "\n ${MAGENTA}${BOLD}[5/5] Transport & Tuning & Logging${NC}"
-    read_input "Heartbeat interval (sec)" "10" HEARTBEAT_INTERVAL
-    read_input "Heartbeat timeout (sec)" "25" HEARTBEAT_TIMEOUT
-    echo -e "  Tuning Profile:"
-    echo -e "    ${WHITE}1)${NC} balanced  ${DIM}(default)${NC}"
-    echo -e "    ${WHITE}2)${NC} fast"
-    read_input "Select tuning profile (1 or 2)" "1" TUNING_CHOICE
-    if [ "$TUNING_CHOICE" = "2" ]; then
-        TUNING_PROFILE="fast"
-    else
-        TUNING_PROFILE="balanced"
+    echo -e "\n ${MAGENTA}${BOLD}[5/5] Transport & Tuning${NC}"
+    HEARTBEAT_INTERVAL="10"
+    HEARTBEAT_TIMEOUT="25"
+
+    local default_workers
+    default_workers=$(nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo 2>/dev/null || echo 1)
+    if [ -z "$default_workers" ] || [ "$default_workers" -lt 1 ]; then
+        default_workers=1
     fi
-    read_input "Log level (info/debug/warn/error)" "info" LOG_LEVEL
+    read_input "Workers count" "${default_workers}" WORKERS
+    if [ -z "$WORKERS" ] || ! [[ "$WORKERS" =~ ^[0-9]+$ ]]; then
+        WORKERS="${default_workers}"
+    fi
+
+    echo -e "  Tuning Profile:"
+    echo -e "    ${WHITE}1)${NC} balanced"
+    echo -e "    ${WHITE}2)${NC} fast  ${DIM}(default)${NC}"
+    read_input "Select tuning profile (1 or 2)" "2" TUNING_CHOICE
+    if [ "$TUNING_CHOICE" = "1" ]; then
+        TUNING_PROFILE="balanced"
+    else
+        TUNING_PROFILE="fast"
+    fi
+    LOG_LEVEL="info"
 
     # ── Review ──
     show_review_box "kharej"
@@ -730,17 +747,35 @@ setup_kharej() {
 
 list_tunnels() {
     echo ""
-    echo -e " ${CYAN}${BOLD}Active Backhaul Tunnels:${NC}"
+    echo -e " ${CYAN}${BOLD}Backhaul Tunnels:${NC}"
     print_line
 
     local found=0
     local i=1
     TUNNEL_LIST=()
 
-    for svc in $(systemctl list-units --type=service --all --no-legend | grep "backhaul-" | awk '{print $1}'); do
+    local all_svcs=()
+    for sfile in "${SYSTEMD_DIR}"/backhaul-*.service; do
+        [ -f "$sfile" ] || continue
+        local bname=$(basename "$sfile" .service)
+        [ "$bname" = "backhaul-watchdog" ] && continue
+        all_svcs+=("$bname")
+    done
+
+    for svc in $(systemctl list-units --type=service --all --no-legend 2>/dev/null | grep "backhaul-" | awk '{print $1}'); do
+        local bname="${svc%.service}"
+        [ "$bname" = "backhaul-watchdog" ] && continue
+        all_svcs+=("$bname")
+    done
+
+    local unique_svcs
+    unique_svcs=$(printf "%s\n" "${all_svcs[@]}" 2>/dev/null | sort -u)
+
+    while IFS= read -r name; do
+        [ -z "$name" ] && continue
         found=1
-        local name="${svc%.service}"
-        local status=$(systemctl is-active "${name}" 2>/dev/null)
+        local status
+        status=$(systemctl is-active "${name}" 2>/dev/null || echo "inactive")
         TUNNEL_LIST+=("${name}")
 
         if [ "$status" = "active" ]; then
@@ -749,7 +784,7 @@ list_tunnels() {
             echo -e "  ${RED}●${NC} ${BOLD}${i})${NC} ${name}  ${RED}[${status}]${NC}"
         fi
         ((i++))
-    done
+    done <<< "$unique_svcs"
 
     if [ $found -eq 0 ]; then
         msg_warn "No backhaul tunnels found."
@@ -772,8 +807,13 @@ pick_tunnel() {
         SELECTED_TUNNEL="$pick"
     fi
 
-    # Validate
-    if ! systemctl list-units --type=service --all --no-legend | grep -q "${SELECTED_TUNNEL}"; then
+    if [ -z "${SELECTED_TUNNEL}" ]; then
+        msg_err "Invalid selection."
+        return 1
+    fi
+
+    # Validate existence as service file or systemd unit
+    if ! systemctl list-unit-files "${SELECTED_TUNNEL}.service" &>/dev/null && [ ! -f "${SYSTEMD_DIR}/${SELECTED_TUNNEL}.service" ]; then
         msg_err "Service '${SELECTED_TUNNEL}' not found."
         return 1
     fi
@@ -851,10 +891,16 @@ do_edit_config() {
 
 do_delete() {
     pick_tunnel || return
+    if [ -z "${SELECTED_TUNNEL}" ]; then
+        msg_err "No tunnel selected."
+        return 1
+    fi
     echo ""
     echo -e " ${RED}${BOLD}This will permanently delete ${SELECTED_TUNNEL} and its config.${NC}"
-    read -p "  Type 'DELETE' to confirm: " confirm
-    if [ "$confirm" = "DELETE" ]; then
+    echo -e "  ${WHITE}1)${NC} Yes, delete"
+    echo -e "  ${WHITE}2)${NC} Cancel"
+    read -p "  Confirm (1 or 2): " confirm
+    if [ "$confirm" = "1" ]; then
         systemctl stop "${SELECTED_TUNNEL}" 2>/dev/null
         systemctl disable "${SELECTED_TUNNEL}" 2>/dev/null
         
@@ -911,7 +957,7 @@ build_watchdog_targets() {
 
             if [ $in_tun -eq 1 ]; then
                 if echo "$line" | grep -q '^remote_addr'; then
-                    remote_addr=$(echo "$line" | sed 's/.*=\s*//' | tr -d '"' | tr -d "'" | cut -d'/' -f1)
+                    remote_addr=$(echo "$line" | cut -d'=' -f2 | tr -d ' "'\'' ' | cut -d'/' -f1)
                 fi
             fi
         done < "$toml_file"
@@ -1034,8 +1080,11 @@ remove_watchdog() {
         return
     fi
 
-    read -p "  Type 'DELETE' to remove watchdog: " confirm
-    if [ "$confirm" = "DELETE" ]; then
+    echo -e " ${RED}${BOLD}Are you sure you want to remove Watchdog?${NC}"
+    echo -e "  ${WHITE}1)${NC} Yes, remove"
+    echo -e "  ${WHITE}2)${NC} Cancel"
+    read -p "  Confirm (1 or 2): " confirm
+    if [ "$confirm" = "1" ]; then
         systemctl stop "${WATCHDOG_SERVICE}" 2>/dev/null
         systemctl disable "${WATCHDOG_SERVICE}" 2>/dev/null
         rm -f "${WATCHDOG_SERVICE_FILE}"
@@ -1076,8 +1125,10 @@ scan_and_sync_configs() {
     fi
     
     local found=0
+    local total=0
     for toml_file in "${CORE_DIR}"/*.toml; do
         [ -f "$toml_file" ] || continue
+        ((total++))
         
         local filename=$(basename "$toml_file")
         local svc_name="backhaul-${filename%.toml}"
@@ -1096,8 +1147,10 @@ scan_and_sync_configs() {
         fi
     done
     
-    if [ $found -eq 0 ]; then
-        msg_ok "All TOML configs already have corresponding services."
+    if [ $total -eq 0 ]; then
+        msg_warn "No TOML configuration files found in ${CORE_DIR}."
+    elif [ $found -eq 0 ]; then
+        msg_ok "All TOML configs (${total} found) already have corresponding services."
     else
         echo ""
         msg_ok "Sync completed."
@@ -1180,4 +1233,3 @@ main_menu() {
 check_root
 check_binary
 main_menu
-
