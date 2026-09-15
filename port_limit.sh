@@ -6,7 +6,7 @@
 
 set -o pipefail
 
-VERSION="1.1.9"
+VERSION="1.2.0"
 
 # ------------------------------------------------------------------------------
 # Default Settings (can be modified directly here or via the interactive menu)
@@ -54,7 +54,10 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 MAGENTA='\033[0;35m'
+WHITE='\033[1;37m'
+GRAY='\033[0;90m'
 BOLD='\033[1m'
+DIM='\033[2m'
 NC='\033[0m'
 
 # ------------------------------------------------------------------------------
@@ -216,16 +219,20 @@ is_container() {
     if [[ -r /proc/1/environ ]] && grep -qaE 'container=(lxc|docker|podman|containerd)' /proc/1/environ 2>/dev/null; then
         return 0
     fi
-    if command -v systemd-detect-virt >/dev/null 2>&1 && systemd-detect-virt --container >/dev/null 2>&1; then
-        return 0
+    if command -v systemd-detect-virt >/dev/null 2>&1; then
+        if command -v timeout >/dev/null 2>&1; then
+            timeout 1 systemd-detect-virt --container >/dev/null 2>&1 && return 0
+        else
+            systemd-detect-virt --container >/dev/null 2>&1 && return 0
+        fi
     fi
-    if grep -qaE 'docker|lxc|kubepods|containerd' /proc/1/cgroup 2>/dev/null; then
+    if [[ -r /proc/1/cgroup ]] && grep -qaE 'docker|lxc|kubepods|containerd' /proc/1/cgroup 2>/dev/null; then
         return 0
     fi
     return 1
 }
 
-# Safely load kernel module with container check, duplicate check, and 3-second timeout protection
+# Safely load kernel module with container check, duplicate check, and 2-second timeout protection
 safe_modprobe() {
     local mod="$1"
     [[ -z "$mod" ]] && return 0
@@ -238,60 +245,29 @@ safe_modprobe() {
         return 0
     fi
     if command -v timeout >/dev/null 2>&1; then
-        timeout 3 modprobe "$mod" 2>/dev/null || true
-    else
-        modprobe "$mod" 2>/dev/null || true
+        timeout -k 1s 2 modprobe -q "$mod" 2>/dev/null || true
     fi
 }
 
-# Safely unload kernel module with container check and 3-second timeout protection
+# Safely unload kernel module with container check and 2-second timeout protection
 safe_modprobe_r() {
     local mod="$1"
     [[ -z "$mod" ]] && return 0
     if is_container; then
         return 0
     fi
+    if ! grep -q "^${mod//-/_} " /proc/modules 2>/dev/null; then
+        return 0
+    fi
     if command -v timeout >/dev/null 2>&1; then
-        timeout 3 modprobe -r "$mod" 2>/dev/null || true
-    else
-        modprobe -r "$mod" 2>/dev/null || true
+        timeout -k 1s 2 modprobe -q -r "$mod" 2>/dev/null || true
     fi
 }
 
-# Automatically load and verify essential traffic control kernel modules
+# Kernel modules: Linux kernel autoloads sch_htb and cls_u32 automatically via netlink on demand.
+# Proactive manual modprobe loops cause hangs on virtualized / cloud kernels and are bypassed.
 ensure_kernel_modules() {
-    # Skip entirely in container environments (kernel modules managed by host)
-    if is_container; then
-        return 0
-    fi
-
-    # Only modules required for direct HTB egress + ingress policing (no IFB needed)
-    local mods=("sch_htb" "cls_u32" "sch_fq_codel" "sch_sfq")
-    local need_install=0
-
-    for m in "${mods[@]}"; do
-        safe_modprobe "$m"
-    done
-
-    # Check if sch_htb can be loaded or is supported (required for egress HTB shaping)
-    if ! grep -q "^sch_htb " /proc/modules 2>/dev/null; then
-        if ! safe_modprobe sch_htb; then
-            need_install=1
-        fi
-    fi
-
-    if [[ $need_install -eq 1 ]] && command -v apt-get >/dev/null 2>&1; then
-        local kver
-        kver=$(uname -r)
-        log_info "Traffic control kernel modules missing. Installing linux-modules-extra for $kver..."
-        export DEBIAN_FRONTEND=noninteractive
-        export NEEDRESTART_MODE=a
-        apt-get update -qq >/dev/null 2>&1 || true
-        apt-get install -y -qq -o DPkg::Lock::Timeout=10 "linux-modules-extra-$kver" "linux-modules-$kver" >/dev/null 2>&1 || true
-        for m in "${mods[@]}"; do
-            safe_modprobe "$m"
-        done
-    fi
+    return 0
 }
 
 # Automatically install required packages if missing (cached check)
@@ -302,20 +278,24 @@ ensure_dependencies() {
     local needed=()
     command -v tc >/dev/null 2>&1 || needed+=("iproute2")
     command -v sqlite3 >/dev/null 2>&1 || needed+=("sqlite3")
-    command -v modprobe >/dev/null 2>&1 || needed+=("kmod")
-    command -v bc >/dev/null 2>&1 || needed+=("bc")
 
     if [[ ${#needed[@]} -gt 0 ]]; then
         log_info "Installing prerequisite packages (${needed[*]})..."
         export DEBIAN_FRONTEND=noninteractive
         export NEEDRESTART_MODE=a
-        apt-get update -qq >/dev/null 2>&1 || true
-        apt-get install -y -qq -o DPkg::Lock::Timeout=10 "${needed[@]}" >/dev/null 2>&1
-        log_info "Prerequisite packages installed successfully."
+        if command -v apt-get >/dev/null 2>&1; then
+            if command -v timeout >/dev/null 2>&1; then
+                timeout 15 apt-get update -qq >/dev/null 2>&1 || true
+                timeout 30 apt-get install -y -qq -o DPkg::Lock::Timeout=10 "${needed[@]}" >/dev/null 2>&1 || true
+            else
+                apt-get update -qq >/dev/null 2>&1 || true
+                apt-get install -y -qq -o DPkg::Lock::Timeout=10 "${needed[@]}" >/dev/null 2>&1 || true
+            fi
+        fi
+        log_info "Prerequisite packages checked."
     fi
 
-    ensure_kernel_modules
-    # [FIX-ST5] Only mark verified if critical binaries actually exist
+    # Only mark verified if critical binaries actually exist
     if command -v tc >/dev/null 2>&1 && command -v sqlite3 >/dev/null 2>&1; then
         DEPS_VERIFIED=1
     else
@@ -345,17 +325,15 @@ detect_wan_interface() {
     if [[ -z "$iface" ]]; then
         iface=$(ip -6 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++)if($i=="dev"){print $(i+1);exit}}')
     fi
-    # Priority 2: Outbound route to internet with 2s timeout to prevent hanging on blocked/delayed routes
-    if [[ -z "$iface" ]]; then
-        if command -v timeout >/dev/null 2>&1; then
-            iface=$(timeout 2 ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++)if($i=="dev"){print $(i+1);exit}}')
-        else
-            iface=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++)if($i=="dev"){print $(i+1);exit}}')
-        fi
-    fi
-    # Priority 3: Active physical links excluding virtual devices
+    # Priority 2: Active physical links excluding virtual devices (local, instantaneous)
     if [[ -z "$iface" ]]; then
         iface=$(ip -br link 2>/dev/null | awk '$2=="UP" && $1!="lo" && !($1~/^(ifb|docker|br-|veth|tun|tap|wg)/){print $1; exit}')
+    fi
+    # Priority 3: Outbound route with strict 1s timeout
+    if [[ -z "$iface" ]]; then
+        if command -v timeout >/dev/null 2>&1; then
+            iface=$(timeout 1 ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++)if($i=="dev"){print $(i+1);exit}}')
+        fi
     fi
     CACHED_WAN_IFACE="$iface"
     CACHED_WAN_TIME="$now"
@@ -484,6 +462,7 @@ clear_rules() {
 
 # Internal implementation of rule application (called exclusively with lock held)
 _apply_rules_locked() {
+    log_info "Detecting active network interface..."
     local iface
     iface=$(detect_wan_interface)
 
@@ -498,6 +477,7 @@ _apply_rules_locked() {
 
     log_info "WAN Interface: ${BOLD}$iface${NC}"
     log_info "Default Speed Limits: Download=${BOLD}$norm_down${NC} | Upload=${BOLD}$norm_up${NC}"
+    log_info "Querying active inbounds from 3X-UI database..."
 
     local raw_ports
     raw_ports=$(get_active_ports 2>/dev/null)
@@ -644,22 +624,28 @@ apply_rules() {
     ensure_dependencies
     load_config
 
-    # [FIX-L2] Acquire exclusive lock to prevent concurrent rule application causing corrupted tc state
-    install -d -m 700 /run/port-limit 2>/dev/null || mkdir -p /run/port-limit 2>/dev/null || true
-    exec 9>/run/port-limit/apply.lock 2>/dev/null
-    if command -v flock >/dev/null 2>&1; then
-        if ! flock -n 9 2>/dev/null; then
-            log_warn "Another apply_rules instance is already running. Skipping to avoid tc race condition."
-            exec 9>&- 2>/dev/null || true
-            return 0
+    # [FIX-L2] Acquire exclusive non-blocking lock to prevent concurrent rule application
+    local lock_file="/run/port-limit/apply.lock"
+    mkdir -p /run/port-limit 2>/dev/null || lock_file="/tmp/port_limit_apply.lock"
+    touch "$lock_file" 2>/dev/null || true
+
+    local lock_held=0
+    if [[ -f "$lock_file" ]] && exec 9>>"$lock_file" 2>/dev/null; then
+        if command -v flock >/dev/null 2>&1; then
+            if ! flock -n 9 2>/dev/null; then
+                log_warn "Another apply_rules instance is already running. Skipping to avoid tc race condition."
+                exec 9>&- 2>/dev/null || true
+                return 0
+            fi
+            lock_held=1
         fi
     fi
 
     local ret=0
     _apply_rules_locked || ret=$?
 
-    # Always release lock and close file descriptor 9 to prevent blocking subsequent calls
-    if command -v flock >/dev/null 2>&1; then
+    # Always release lock and close file descriptor 9
+    if [[ $lock_held -eq 1 ]] && command -v flock >/dev/null 2>&1; then
         flock -u 9 2>/dev/null || true
     fi
     exec 9>&- 2>/dev/null || true
@@ -697,30 +683,32 @@ show_status() {
     local iface
     iface=$(detect_wan_interface)
 
-    echo -e "${BOLD}${CYAN}================================================================${NC}"
-    echo -e "${BOLD}${CYAN}  3X-UI Inbound Ports Real-Time Traffic & Rate Limits (v${VERSION})   ${NC}"
-    echo -e "${BOLD}${CYAN}================================================================${NC}"
-
-    local s_status="${RED}Inactive${NC}"
+    local s_status="${RED}● Inactive${NC}"
     if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
-        s_status="${GREEN}Active (Running)${NC}"
+        s_status="${GREEN}● Active (Running)${NC}"
     fi
-    echo -e "Auto-Monitor Service: $s_status"
-    echo -e "WAN Interface: ${YELLOW}${iface:-Unknown}${NC}"
-    echo -e "Default Limits: Download=${GREEN}$DOWNLOAD_LIMIT${NC} | Upload=${GREEN}$UPLOAD_LIMIT${NC}"
-    echo -e "Port Filter: ${YELLOW}>= ${MIN_PORT}${NC} (Ports < ${MIN_PORT} are completely exempt)"
-    echo -e "Excluded Ports: ${MAGENTA}${EXCLUDE_PORTS:-None}${NC}"
+
     local _interval_label
     if (( CHECK_INTERVAL >= 3600 )); then
-        _interval_label="$(( CHECK_INTERVAL / 3600 )) hour(s)"
+        _interval_label="$(( CHECK_INTERVAL / 3600 ))h"
     elif (( CHECK_INTERVAL >= 60 )); then
-        _interval_label="$(( CHECK_INTERVAL / 60 )) minute(s)"
+        _interval_label="$(( CHECK_INTERVAL / 60 ))m"
     else
-        _interval_label="${CHECK_INTERVAL} second(s)"
+        _interval_label="${CHECK_INTERVAL}s"
     fi
-    echo -e "Check Interval: ${CYAN}${CHECK_INTERVAL}s (${_interval_label})${NC}"
-    echo -e "Panel Database: $DB_PATH"
-    echo -e "----------------------------------------------------------------"
+
+    echo -e "${CYAN}╭───────────────────────────────────────────────────────────────────╮${NC}"
+    echo -e "${CYAN}│${NC}   ${BOLD}${WHITE}📊 3X-UI Inbound Ports Real-Time Traffic & Rate Limits (v${VERSION})${NC}   ${CYAN}│${NC}"
+    echo -e "${CYAN}╰───────────────────────────────────────────────────────────────────╯${NC}"
+    echo -e " ${BOLD}${WHITE}System Overview${NC}"
+    echo -e "   ${CYAN}●${NC} Service Status : $s_status"
+    echo -e "   ${CYAN}●${NC} WAN Interface  : ${YELLOW}${iface:-Unknown}${NC}"
+    echo -e "   ${CYAN}●${NC} Default Limits : ↓ ${GREEN}$DOWNLOAD_LIMIT${NC} (Download) │ ↑ ${GREEN}$UPLOAD_LIMIT${NC} (Upload)"
+    echo -e "   ${CYAN}●${NC} Port Filter    : ${YELLOW}>= ${MIN_PORT}${NC} ${GRAY}(Ports < ${MIN_PORT} are exempt)${NC}"
+    echo -e "   ${CYAN}●${NC} Excluded Ports : ${MAGENTA}${EXCLUDE_PORTS:-None}${NC}"
+    echo -e "   ${CYAN}●${NC} Check Interval : ${CYAN}${CHECK_INTERVAL}s (${_interval_label})${NC}"
+    echo -e "   ${CYAN}●${NC} Panel Database : ${GRAY}$DB_PATH${NC}"
+    echo ""
 
     local active_ports=()
     if [[ -f "$STATE_FILE" && -s "$STATE_FILE" ]]; then
@@ -738,13 +726,13 @@ show_status() {
     fi
 
     if [[ ${#active_ports[@]} -eq 0 ]]; then
-        echo -e "${YELLOW}No active ports found in database or limits have not been applied yet.${NC}"
-        echo -e "${BOLD}${CYAN}================================================================${NC}"
+        echo -e "  ${YELLOW}ℹ No active inbound ports found or limits have not been applied yet.${NC}\n"
         return 0
     fi
 
-    printf "%-8s %-12s %-12s %-16s %-16s\n" "Port" "Download" "Upload" "Egress (Sent)" "Ingress (Recv)"
-    echo -e "----------------------------------------------------------------"
+    echo -e "${CYAN}┌──────────┬──────────────┬──────────────┬──────────────────┬──────────────────┐${NC}"
+    printf "${CYAN}│${NC} ${BOLD}%-8s${NC} ${CYAN}│${NC} ${BOLD}%-12s${NC} ${CYAN}│${NC} ${BOLD}%-12s${NC} ${CYAN}│${NC} ${BOLD}%-16s${NC} ${CYAN}│${NC} ${BOLD}%-16s${NC} ${CYAN}│${NC}\n" "Port" "Download" "Upload" "Egress (Sent)" "Ingress (Recv)"
+    echo -e "${CYAN}├──────────┼──────────────┼──────────────┼──────────────────┼──────────────────┤${NC}"
 
     # [FIX-ST1] Use shared helper to parse custom limits (eliminates code duplication)
     _load_custom_limits_maps
@@ -811,10 +799,10 @@ show_status() {
         local up_bytes
         up_bytes=$(format_bytes "$up_count")
 
-        printf "%-8s %-12s %-12s %-16s %-16s\n" "$port" "$port_down" "$port_up" "$down_bytes" "$up_bytes"
+        printf "${CYAN}│${NC} ${CYAN}%-8s${NC} ${CYAN}│${NC} ${GREEN}%-12s${NC} ${CYAN}│${NC} ${GREEN}%-12s${NC} ${CYAN}│${NC} %-16s ${CYAN}│${NC} %-16s ${CYAN}│${NC}\n" "$port" "$port_down" "$port_up" "$down_bytes" "$up_bytes"
         idx=$((idx + 1))
     done
-    echo -e "${BOLD}${CYAN}================================================================${NC}"
+    echo -e "${CYAN}└──────────┴──────────────┴──────────────┴──────────────────┴──────────────────┘${NC}"
 }
 
 # Generate a fingerprint string of current config parameters to track modifications
@@ -1013,9 +1001,9 @@ EOF
     systemctl enable --now "${SERVICE_NAME}.service" >/dev/null 2>&1
 
     echo ""
-    echo -e "${BOLD}${GREEN}================================================================${NC}"
-    echo -e "${BOLD}${GREEN}  ✓ Script installed and systemd service activated successfully! 🎉${NC}"
-    echo -e "${BOLD}${GREEN}================================================================${NC}"
+    echo -e "${GREEN}╭───────────────────────────────────────────────────────────────────╮${NC}"
+    echo -e "${GREEN}│${NC}  ${BOLD}${WHITE}✓ Script installed and systemd service activated successfully! 🎉${NC}  ${GREEN}│${NC}"
+    echo -e "${GREEN}╰───────────────────────────────────────────────────────────────────╯${NC}"
     echo -e "You can now run '${BOLD}${CYAN}port-limit${NC}' from anywhere to access the management menu."
     echo ""
     show_status
@@ -1071,9 +1059,10 @@ uninstall_service() {
     rm -f "$STATE_FILE" /run/port-limit* 2>/dev/null || true
     rm -f "$INSTALL_PATH" "${INSTALL_PATH}.tmp" 2>/dev/null || true
 
-    echo -e "${BOLD}${GREEN}================================================================${NC}"
-    echo -e "${BOLD}${GREEN}  ✓ Port-Limit and all associated components completely uninstalled!${NC}"
-    echo -e "${BOLD}${GREEN}================================================================${NC}"
+    echo ""
+    echo -e "${GREEN}╭───────────────────────────────────────────────────────────────────╮${NC}"
+    echo -e "${GREEN}│${NC}  ${BOLD}${WHITE}✓ Port-Limit and all associated components completely uninstalled!${NC} ${GREEN}│${NC}"
+    echo -e "${GREEN}╰───────────────────────────────────────────────────────────────────╯${NC}"
 }
 
 # ------------------------------------------------------------------------------
@@ -1084,10 +1073,10 @@ uninstall_service() {
 menu_custom_limits() {
     while true; do
         clear
-        echo -e "${BOLD}${CYAN}================================================================${NC}"
-        echo -e "${BOLD}${GREEN}              Custom Per-Port Speed Limits Menu                 ${NC}"
-        echo -e "${BOLD}${CYAN}================================================================${NC}"
-        echo -e "Current configured custom limits:"
+        echo -e "${CYAN}╭───────────────────────────────────────────────────────────────────╮${NC}"
+        echo -e "${CYAN}│${NC}          ${BOLD}${WHITE}⚡ Custom Per-Port Speed Limits Management ⚡${NC}             ${CYAN}│${NC}"
+        echo -e "${CYAN}╰───────────────────────────────────────────────────────────────────╯${NC}"
+        echo -e " ${BOLD}${WHITE}Configured Custom Limits${NC}"
         if [[ -n "$CUSTOM_LIMITS" ]]; then
             IFS=',' read -ra c_arr <<< "$CUSTOM_LIMITS"
             for entry in "${c_arr[@]}"; do
@@ -1095,18 +1084,21 @@ menu_custom_limits() {
                 [[ -z "$entry" ]] && continue
                 local cp cd cu _rest
                 IFS=':' read -r cp cd cu _rest <<< "$entry"
-                echo -e "  • Port ${BOLD}${CYAN}$cp${NC} -> Download: ${GREEN}$cd${NC} | Upload: ${GREEN}$cu${NC}"
+                echo -e "   ${CYAN}•${NC} Port ${BOLD}${CYAN}$cp${NC} ➔ Down: ${GREEN}$cd${NC} │ Up: ${GREEN}$cu${NC}"
             done
         else
-            echo -e "  ${YELLOW}(No custom limits configured - all inbounds use default limits)${NC}"
+            echo -e "   ${GRAY}(No custom limits configured - all inbounds use default limits)${NC}"
         fi
-        echo -e "${BOLD}${CYAN}----------------------------------------------------------------${NC}"
-        echo -e " ${BOLD}1)${NC} Add or update custom limit for a port"
-        echo -e " ${BOLD}2)${NC} Remove custom limit for a specific port"
-        echo -e " ${BOLD}3)${NC} Clear all custom limits"
-        echo -e " ${BOLD}0)${NC} ${BOLD}${YELLOW}Return to Main Menu${NC}"
-        echo -e "${BOLD}${CYAN}================================================================${NC}"
-        read -rp "Please select an option [0-3]: " sub_choice
+        echo ""
+        echo -e " ${BOLD}${BLUE}Actions${NC}"
+        echo -e "   ${BOLD}${GREEN}[1]${NC} Add or update custom speed limit for a port"
+        echo -e "   ${BOLD}${YELLOW}[2]${NC} Remove custom limit for a specific port"
+        echo -e "   ${BOLD}${RED}[3]${NC} Clear all custom limits"
+        echo -e "   ${BOLD}[0]${NC} Back to Main Menu"
+        echo -e "${CYAN}─────────────────────────────────────────────────────────────────────${NC}"
+        echo -ne "${CYAN}❯ ${WHITE}Select an option ${GRAY}[0-3]${WHITE}: ${GREEN}"
+        read -r sub_choice
+        echo -ne "${NC}"
 
         case "$sub_choice" in
             1)
@@ -1175,8 +1167,8 @@ menu_custom_limits() {
                 save_config
                 log_info "Custom limit for port $p_port set to Down: $v_down | Up: $v_up"
                 apply_rules
-                echo ""
-                read -rp "Press Enter [or enter 0] to continue..."
+                echo -e "\n${GRAY}Press ${BOLD}[Enter]${NC}${GRAY} to continue...${NC}"
+                read -r _
                 ;;
             2)
                 echo ""
@@ -1213,22 +1205,27 @@ menu_custom_limits() {
                 else
                     echo -e "${YELLOW}Port $p_port was not found in custom limits.${NC}"
                 fi
-                echo ""
-                read -rp "Press Enter [or enter 0] to continue..."
+                echo -e "\n${GRAY}Press ${BOLD}[Enter]${NC}${GRAY} to continue...${NC}"
+                read -r _
                 ;;
             3)
                 echo ""
-                echo -e "${BOLD}${YELLOW}Are you sure you want to clear ALL custom per-port limits?${NC}"
-                echo -e " ${BOLD}1)${NC} Confirm and clear all"
-                echo -e " ${BOLD}0)${NC} ${YELLOW}Cancel and return${NC}"
-                read -rp "Please select an option [0-1]: " clr_cust
+                echo -e "${YELLOW}╭───────────────────────────────────────────────────────────────────╮${NC}"
+                echo -e "${YELLOW}│${NC}   ${BOLD}${YELLOW}⚠️  Are you sure you want to clear ALL custom per-port limits?   │${NC}"
+                echo -e "${YELLOW}╰───────────────────────────────────────────────────────────────────╯${NC}"
+                echo -e "   ${BOLD}${RED}[1]${NC} Confirm and clear all"
+                echo -e "   ${BOLD}[0]${NC} Cancel and return"
+                echo -e "${YELLOW}─────────────────────────────────────────────────────────────────────${NC}"
+                echo -ne "${YELLOW}❯ ${WHITE}Select an option ${GRAY}[0-1]${WHITE}: ${GREEN}"
+                read -r clr_cust
+                echo -ne "${NC}"
                 if [[ "$clr_cust" == "1" ]]; then
                     CUSTOM_LIMITS=""
                     save_config
                     log_info "All custom limits cleared."
                     apply_rules
-                    echo ""
-                    read -rp "Press Enter [or enter 0] to continue..."
+                    echo -e "\n${GRAY}Press ${BOLD}[Enter]${NC}${GRAY} to continue...${NC}"
+                    read -r _
                 else
                     echo -e "${YELLOW}Cancelled.${NC}"
                     sleep 0.5
@@ -1249,25 +1246,28 @@ menu_custom_limits() {
 menu_port_filter() {
     while true; do
         clear
-        echo -e "${BOLD}${CYAN}================================================================${NC}"
-        echo -e "${BOLD}${GREEN}               Configure Port Filtering & Exclusions            ${NC}"
-        echo -e "${BOLD}${CYAN}================================================================${NC}"
-        echo -e " Minimum Controlled Port : ${YELLOW}>= ${MIN_PORT}${NC} ${GREEN}(All ports < ${MIN_PORT} are completely exempt)${NC}"
-        echo -e " Excluded Ports List     : ${MAGENTA}${EXCLUDE_PORTS:-None}${NC}"
-        echo -e "${BOLD}${CYAN}----------------------------------------------------------------${NC}"
-        echo -e " ${BOLD}1)${NC} Change minimum port threshold (Current: >= ${MIN_PORT})"
-        echo -e " ${BOLD}2)${NC} Configure excluded ports list (e.g. 22,2053)"
-        echo -e " ${BOLD}0)${NC} ${BOLD}${YELLOW}Return to Main Menu${NC}"
-        echo -e "${BOLD}${CYAN}================================================================${NC}"
-        read -rp "Please select an option [0-2]: " pf_choice
+        echo -e "${CYAN}╭───────────────────────────────────────────────────────────────────╮${NC}"
+        echo -e "${CYAN}│${NC}            ${BOLD}${WHITE}🛡️  Configure Port Filtering & Exclusions 🛡️             ${CYAN}│${NC}"
+        echo -e "${CYAN}╰───────────────────────────────────────────────────────────────────╯${NC}"
+        echo -e " ${BOLD}${WHITE}Filter Rules${NC}"
+        echo -e "   ${CYAN}●${NC} Minimum Controlled Port : ${YELLOW}>= ${MIN_PORT}${NC} ${GRAY}(Ports < ${MIN_PORT} are exempt)${NC}"
+        echo -e "   ${CYAN}●${NC} Excluded Ports List     : ${MAGENTA}${EXCLUDE_PORTS:-None}${NC}"
+        echo ""
+        echo -e " ${BOLD}${BLUE}Configuration Actions${NC}"
+        echo -e "   ${BOLD}${GREEN}[1]${NC} Change minimum port threshold ${GRAY}(Current: >= ${MIN_PORT})${NC}"
+        echo -e "   ${BOLD}${YELLOW}[2]${NC} Configure excluded ports list ${GRAY}(e.g. 22,2053)${NC}"
+        echo -e "   ${BOLD}[0]${NC} Back to Main Menu"
+        echo -e "${CYAN}─────────────────────────────────────────────────────────────────────${NC}"
+        echo -ne "${CYAN}❯ ${WHITE}Select an option ${GRAY}[0-2]${WHITE}: ${GREEN}"
+        read -r pf_choice
+        echo -ne "${NC}"
 
         case "$pf_choice" in
             1)
                 echo ""
                 echo -e "Current minimum port threshold: ${YELLOW}>= ${MIN_PORT}${NC}"
-                echo -e "${CYAN}(Inbound ports below this number will never have rate limits applied)${NC}"
-                # [FIX-L5] Accept 0 to mean "apply limits to ALL ports" — consistent with log messages
-                echo -e "${CYAN}(Enter 0 to apply rate limits to ALL ports with no minimum threshold)${NC}"
+                echo -e "${GRAY}(Inbound ports below this number will never have rate limits applied)${NC}"
+                echo -e "${GRAY}(Enter 0 to apply rate limits to ALL ports with no minimum threshold)${NC}"
                 read -rp "Enter new minimum port (0-65535) ['b' to cancel]: " inp_min
                 if [[ "$inp_min" == "b" || "$inp_min" == "B" || -z "$inp_min" ]]; then
                     echo -e "${YELLOW}Cancelled.${NC}"
@@ -1282,13 +1282,13 @@ menu_port_filter() {
                 else
                     echo -e "${RED}[ERROR] Invalid port number. Must be between 0 and 65535.${NC}"
                 fi
-                echo ""
-                read -rp "Press Enter [or enter 0] to continue..."
+                echo -e "\n${GRAY}Press ${BOLD}[Enter]${NC}${GRAY} to continue...${NC}"
+                read -r _
                 ;;
             2)
                 echo ""
                 echo -e "Current excluded ports: ${MAGENTA}${EXCLUDE_PORTS:-None}${NC}"
-                echo -e "${YELLOW}(Enter '0' or 'b' to cancel and return, or 'none' to clear)${NC}\n"
+                echo -e "${GRAY}(Enter '0' or 'b' to cancel and return, or 'none' to clear)${NC}\n"
                 read -rp "New excluded ports (comma-separated, e.g. 22,2053) [0 to return]: " inp_exc
                 if [[ "$inp_exc" == "0" || "$inp_exc" == "b" || "$inp_exc" == "B" || -z "$inp_exc" ]]; then
                     echo -e "${YELLOW}Cancelled.${NC}"
@@ -1305,8 +1305,8 @@ menu_port_filter() {
                 save_config
                 log_info "Excluded ports saved: ${EXCLUDE_PORTS:-None}"
                 apply_rules
-                echo ""
-                read -rp "Press Enter [or enter 0] to continue..."
+                echo -e "\n${GRAY}Press ${BOLD}[Enter]${NC}${GRAY} to continue...${NC}"
+                read -r _
                 ;;
             0|b|B|q|Q)
                 return 0
@@ -1322,52 +1322,61 @@ menu_port_filter() {
 show_menu() {
     while true; do
         clear
-        local s_status="${RED}Inactive${NC}"
+        local s_status="${RED}● Inactive${NC}"
         if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
-            s_status="${GREEN}Active (Running)${NC}"
+            s_status="${GREEN}● Active (Running)${NC}"
         fi
 
-        echo -e "${BOLD}${CYAN}================================================================${NC}"
-        echo -e "${BOLD}${GREEN}   3X-UI Inbound Port Rate Limiter - PortLimit (v${VERSION})     ${NC}"
-        echo -e "${BOLD}${CYAN}================================================================${NC}"
-        echo -e " Auto-Monitor Service : $s_status"
-        echo -e " Default Speed Limits : Down: ${GREEN}$DOWNLOAD_LIMIT${NC} | Up: ${GREEN}$UPLOAD_LIMIT${NC}"
-        echo -e " Port Filtering       : >= ${MIN_PORT} (Ports < ${MIN_PORT} are completely exempt)"
-        echo -e " Excluded Ports       : ${MAGENTA}${EXCLUDE_PORTS:-None}${NC}"
         local _ci_label
         if (( CHECK_INTERVAL >= 3600 )); then _ci_label="$(( CHECK_INTERVAL / 3600 ))h"
         elif (( CHECK_INTERVAL >= 60 )); then  _ci_label="$(( CHECK_INTERVAL / 60 ))m"
         else                                    _ci_label="${CHECK_INTERVAL}s"
         fi
-        echo -e " Check Interval       : ${CYAN}${CHECK_INTERVAL}s (${_ci_label})${NC}"
-        echo -e "${BOLD}${CYAN}================================================================${NC}"
-        echo -e " ${BOLD}1)${NC} ${CYAN}Show current status & traffic stats (Status)${NC}"
-        echo -e " ${BOLD}2)${NC} ${YELLOW}Change default download & upload speed limits${NC}"
-        echo -e " ${BOLD}3)${NC} ${MAGENTA}Configure port filtering & exclusions (Min Port: >= ${MIN_PORT})${NC}"
-        echo -e " ${BOLD}4)${NC} ${BLUE}Configure custom per-port speed limits (Custom Limits)${NC}"
-        echo -e " ${BOLD}5)${NC} ${GREEN}Apply / reload traffic control rules now (Apply / Reload)${NC}"
-        echo -e " ${BOLD}6)${NC} ${YELLOW}Install & enable background service (Install Service)${NC}"
-        echo -e " ${BOLD}7)${NC} ${RED}Clear all rate limits / unthrottle traffic (Clear Limits)${NC}"
-        echo -e " ${BOLD}8)${NC} ${CYAN}View live monitor daemon logs (Live Logs)${NC}"
-        echo -e " ${BOLD}9)${NC} ${RED}Uninstall port-limit completely (Uninstall)${NC}"
-        echo -e " ${BOLD}0)${NC} Exit"
-        echo -e "${BOLD}${CYAN}================================================================${NC}"
-        read -rp "Please select an option [0-9]: " choice
+
+        echo -e "${CYAN}╭───────────────────────────────────────────────────────────────────╮${NC}"
+        echo -e "${CYAN}│${NC}     ${BOLD}${WHITE}⚡ 3X-UI Inbound Port Rate Limiter — PortLimit (v${VERSION}) ⚡${NC}     ${CYAN}│${NC}"
+        echo -e "${CYAN}╰───────────────────────────────────────────────────────────────────╯${NC}"
+        echo -e " ${BOLD}${WHITE}System Overview${NC}"
+        echo -e "   ${CYAN}●${NC} Service State : $s_status"
+        echo -e "   ${CYAN}●${NC} Default Limits: ↓ ${GREEN}$DOWNLOAD_LIMIT${NC} (Down) │ ↑ ${GREEN}$UPLOAD_LIMIT${NC} (Up)"
+        echo -e "   ${CYAN}●${NC} Port Filter   : ${YELLOW}>= ${MIN_PORT}${NC} ${GRAY}(Ports < ${MIN_PORT} exempt)${NC}"
+        echo -e "   ${CYAN}●${NC} Excluded Ports: ${MAGENTA}${EXCLUDE_PORTS:-None}${NC}"
+        echo -e "   ${CYAN}●${NC} Sync Interval : ${CYAN}${CHECK_INTERVAL}s (${_ci_label})${NC}"
+        echo ""
+        echo -e " ${BOLD}${BLUE}📊 Traffic & Inbound Control${NC}"
+        echo -e "   ${BOLD}${GREEN}[1]${NC} View traffic stats & real-time usage ${GRAY}(Status)${NC}"
+        echo -e "   ${BOLD}${GREEN}[2]${NC} Change default download & upload speed limits"
+        echo -e "   ${BOLD}${GREEN}[3]${NC} Configure port filtering & exclusions ${GRAY}(Min: >= ${MIN_PORT})${NC}"
+        echo -e "   ${BOLD}${GREEN}[4]${NC} Configure custom per-port speed limits ${GRAY}(Custom Limits)${NC}"
+        echo -e "   ${BOLD}${GREEN}[5]${NC} Apply & reload traffic control rules now"
+        echo ""
+        echo -e " ${BOLD}${YELLOW}⚙️  Service & System Management${NC}"
+        echo -e "   ${BOLD}${YELLOW}[6]${NC} Install & enable background service ${GRAY}(Systemd)${NC}"
+        echo -e "   ${BOLD}${RED}[7]${NC} Clear all rate limits / unthrottle traffic ${GRAY}(Flush tc)${NC}"
+        echo -e "   ${BOLD}${CYAN}[8]${NC} View live monitor daemon logs ${GRAY}(Journalctl)${NC}"
+        echo -e "   ${BOLD}${RED}[9]${NC} Uninstall port-limit completely"
+        echo ""
+        echo -e " ${BOLD}${GRAY}🚪 Navigation${NC}"
+        echo -e "   ${BOLD}[0]${NC} Exit"
+        echo -e "${CYAN}─────────────────────────────────────────────────────────────────────${NC}"
+        echo -ne "${CYAN}❯ ${WHITE}Please select an option ${GRAY}[0-9]${WHITE}: ${GREEN}"
+        read -r choice
+        echo -ne "${NC}"
 
         case "$choice" in
             1)
                 echo ""
                 show_status
-                echo ""
-                read -rp "Press Enter [or enter 0] to return to main menu..."
+                echo -e "\n${GRAY}Press ${BOLD}[Enter]${NC}${GRAY} to return to main menu...${NC}"
+                read -r _
                 ;;
             2)
                 echo ""
-                echo -e "${BOLD}${CYAN}================================================================${NC}"
-                echo -e "${BOLD}${GREEN}        Change Default Download & Upload Speed Limits           ${NC}"
-                echo -e "${BOLD}${CYAN}================================================================${NC}"
-                echo -e "Current limits: Download = ${GREEN}$DOWNLOAD_LIMIT${NC} | Upload = ${GREEN}$UPLOAD_LIMIT${NC}"
-                echo -e "${YELLOW}(Enter '0' or 'b' at any prompt to cancel and return to main menu)${NC}\n"
+                echo -e "${CYAN}╭───────────────────────────────────────────────────────────────────╮${NC}"
+                echo -e "${CYAN}│${NC}       ${BOLD}${WHITE}⚡ Change Default Download & Upload Speed Limits ⚡${NC}          ${CYAN}│${NC}"
+                echo -e "${CYAN}╰───────────────────────────────────────────────────────────────────╯${NC}"
+                echo -e "  Current limits: Download = ${GREEN}$DOWNLOAD_LIMIT${NC} │ Upload = ${GREEN}$UPLOAD_LIMIT${NC}"
+                echo -e "  ${GRAY}(Enter '0' or 'b' at any prompt to cancel and return)${NC}\n"
                 read -rp "New download speed (e.g. 10mbit, 20m, or 10) [0 to return]: " inp_down
                 if [[ "$inp_down" == "0" || "$inp_down" == "b" || "$inp_down" == "B" || -z "$inp_down" ]]; then
                     echo -e "${YELLOW}Cancelled. Returning to main menu...${NC}"
@@ -1381,8 +1390,8 @@ show_menu() {
                     continue
                 fi
                 set_speed "$inp_down" "$inp_up"
-                echo ""
-                read -rp "Press Enter [or enter 0] to return to main menu..."
+                echo -e "\n${GRAY}Press ${BOLD}[Enter]${NC}${GRAY} to return to main menu...${NC}"
+                read -r _
                 ;;
             3)
                 menu_port_filter
@@ -1393,27 +1402,28 @@ show_menu() {
             5)
                 echo ""
                 apply_rules
-                echo ""
-                read -rp "Press Enter [or enter 0] to return to main menu..."
+                echo -e "\n${GRAY}Press ${BOLD}[Enter]${NC}${GRAY} to return to main menu...${NC}"
+                read -r _
                 ;;
             6)
                 echo ""
-                echo -e "${BOLD}${CYAN}================================================================${NC}"
-                echo -e "${BOLD}${GREEN}            Install & Enable Background Service                 ${NC}"
-                echo -e "${BOLD}${CYAN}================================================================${NC}"
-                echo -e "This will configure kernel modules, install 'port-limit' to system PATH,"
-                echo -e "and enable 'port-limit.service' under systemd to monitor inbounds automatically."
-                echo ""
-                echo -e " ${BOLD}1)${NC} Confirm and Install Service"
-                echo -e " ${BOLD}0)${NC} ${YELLOW}Return to Main Menu${NC}"
-                echo -e "${BOLD}${CYAN}================================================================${NC}"
-                read -rp "Please select an option [0-1]: " svc_choice
+                echo -e "${CYAN}╭───────────────────────────────────────────────────────────────────╮${NC}"
+                echo -e "${CYAN}│${NC}             ${BOLD}${WHITE}🚀 Install & Enable Background Service 🚀${NC}             ${CYAN}│${NC}"
+                echo -e "${CYAN}╰───────────────────────────────────────────────────────────────────╯${NC}"
+                echo -e " This will configure kernel modules, install 'port-limit' to system PATH,"
+                echo -e " and enable 'port-limit.service' under systemd to monitor inbounds 24/7.\n"
+                echo -e "   ${BOLD}${GREEN}[1]${NC} Confirm and Install Service"
+                echo -e "   ${BOLD}[0]${NC} Return to Main Menu"
+                echo -e "${CYAN}─────────────────────────────────────────────────────────────────────${NC}"
+                echo -ne "${CYAN}❯ ${WHITE}Select an option ${GRAY}[0-1]${WHITE}: ${GREEN}"
+                read -r svc_choice
+                echo -ne "${NC}"
                 case "$svc_choice" in
                     1)
                         echo ""
                         install_service
-                        echo ""
-                        read -rp "Press Enter [or enter 0] to return to main menu..."
+                        echo -e "\n${GRAY}Press ${BOLD}[Enter]${NC}${GRAY} to return to main menu...${NC}"
+                        read -r _
                         ;;
                     *)
                         echo -e "${YELLOW}Cancelled. Returning to main menu...${NC}"
@@ -1423,21 +1433,22 @@ show_menu() {
                 ;;
             7)
                 echo ""
-                echo -e "${BOLD}${YELLOW}================================================================${NC}"
-                echo -e "${BOLD}${YELLOW}                Clear All Traffic Rate Limits                   ${NC}"
-                echo -e "${BOLD}${YELLOW}================================================================${NC}"
-                echo -e "This will remove all 'tc' traffic queues and unthrottle all traffic."
-                echo ""
-                echo -e " ${BOLD}1)${NC} Confirm and Clear All Limits"
-                echo -e " ${BOLD}0)${NC} ${YELLOW}Return to Main Menu${NC}"
-                echo -e "${BOLD}${YELLOW}================================================================${NC}"
-                read -rp "Please select an option [0-1]: " clr_choice
+                echo -e "${YELLOW}╭───────────────────────────────────────────────────────────────────╮${NC}"
+                echo -e "${YELLOW}│${NC}                 ${BOLD}${YELLOW}⚠️  Clear All Traffic Rate Limits ⚠️${NC}                ${YELLOW}│${NC}"
+                echo -e "${YELLOW}╰───────────────────────────────────────────────────────────────────╯${NC}"
+                echo -e " This will remove all traffic control queues and unthrottle all traffic.\n"
+                echo -e "   ${BOLD}${RED}[1]${NC} Confirm and Clear All Limits"
+                echo -e "   ${BOLD}[0]${NC} Cancel and Return"
+                echo -e "${YELLOW}─────────────────────────────────────────────────────────────────────${NC}"
+                echo -ne "${YELLOW}❯ ${WHITE}Select an option ${GRAY}[0-1]${WHITE}: ${RED}"
+                read -r clr_choice
+                echo -ne "${NC}"
                 case "$clr_choice" in
                     1)
                         echo ""
                         clear_rules
-                        echo ""
-                        read -rp "Press Enter [or enter 0] to return to main menu..."
+                        echo -e "\n${GRAY}Press ${BOLD}[Enter]${NC}${GRAY} to return to main menu...${NC}"
+                        read -r _
                         ;;
                     *)
                         echo -e "${YELLOW}Cancelled. Returning to main menu...${NC}"
@@ -1451,21 +1462,22 @@ show_menu() {
                 trap ':' SIGINT
                 journalctl -u "$SERVICE_NAME" -f -n 50 2>/dev/null || true
                 trap - SIGINT
-                echo ""
-                read -rp "Press Enter [or enter 0] to return to main menu..."
+                echo -e "\n${GRAY}Press ${BOLD}[Enter]${NC}${GRAY} to return to main menu...${NC}"
+                read -r _
                 ;;
             9)
                 echo ""
-                echo -e "${BOLD}${RED}================================================================${NC}"
-                echo -e "${BOLD}${RED}                Uninstall Port-Limit Completely                 ${NC}"
-                echo -e "${BOLD}${RED}================================================================${NC}"
-                echo -e "This will stop the service, remove all traffic control rules,"
-                echo -e "delete configuration files, and remove the port-limit executable."
-                echo ""
-                echo -e " ${BOLD}1)${NC} Confirm Complete Uninstallation"
-                echo -e " ${BOLD}0)${NC} ${YELLOW}Return to Main Menu${NC}"
-                echo -e "${BOLD}${RED}================================================================${NC}"
-                read -rp "Please select an option [0-1]: " uninst_choice
+                echo -e "${RED}╭───────────────────────────────────────────────────────────────────╮${NC}"
+                echo -e "${RED}│${NC}                 ${BOLD}${RED}🚨 Uninstall Port-Limit Completely 🚨${NC}              ${RED}│${NC}"
+                echo -e "${RED}╰───────────────────────────────────────────────────────────────────╯${NC}"
+                echo -e " This will stop the service, remove all traffic control rules, delete"
+                echo -e " configuration files, and remove the port-limit executable.\n"
+                echo -e "   ${BOLD}${RED}[1]${NC} Confirm Complete Uninstallation"
+                echo -e "   ${BOLD}[0]${NC} Cancel and Return"
+                echo -e "${RED}─────────────────────────────────────────────────────────────────────${NC}"
+                echo -ne "${RED}❯ ${WHITE}Select an option ${GRAY}[0-1]${WHITE}: ${RED}"
+                read -r uninst_choice
+                echo -ne "${NC}"
                 case "$uninst_choice" in
                     1)
                         echo ""
