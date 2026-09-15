@@ -6,7 +6,7 @@
 
 set -o pipefail
 
-VERSION="1.2.0"
+VERSION="1.2.1"
 
 # ------------------------------------------------------------------------------
 # Default Settings (can be modified directly here or via the interactive menu)
@@ -544,11 +544,15 @@ _apply_rules_locked() {
     tc class replace dev "$iface" parent 1: classid 1:999 htb rate 10000mbit ceil 10000mbit 2>/dev/null || \
     tc class add dev "$iface" parent 1: classid 1:999 htb rate 10000mbit ceil 10000mbit 2>/dev/null || true
 
-    # Probe leaf qdisc support once on class 1:999
+    # Probe leaf qdisc support once on class 1:999 (fq_codel > sfq > pfifo)
     local leaf_qdisc="fq_codel"
     if ! tc qdisc replace dev "$iface" parent 1:999 handle 999: fq_codel 2>/dev/null; then
-        tc qdisc replace dev "$iface" parent 1:999 handle 999: sfq perturb 10 2>/dev/null || true
-        leaf_qdisc="sfq perturb 10"
+        if ! tc qdisc replace dev "$iface" parent 1:999 handle 999: sfq perturb 10 2>/dev/null; then
+            tc qdisc replace dev "$iface" parent 1:999 handle 999: pfifo 2>/dev/null || true
+            leaf_qdisc="pfifo"
+        else
+            leaf_qdisc="sfq perturb 10"
+        fi
     fi
 
     # 2. Ingress root qdisc directly on physical WAN interface (Client Upload - traffic entering server)
@@ -574,17 +578,23 @@ _apply_rules_locked() {
 
         # --- Egress shaping (Download): attached directly to parent 1: (no token borrowing, strictly capped) ---
         batch_rules+="class add dev $iface parent 1: classid $class_id htb rate $port_down ceil $port_down burst $burst_val cburst $burst_val"$'\n'
-        batch_rules+="qdisc add dev $iface parent $class_id handle $qdisc_handle $leaf_qdisc"$'\n'
-        # Match IPv4 TCP & UDP via sport
-        batch_rules+="filter add dev $iface protocol ip parent 1: prio 1 u32 match ip sport $port 0xffff flowid $class_id"$'\n'
-        # Match IPv6 TCP & UDP via sport (offset 40)
-        batch_rules+="filter add dev $iface protocol ipv6 parent 1: prio 2 u32 match u16 $port 0xffff at 40 flowid $class_id"$'\n'
+        batch_rules+="qdisc add dev $iface parent $class_id handle $qdisc_handle ${leaf_qdisc:-pfifo}"$'\n'
+        # Each port/protocol gets a unique prio to prevent kernel filter collisions
+        # prio scheme: (idx * 10 + N) — guarantees uniqueness across all ports and protocols
+        # Match IPv4 TCP via sport (proto 6)
+        batch_rules+="filter add dev $iface protocol ip parent 1: prio $((idx * 10 + 1)) u32 match ip protocol 6 0xff match ip sport $port 0xffff flowid $class_id"$'\n'
+        # Match IPv4 UDP via sport (proto 17)
+        batch_rules+="filter add dev $iface protocol ip parent 1: prio $((idx * 10 + 2)) u32 match ip protocol 17 0xff match ip sport $port 0xffff flowid $class_id"$'\n'
+        # Match IPv6 via sport (offset 40 covers both TCP+UDP sport in IPv6)
+        batch_rules+="filter add dev $iface protocol ipv6 parent 1: prio $((idx * 10 + 3)) u32 match u16 $port 0xffff at 40 flowid $class_id"$'\n'
 
-        # --- Ingress direct policing (Upload): per-port hardware line-rate rate limiting ---
-        # Match IPv4 TCP & UDP via dport on ingress
-        batch_rules+="filter add dev $iface parent ffff: protocol ip prio $idx u32 match ip dport $port 0xffff police rate $port_up burst $burst_val drop flowid :1"$'\n'
-        # Match IPv6 TCP & UDP via dport on ingress (offset 42)
-        batch_rules+="filter add dev $iface parent ffff: protocol ipv6 prio $((idx + 5000)) u32 match u16 $port 0xffff at 42 police rate $port_up burst $burst_val drop flowid :1"$'\n'
+        # --- Ingress direct policing (Upload): per-port per-protocol rate limiting ---
+        # Match IPv4 TCP via dport on ingress (proto 6)
+        batch_rules+="filter add dev $iface parent ffff: protocol ip prio $((idx * 10 + 4)) u32 match ip protocol 6 0xff match ip dport $port 0xffff police rate $port_up burst $burst_val drop flowid :1"$'\n'
+        # Match IPv4 UDP via dport on ingress (proto 17)
+        batch_rules+="filter add dev $iface parent ffff: protocol ip prio $((idx * 10 + 5)) u32 match ip protocol 17 0xff match ip dport $port 0xffff police rate $port_up burst $burst_val drop flowid :1"$'\n'
+        # Match IPv6 via dport on ingress (offset 42 covers TCP+UDP dport in IPv6)
+        batch_rules+="filter add dev $iface parent ffff: protocol ipv6 prio $((idx * 10 + 6)) u32 match u16 $port 0xffff at 42 police rate $port_up burst $burst_val drop flowid :1"$'\n'
 
         idx=$((idx + 1))
     done
@@ -794,8 +804,9 @@ show_status() {
 
         local down_bytes
         down_bytes=$(format_bytes "${egress_bytes[$class_id]:-0}")
-        # [FIX-L3] Removed dead $class_id lookup: ingress_bytes is keyed by prio (integer), not class_id string
-        local up_count=$(( ${ingress_bytes[$idx]:-0} + ${ingress_bytes[$((idx + 5000))]:-0} ))
+        # Ingress bytes are keyed by prio number matching the filter generation scheme (idx*10+N):
+        # prio idx*10+4 = IPv4 TCP, idx*10+5 = IPv4 UDP, idx*10+6 = IPv6
+        local up_count=$(( ${ingress_bytes[$((idx * 10 + 4))]:-0} + ${ingress_bytes[$((idx * 10 + 5))]:-0} + ${ingress_bytes[$((idx * 10 + 6))]:-0} ))
         local up_bytes
         up_bytes=$(format_bytes "$up_count")
 
