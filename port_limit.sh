@@ -6,7 +6,7 @@
 
 set -o pipefail
 
-VERSION="1.2.1"
+VERSION="1.2.2"
 
 # ------------------------------------------------------------------------------
 # Default Settings (can be modified directly here or via the interactive menu)
@@ -17,7 +17,7 @@ CHECK_INTERVAL=600             # Interval in seconds to check for new inbounds (
 EXCLUDE_PORTS="22"            # Excluded ports (comma-separated, e.g., 22,2053)
 MIN_PORT=10000                # Minimum port threshold (ports below 10000 are completely exempt)
 CUSTOM_LIMITS=""              # Custom limits per port (e.g., "443:20mbit:20mbit,8443:5mbit:5mbit")
-BURST="128k"                  # Burst buffer size for connection establishment (TSO/GSO 64KB+ compatible)
+BURST="auto"                  # Burst buffer: 'auto' = 250ms×rate per port (recommended), or fixed e.g. '512k'
 # [FIX-S8] Sanitize environment overrides: enforce valid absolute paths without traversal
 if [[ -n "${PORT_LIMIT_DB:-}" && "${PORT_LIMIT_DB}" =~ ^/[a-zA-Z0-9_./-]+$ && ! "${PORT_LIMIT_DB}" =~ \.\. ]]; then
     DB_PATH="$PORT_LIMIT_DB"
@@ -41,6 +41,8 @@ else
     STATE_FILE="/run/port-limit.ports"
 fi
 IFB_DEVICE="ifb0"
+LOG_FILE="/root/port-limit.log"   # Path to persistent log file (set empty to disable)
+LOG_MAX_BYTES=5242880              # Rotate log when it exceeds this size (default: 5 MB)
 
 # Runtime state (not user-configurable)
 DEPS_VERIFIED=0
@@ -166,14 +168,19 @@ load_config() {
                 CUSTOM_LIMITS)
                     CUSTOM_LIMITS=$(validate_custom_limits "$val") ;;
                 BURST)
-                    # [FIX-L8] Reject zero-burst values that cause silent tc failures
-                    [[ "$val" =~ ^[1-9][0-9]*[kKmMgG]?$ ]] && BURST="$val" ;;
+                    # Accept 'auto' for dynamic per-port calculation, or a fixed size (e.g. 512k, 2m)
+                    if [[ "$val" == "auto" ]] || [[ "$val" =~ ^[1-9][0-9]*[kKmMgG]?$ ]]; then BURST="$val"; fi ;;
                 DB_PATH)
                     # [FIX-S5] Only accept absolute paths; reject shell metacharacters
                     if [[ "$val" =~ ^/[a-zA-Z0-9_./-]+$ ]]; then DB_PATH="$val"; fi ;;
                 WAN_INTERFACE)
                     # [FIX-S6] Validate interface name against allowed character set (max 15 chars)
                     if [[ "$val" =~ ^[a-zA-Z0-9_@.-]{1,15}$ ]]; then WAN_INTERFACE="$val"; fi ;;
+                LOG_FILE)
+                    # Accept empty string (disables logging) or a valid absolute path
+                    if [[ -z "$val" || "$val" =~ ^/[a-zA-Z0-9_./-]+$ ]]; then LOG_FILE="$val"; fi ;;
+                LOG_MAX_BYTES)
+                    [[ "$val" =~ ^[1-9][0-9]+$ ]] && LOG_MAX_BYTES="$val" ;;
             esac
         done < "$CONFIG_FILE"
     fi
@@ -185,23 +192,38 @@ load_config
 # ------------------------------------------------------------------------------
 # Logging & Helper Functions
 # ------------------------------------------------------------------------------
+
+# Write a plain-text (no ANSI) log entry to LOG_FILE with optional rotation
+_log_to_file() {
+    local level="$1" msg="$2"
+    [[ -z "${LOG_FILE:-}" ]] && return 0
+    # Rotate log if it exceeds LOG_MAX_BYTES
+    if [[ -f "$LOG_FILE" ]] && (( $(stat -c%s "$LOG_FILE" 2>/dev/null || echo 0) >= ${LOG_MAX_BYTES:-5242880} )); then
+        mv -f "$LOG_FILE" "${LOG_FILE}.1" 2>/dev/null || true
+    fi
+    printf '[%s] [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$level" "$msg" >> "$LOG_FILE" 2>/dev/null || true
+}
+
 # [FIX-S9] Sanitize log messages to prevent ANSI escape injection / log forging
 log_info() {
     local msg="$1"
     msg="${msg//$'\r'/}"
     printf '%b[INFO]%b %s\n' "${CYAN}[$(date '+%Y-%m-%d %H:%M:%S')] ${GREEN}" "${NC}" "$msg" >&2
+    _log_to_file "INFO" "$msg"
 }
 
 log_warn() {
     local msg="$1"
     msg="${msg//$'\r'/}"
     printf '%b[WARN]%b %s\n' "${CYAN}[$(date '+%Y-%m-%d %H:%M:%S')] ${YELLOW}" "${NC}" "$msg" >&2
+    _log_to_file "WARN" "$msg"
 }
 
 log_error() {
     local msg="$1"
     msg="${msg//$'\r'/}"
     printf '%b[ERROR]%b %s\n' "${CYAN}[$(date '+%Y-%m-%d %H:%M:%S')] ${RED}" "${NC}" "$msg" >&2
+    _log_to_file "ERROR" "$msg"
 }
 
 check_root() {
@@ -426,6 +448,28 @@ get_port_limits() {
     echo "$norm_d $norm_u"
 }
 
+# Calculate optimal burst size in bytes for a given rate string (pure bash, zero forks)
+# Formula: burst = rate_bytes_per_sec × 250ms, clamped to [131072 (128KiB), 16777216 (16MiB)]
+# This ensures TCP slow-start can ramp up properly even on high-latency paths
+calc_burst() {
+    local rate="${1,,}"   # lowercase
+    local val bps burst
+    if [[ "$rate" =~ ^([0-9]+)(kbit|mbit|gbit)$ ]]; then
+        val="${BASH_REMATCH[1]}"
+        case "${BASH_REMATCH[2]}" in
+            kbit) bps=$(( val * 125 ))       ;;  # 1000 / 8
+            mbit) bps=$(( val * 125000 ))    ;;  # 1_000_000 / 8
+            gbit) bps=$(( val * 125000000 )) ;;  # 1_000_000_000 / 8
+        esac
+        burst=$(( bps / 4 ))  # 250ms window
+        (( burst < 131072   )) && burst=131072    # min 128 KiB
+        (( burst > 16777216 )) && burst=16777216  # max  16 MiB
+    else
+        burst=131072  # 128 KiB safe fallback
+    fi
+    echo "$burst"
+}
+
 # (IFB virtual device approach removed — direct ingress policing used instead)
 
 # ------------------------------------------------------------------------------
@@ -565,7 +609,6 @@ _apply_rules_locked() {
     _load_custom_limits_maps
 
     # 3. Generate batch rules in memory for high-performance atomic execution
-    local burst_val="${BURST:-128k}"
     local batch_rules=""
     local idx=1
     for port in "${active_ports[@]}"; do
@@ -576,8 +619,18 @@ _apply_rules_locked() {
         local port_down="${custom_down_map[$port]:-$norm_down}"
         local port_up="${custom_up_map[$port]:-$norm_up}"
 
+        # Per-port burst: auto-calculate from rate (250ms window) unless user set a fixed value
+        # Old default '128k' is also treated as auto to silently upgrade existing installs
+        local burst_egress burst_ingress
+        if [[ "${BURST:-auto}" == "auto" || "${BURST}" == "128k" ]]; then
+            burst_egress=$(calc_burst "$port_down")
+            burst_ingress=$(calc_burst "$port_up")
+        else
+            burst_egress="${BURST}"
+            burst_ingress="${BURST}"
+        fi
         # --- Egress shaping (Download): attached directly to parent 1: (no token borrowing, strictly capped) ---
-        batch_rules+="class add dev $iface parent 1: classid $class_id htb rate $port_down ceil $port_down burst $burst_val cburst $burst_val"$'\n'
+        batch_rules+="class add dev $iface parent 1: classid $class_id htb rate $port_down ceil $port_down burst $burst_egress cburst $burst_egress"$'\n'
         batch_rules+="qdisc add dev $iface parent $class_id handle $qdisc_handle ${leaf_qdisc:-pfifo}"$'\n'
         # Each port/protocol gets a unique prio to prevent kernel filter collisions
         # prio scheme: (idx * 10 + N) — guarantees uniqueness across all ports and protocols
@@ -590,11 +643,11 @@ _apply_rules_locked() {
 
         # --- Ingress direct policing (Upload): per-port per-protocol rate limiting ---
         # Match IPv4 TCP via dport on ingress (proto 6)
-        batch_rules+="filter add dev $iface parent ffff: protocol ip prio $((idx * 10 + 4)) u32 match ip protocol 6 0xff match ip dport $port 0xffff police rate $port_up burst $burst_val drop flowid :1"$'\n'
+        batch_rules+="filter add dev $iface parent ffff: protocol ip prio $((idx * 10 + 4)) u32 match ip protocol 6 0xff match ip dport $port 0xffff police rate $port_up burst $burst_ingress drop flowid :1"$'\n'
         # Match IPv4 UDP via dport on ingress (proto 17)
-        batch_rules+="filter add dev $iface parent ffff: protocol ip prio $((idx * 10 + 5)) u32 match ip protocol 17 0xff match ip dport $port 0xffff police rate $port_up burst $burst_val drop flowid :1"$'\n'
+        batch_rules+="filter add dev $iface parent ffff: protocol ip prio $((idx * 10 + 5)) u32 match ip protocol 17 0xff match ip dport $port 0xffff police rate $port_up burst $burst_ingress drop flowid :1"$'\n'
         # Match IPv6 via dport on ingress (offset 42 covers TCP+UDP dport in IPv6)
-        batch_rules+="filter add dev $iface parent ffff: protocol ipv6 prio $((idx * 10 + 6)) u32 match u16 $port 0xffff at 42 police rate $port_up burst $burst_val drop flowid :1"$'\n'
+        batch_rules+="filter add dev $iface parent ffff: protocol ipv6 prio $((idx * 10 + 6)) u32 match u16 $port 0xffff at 42 police rate $port_up burst $burst_ingress drop flowid :1"$'\n'
 
         idx=$((idx + 1))
     done
@@ -880,6 +933,8 @@ CUSTOM_LIMITS="$CUSTOM_LIMITS"
 BURST="$BURST"
 DB_PATH="$DB_PATH"
 WAN_INTERFACE="$WAN_INTERFACE"
+LOG_FILE="$LOG_FILE"
+LOG_MAX_BYTES=$LOG_MAX_BYTES
 EOF
     chmod 600 "$tmp_conf" 2>/dev/null || true
     mv -f "$tmp_conf" "$CONFIG_FILE" 2>/dev/null || cat "$tmp_conf" > "$CONFIG_FILE"
