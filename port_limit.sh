@@ -6,7 +6,7 @@
 
 set -o pipefail
 
-VERSION="1.1.8"
+VERSION="1.1.9"
 
 # ------------------------------------------------------------------------------
 # Default Settings (can be modified directly here or via the interactive menu)
@@ -208,21 +208,74 @@ check_root() {
     fi
 }
 
+# Detect containerized environments (Docker, LXC, OpenVZ, Podman, Containerd)
+is_container() {
+    if [[ -f /.dockerenv || -f /run/.containerenv ]]; then
+        return 0
+    fi
+    if [[ -r /proc/1/environ ]] && grep -qaE 'container=(lxc|docker|podman|containerd)' /proc/1/environ 2>/dev/null; then
+        return 0
+    fi
+    if command -v systemd-detect-virt >/dev/null 2>&1 && systemd-detect-virt --container >/dev/null 2>&1; then
+        return 0
+    fi
+    if grep -qaE 'docker|lxc|kubepods|containerd' /proc/1/cgroup 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
+# Safely load kernel module with container check, duplicate check, and 3-second timeout protection
+safe_modprobe() {
+    local mod="$1"
+    [[ -z "$mod" ]] && return 0
+    # Inside containers, kernel modules cannot and must not be loaded directly
+    if is_container; then
+        return 0
+    fi
+    # If already loaded in /proc/modules, skip to avoid redundant fork/modprobe
+    if grep -q "^${mod//-/_} " /proc/modules 2>/dev/null; then
+        return 0
+    fi
+    if command -v timeout >/dev/null 2>&1; then
+        timeout 3 modprobe "$mod" 2>/dev/null || true
+    else
+        modprobe "$mod" 2>/dev/null || true
+    fi
+}
+
+# Safely unload kernel module with container check and 3-second timeout protection
+safe_modprobe_r() {
+    local mod="$1"
+    [[ -z "$mod" ]] && return 0
+    if is_container; then
+        return 0
+    fi
+    if command -v timeout >/dev/null 2>&1; then
+        timeout 3 modprobe -r "$mod" 2>/dev/null || true
+    else
+        modprobe -r "$mod" 2>/dev/null || true
+    fi
+}
+
 # Automatically load and verify essential traffic control kernel modules
 ensure_kernel_modules() {
+    # Skip entirely in container environments (kernel modules managed by host)
+    if is_container; then
+        return 0
+    fi
+
     # Only modules required for direct HTB egress + ingress policing (no IFB needed)
     local mods=("sch_htb" "cls_u32" "sch_fq_codel" "sch_sfq")
     local need_install=0
 
     for m in "${mods[@]}"; do
-        if ! grep -q "^${m//-/_} " /proc/modules 2>/dev/null; then
-            modprobe "$m" 2>/dev/null || true
-        fi
+        safe_modprobe "$m"
     done
 
     # Check if sch_htb can be loaded or is supported (required for egress HTB shaping)
     if ! grep -q "^sch_htb " /proc/modules 2>/dev/null; then
-        if ! modprobe sch_htb 2>/dev/null; then
+        if ! safe_modprobe sch_htb; then
             need_install=1
         fi
     fi
@@ -232,10 +285,11 @@ ensure_kernel_modules() {
         kver=$(uname -r)
         log_info "Traffic control kernel modules missing. Installing linux-modules-extra for $kver..."
         export DEBIAN_FRONTEND=noninteractive
+        export NEEDRESTART_MODE=a
         apt-get update -qq >/dev/null 2>&1 || true
-        apt-get install -y -qq "linux-modules-extra-$kver" "linux-modules-$kver" >/dev/null 2>&1 || true
+        apt-get install -y -qq -o DPkg::Lock::Timeout=10 "linux-modules-extra-$kver" "linux-modules-$kver" >/dev/null 2>&1 || true
         for m in "${mods[@]}"; do
-            modprobe "$m" 2>/dev/null || true
+            safe_modprobe "$m"
         done
     fi
 }
@@ -254,8 +308,9 @@ ensure_dependencies() {
     if [[ ${#needed[@]} -gt 0 ]]; then
         log_info "Installing prerequisite packages (${needed[*]})..."
         export DEBIAN_FRONTEND=noninteractive
+        export NEEDRESTART_MODE=a
         apt-get update -qq >/dev/null 2>&1 || true
-        apt-get install -y -qq "${needed[@]}" >/dev/null 2>&1
+        apt-get install -y -qq -o DPkg::Lock::Timeout=10 "${needed[@]}" >/dev/null 2>&1
         log_info "Prerequisite packages installed successfully."
     fi
 
@@ -286,9 +341,17 @@ detect_wan_interface() {
     local iface
     # Priority 1: Default IPv4 route
     iface=$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++)if($i=="dev"){print $(i+1);exit}}')
-    # Priority 2: Outbound route to internet
+    # Priority 1b: Default IPv6 route if IPv4 default route absent
     if [[ -z "$iface" ]]; then
-        iface=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++)if($i=="dev"){print $(i+1);exit}}')
+        iface=$(ip -6 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++)if($i=="dev"){print $(i+1);exit}}')
+    fi
+    # Priority 2: Outbound route to internet with 2s timeout to prevent hanging on blocked/delayed routes
+    if [[ -z "$iface" ]]; then
+        if command -v timeout >/dev/null 2>&1; then
+            iface=$(timeout 2 ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++)if($i=="dev"){print $(i+1);exit}}')
+        else
+            iface=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++)if($i=="dev"){print $(i+1);exit}}')
+        fi
     fi
     # Priority 3: Active physical links excluding virtual devices
     if [[ -z "$iface" ]]; then
@@ -412,7 +475,7 @@ clear_rules() {
         tc qdisc del dev "$IFB_DEVICE" ingress 2>/dev/null || true
         ip link set dev "$IFB_DEVICE" down 2>/dev/null || true
         ip link delete "$IFB_DEVICE" type ifb 2>/dev/null || true
-        modprobe -r ifb 2>/dev/null || true
+        safe_modprobe_r ifb
     fi
 
     rm -f "$STATE_FILE"
@@ -453,7 +516,7 @@ _apply_rules_locked() {
 
     if [[ ${#active_ports[@]} -eq 0 ]]; then
         local total_inbounds
-        total_inbounds=$(sqlite3 -readonly "$DB_PATH" "SELECT count(*) FROM inbounds WHERE enable = 1;" 2>/dev/null || echo 0)
+        total_inbounds=$(sqlite3 -readonly "$DB_PATH" "PRAGMA busy_timeout = 2000; SELECT count(*) FROM inbounds WHERE enable = 1;" 2>/dev/null || echo 0)
         if (( total_inbounds > 0 )); then
             # [FIX-L1] Inbounds exist but are ALL below MIN_PORT — preserve existing tc rules.
             # Clearing rules here would briefly expose traffic during config changes.
@@ -477,7 +540,7 @@ _apply_rules_locked() {
         tc qdisc del dev "$IFB_DEVICE" ingress 2>/dev/null || true
         ip link set dev "$IFB_DEVICE" down 2>/dev/null || true
         ip link delete "$IFB_DEVICE" type ifb 2>/dev/null || true
-        modprobe -r ifb 2>/dev/null || true
+        safe_modprobe_r ifb
     fi
 
     # Reset existing root and ingress qdiscs on physical WAN interface cleanly
@@ -488,7 +551,7 @@ _apply_rules_locked() {
     # 1. Egress root qdisc on physical WAN interface (Client Download - traffic leaving server)
     # Default class 1:999 handles unclassified/system traffic (SSH, web, non-limited ports) at line rate (10 Gbps)
     if ! tc qdisc replace dev "$iface" root handle 1: htb default 999 2>/dev/null; then
-        modprobe sch_htb 2>/dev/null || true
+        safe_modprobe sch_htb
         if ! tc qdisc replace dev "$iface" root handle 1: htb default 999 2>/dev/null; then
             log_error "Failed to create root HTB queue on WAN interface '$iface'!"
             log_error "Kernel module 'sch_htb' is missing or not supported on this kernel."
@@ -577,23 +640,28 @@ _apply_rules_locked() {
 
 # Apply download and upload bandwidth limits for all active inbounds (lock-protected)
 apply_rules() {
+    log_info "Applying traffic control rate limits..."
     ensure_dependencies
     load_config
 
     # [FIX-L2] Acquire exclusive lock to prevent concurrent rule application causing corrupted tc state
     install -d -m 700 /run/port-limit 2>/dev/null || mkdir -p /run/port-limit 2>/dev/null || true
     exec 9>/run/port-limit/apply.lock 2>/dev/null
-    if ! flock -n 9 2>/dev/null; then
-        log_warn "Another apply_rules instance is already running. Skipping to avoid tc race condition."
-        exec 9>&- 2>/dev/null || true
-        return 0
+    if command -v flock >/dev/null 2>&1; then
+        if ! flock -n 9 2>/dev/null; then
+            log_warn "Another apply_rules instance is already running. Skipping to avoid tc race condition."
+            exec 9>&- 2>/dev/null || true
+            return 0
+        fi
     fi
 
     local ret=0
     _apply_rules_locked || ret=$?
 
     # Always release lock and close file descriptor 9 to prevent blocking subsequent calls
-    flock -u 9 2>/dev/null || true
+    if command -v flock >/dev/null 2>&1; then
+        flock -u 9 2>/dev/null || true
+    fi
     exec 9>&- 2>/dev/null || true
     return $ret
 }
@@ -850,13 +918,15 @@ install_service() {
     ensure_dependencies
     save_config
 
-    mkdir -p /etc/modules-load.d
-    # Load only modules required for HTB egress + direct ingress policing
-    cat <<'EOF' > /etc/modules-load.d/port-limit-tc.conf
+    if ! is_container; then
+        mkdir -p /etc/modules-load.d
+        # Load only modules required for HTB egress + direct ingress policing
+        cat <<'EOF' > /etc/modules-load.d/port-limit-tc.conf
 sch_htb
 cls_u32
 sch_fq_codel
 EOF
+    fi
     # Remove any old IFB-related config left from previous versions
     rm -f /etc/modprobe.d/port-limit-ifb.conf 2>/dev/null || true
 
@@ -988,7 +1058,7 @@ uninstall_service() {
 
     # 6. Remove kernel module load configuration and unload module from kernel
     rm -f /etc/modules-load.d/ifb.conf /etc/modules-load.d/port-limit-tc.conf /etc/modprobe.d/port-limit-ifb.conf 2>/dev/null || true
-    modprobe -r ifb 2>/dev/null || rmmod ifb 2>/dev/null || true
+    safe_modprobe_r ifb || rmmod ifb 2>/dev/null || true
 
     # 7. Clean up any crontab or cron file remnants
     if command -v crontab >/dev/null 2>&1; then
