@@ -6,14 +6,14 @@
 
 set -o pipefail
 
-VERSION="1.2.2"
+VERSION="1.2.4"
 
 # ------------------------------------------------------------------------------
 # Default Settings (can be modified directly here or via the interactive menu)
 # ------------------------------------------------------------------------------
 DOWNLOAD_LIMIT="16mbit"       # Client download speed limit (Server egress traffic)
 UPLOAD_LIMIT="16mbit"         # Client upload speed limit (Server ingress traffic)
-CHECK_INTERVAL=600             # Interval in seconds to check for new inbounds (1 minute)
+CHECK_INTERVAL=60             # Interval in seconds to check for new inbounds (1 minute)
 EXCLUDE_PORTS="22"            # Excluded ports (comma-separated, e.g., 22,2053)
 MIN_PORT=10000                # Minimum port threshold (ports below 10000 are completely exempt)
 CUSTOM_LIMITS=""              # Custom limits per port (e.g., "443:20mbit:20mbit,8443:5mbit:5mbit")
@@ -327,9 +327,11 @@ ensure_dependencies() {
 
 # Automatically detect WAN interface, with in-memory caching to avoid repeated ip/awk calls
 detect_wan_interface() {
-    if [[ -n "$WAN_INTERFACE" ]] && ip link show "$WAN_INTERFACE" >/dev/null 2>&1; then
-        echo "$WAN_INTERFACE"
-        return 0
+    if [[ -n "$WAN_INTERFACE" ]]; then
+        if ! command -v ip >/dev/null 2>&1 || ip link show "$WAN_INTERFACE" >/dev/null 2>&1; then
+            echo "$WAN_INTERFACE"
+            return 0
+        fi
     fi
 
     # [FIX-L4] Cache WAN interface with 300s TTL; re-evaluate routing when cache expires or link drops
@@ -715,6 +717,40 @@ apply_rules() {
     return $ret
 }
 
+# Verify if traffic control rate limits are currently active in kernel on the active interface
+check_tc_health() {
+    # If state file does not exist or is empty, no rules are currently active
+    if [[ ! -f "$STATE_FILE" ]] || [[ ! -s "$STATE_FILE" ]]; then
+        return 0
+    fi
+
+    # In environments where tc binary is missing, skip to avoid errors
+    if ! command -v tc >/dev/null 2>&1; then
+        return 0
+    fi
+
+    local iface
+    iface=$(detect_wan_interface)
+    [[ -z "$iface" ]] && return 1
+
+    # Check 1: Root HTB qdisc must be present on WAN interface
+    if ! tc qdisc show dev "$iface" root 2>/dev/null | grep -q "qdisc htb 1:"; then
+        return 1
+    fi
+
+    # Check 2: Ingress qdisc must be present on WAN interface
+    if ! tc qdisc show dev "$iface" ingress 2>/dev/null | grep -q "qdisc ingress ffff:"; then
+        return 1
+    fi
+
+    # Check 3: Default unthrottled class 1:999 must exist
+    if ! tc class show dev "$iface" 2>/dev/null | grep -q "class htb 1:999"; then
+        return 1
+    fi
+
+    return 0
+}
+
 # Format byte counts into human-readable units using pure Bash integer math (zero forks)
 format_bytes() {
     local b="${1:-0}"
@@ -760,11 +796,17 @@ show_status() {
         _interval_label="${CHECK_INTERVAL}s"
     fi
 
+    local tc_health_label="${GREEN}● Healthy (Active in Kernel)${NC}"
+    if ! check_tc_health; then
+        tc_health_label="${RED}● Flushed / Missing (Auto-healing pending)${NC}"
+    fi
+
     echo -e "${CYAN}╭───────────────────────────────────────────────────────────────────╮${NC}"
     echo -e "${CYAN}│${NC}   ${BOLD}${WHITE}📊 3X-UI Inbound Ports Real-Time Traffic & Rate Limits (v${VERSION})${NC}   ${CYAN}│${NC}"
     echo -e "${CYAN}╰───────────────────────────────────────────────────────────────────╯${NC}"
     echo -e " ${BOLD}${WHITE}System Overview${NC}"
     echo -e "   ${CYAN}●${NC} Service Status : $s_status"
+    echo -e "   ${CYAN}●${NC} TC Rules Health: $tc_health_label"
     echo -e "   ${CYAN}●${NC} WAN Interface  : ${YELLOW}${iface:-Unknown}${NC}"
     echo -e "   ${CYAN}●${NC} Default Limits : ↓ ${GREEN}$DOWNLOAD_LIMIT${NC} (Download) │ ↑ ${GREEN}$UPLOAD_LIMIT${NC} (Upload)"
     echo -e "   ${CYAN}●${NC} Port Filter    : ${YELLOW}>= ${MIN_PORT}${NC} ${GRAY}(Ports < ${MIN_PORT} are exempt)${NC}"
@@ -874,9 +916,11 @@ get_config_state_string() {
     echo "${DOWNLOAD_LIMIT}|${UPLOAD_LIMIT}|${CHECK_INTERVAL}|${EXCLUDE_PORTS}|${MIN_PORT}|${CUSTOM_LIMITS}|${BURST}|${WAN_INTERFACE}|${DB_PATH}"
 }
 
-# Daemon loop to automatically detect database additions/removals and config changes
+# Daemon loop to automatically detect database additions/removals and config changes,
+# with fast 15-second self-healing health check against kernel TC resets (networkd, DHCP, link flaps)
 run_monitor() {
-    log_info "3X-UI auto-detector daemon started (interval: ${CHECK_INTERVAL}s)..."
+    load_config
+    log_info "3X-UI auto-detector daemon started (interval: ${CHECK_INTERVAL}s, health check: 15s)..."
     # [FIX-ST6] Write PID for targeted termination in uninstall — avoids broad pkill -f pattern
     install -d -m 700 /run/port-limit 2>/dev/null || true
     echo $$ > /run/port-limit/daemon.pid 2>/dev/null || true
@@ -889,32 +933,70 @@ run_monitor() {
     local last_cfg_state
     last_cfg_state=$(get_config_state_string)
 
+    local health_subinterval=15
+    local elapsed=0
+
     while true; do
-        sleep "$CHECK_INTERVAL"
+        sleep "$health_subinterval"
+        elapsed=$((elapsed + health_subinterval))
 
-        load_config
-        local current_cfg_state
-        current_cfg_state=$(get_config_state_string)
-
-        raw_p=$(get_active_ports 2>/dev/null)
-        local status_code=$?
-
-        # Skip iteration if database was temporarily busy or unreachable
-        if [[ $status_code -ne 0 ]]; then
+        # 1. Fast Self-Healing Health Check: Verify kernel TC rules didn't get flushed by networkd/DHCP
+        if ! check_tc_health; then
+            log_warn "Traffic control rules missing from kernel (detected interface reset or system purge)! Restoring rate limits immediately..."
+            apply_rules
+            raw_p=$(get_active_ports 2>/dev/null)
+            last_ports="${raw_p//$'\n'/ }"
+            last_cfg_state=$(get_config_state_string)
+            elapsed=0
             continue
         fi
 
-        local current_ports="${raw_p//$'\n'/ }"
+        # 2. Periodic Database and Config Check (every CHECK_INTERVAL seconds)
+        if (( elapsed >= CHECK_INTERVAL )); then
+            elapsed=0
+            load_config
+            local current_cfg_state
+            current_cfg_state=$(get_config_state_string)
 
-        # Re-apply rules if ports changed or speed parameters were updated
-        if [[ "$current_ports" != "$last_ports" || "$current_cfg_state" != "$last_cfg_state" ]]; then
-            log_info "Change detected in inbounds or speed configuration!"
-            [[ "$current_ports" != "$last_ports" ]] && log_info "Previous ports: [ $last_ports ] -> New ports: [ $current_ports ]"
-            [[ "$current_cfg_state" != "$last_cfg_state" ]] && log_info "Speed configuration updated."
+            raw_p=$(get_active_ports 2>/dev/null)
+            local status_code=$?
 
-            apply_rules
-            last_ports="$current_ports"
-            last_cfg_state="$current_cfg_state"
+            # Skip iteration if database was temporarily busy or unreachable
+            if [[ $status_code -ne 0 ]]; then
+                continue
+            fi
+
+            local current_ports="${raw_p//$'\n'/ }"
+
+            # Transient empty safeguard: if previous ports existed but now 0 ports returned,
+            # retry up to 3 times with delay before accepting it was intentional (prevents DB lock/reload glitch)
+            if [[ -n "$last_ports" && -z "$current_ports" ]]; then
+                local retry_ok=0
+                for _r in 1 2 3; do
+                    sleep 1
+                    local retry_p
+                    retry_p=$(get_active_ports 2>/dev/null)
+                    if [[ -n "$retry_p" ]]; then
+                        current_ports="${retry_p//$'\n'/ }"
+                        retry_ok=1
+                        break
+                    fi
+                done
+                if [[ $retry_ok -eq 0 ]]; then
+                    log_warn "All inbounds appear removed from 3X-UI database."
+                fi
+            fi
+
+            # Re-apply rules if ports changed or speed parameters were updated
+            if [[ "$current_ports" != "$last_ports" || "$current_cfg_state" != "$last_cfg_state" ]]; then
+                log_info "Change detected in inbounds or speed configuration!"
+                [[ "$current_ports" != "$last_ports" ]] && log_info "Previous ports: [ $last_ports ] -> New ports: [ $current_ports ]"
+                [[ "$current_cfg_state" != "$last_cfg_state" ]] && log_info "Speed configuration updated."
+
+                apply_rules
+                last_ports="$current_ports"
+                last_cfg_state="$current_cfg_state"
+            fi
         fi
     done
 }
@@ -1047,7 +1129,7 @@ EOF
     cat << EOF > "/etc/systemd/system/${SERVICE_NAME}.service"
 [Unit]
 Description=3X-UI Inbound Port Rate Limiter & Auto-Detector
-After=network.target x-ui.service
+After=network-online.target systemd-networkd.service NetworkManager.service x-ui.service
 Wants=network-online.target
 
 [Service]
