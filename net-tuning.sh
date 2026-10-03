@@ -31,8 +31,8 @@ print_header() {
     echo ""
     echo -e "${CYAN}${BOLD}"
     echo " ╔════════════════════════════════════════════════╗"
-    echo " ║     Network Tuning Manager — Iran Server       ║"
-    echo " ║   GRE / FOU Tunnel & MSS Clamping Optimizer   ║"
+    echo " ║           Network Tuning Optimizer             ║"
+    echo " ║   GRE / FOU Tunnel & MSS Clamping Manager      ║"
     echo " ╚════════════════════════════════════════════════╝"
     echo -e "${NC}"
 }
@@ -69,28 +69,40 @@ show_status() {
 
     local svc_st svc_col svc_en wan tso_val qlen fwd gre_list
 
-    svc_st=$(systemctl is-active "${SERVICE_NAME}" 2>/dev/null || echo "inactive")
-    svc_en=$(systemctl is-enabled "${SERVICE_NAME}" 2>/dev/null || echo "disabled")
-    if [ "$svc_st" = "active" ]; then svc_col="${GREEN}"; else svc_col="${RED}"; fi
+    if systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null; then
+        svc_st="active"
+        svc_col="${GREEN}"
+    else
+        svc_st="inactive"
+        svc_col="${RED}"
+    fi
+
+    if systemctl is-enabled --quiet "${SERVICE_NAME}" 2>/dev/null; then
+        svc_en="enabled"
+    else
+        svc_en="disabled"
+    fi
     echo -e "  ${MAGENTA}Systemd Service:${NC}  ${svc_col}${BOLD}${svc_st}${NC}  (${svc_en})"
 
     wan=$(detect_wan)
     echo -e "  ${MAGENTA}WAN Interface:${NC}    ${BOLD}${wan}${NC}"
 
-    echo -n "  ${MAGENTA}MSS Clamping:${NC}     "
+    local mss_status
     if nft list table ip "${NFT_TABLE}" &>/dev/null 2>&1; then
-        echo -e "${GREEN}${BOLD}ACTIVE${NC}  (table: ${NFT_TABLE})"
+        mss_status="${GREEN}${BOLD}ACTIVE${NC}  (table: ${NFT_TABLE})"
     else
-        echo -e "${RED}${BOLD}NOT ACTIVE${NC}"
+        mss_status="${RED}${BOLD}NOT ACTIVE${NC}"
     fi
+    echo -e "  ${MAGENTA}MSS Clamping:${NC}     ${mss_status}"
 
-    echo -n "  ${MAGENTA}TSO Offload:${NC}      "
+    local tso_status
     tso_val=$(ethtool -k "${wan}" 2>/dev/null | awk '/tcp-segmentation-offload/ {print $2; exit}')
     if [ "$tso_val" = "off" ]; then
-        echo -e "${GREEN}${BOLD}DISABLED${NC}  (optimal for tunnels)"
+        tso_status="${GREEN}${BOLD}DISABLED${NC}  (optimal for tunnels)"
     else
-        echo -e "${YELLOW}${BOLD}ENABLED${NC}  (may cause fragmentation with GRE)"
+        tso_status="${YELLOW}${BOLD}ENABLED${NC}  (may cause fragmentation with GRE)"
     fi
+    echo -e "  ${MAGENTA}TSO Offload:${NC}      ${tso_status}"
 
     qlen=$(ip link show "${wan}" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="qlen") print $(i+1)}')
     echo -e "  ${MAGENTA}TX Queue Len:${NC}     ${BOLD}${qlen:-unknown}${NC}"
