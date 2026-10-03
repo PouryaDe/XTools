@@ -1487,11 +1487,18 @@ do_delete() {
 
     echo ""
     echo -e " ${RED}${BOLD}This will permanently delete Tunnel ${tid} (${tun_if}) and ALL its components.${NC}"
-    read -p "  Type 'DELETE' to confirm: " confirm
-    if [ "$confirm" != "DELETE" ]; then
-        msg_warn "Cancelled."
-        return
-    fi
+    echo -e "  ${GREEN}1)${NC} Yes, delete Tunnel ${tid} (y)"
+    echo -e "  ${RED}2)${NC} Cancel (n)"
+    echo ""
+    read -p "  Confirm deletion [1/y to delete, 2/n to cancel]: " confirm
+    case "$confirm" in
+        1|[yY]|[yY][eE][sS]|DELETE|delete)
+            ;;
+        *)
+            msg_warn "Cancelled."
+            return
+            ;;
+    esac
 
     msg_info "Completely deleting Tunnel ${tid} (${tun_if})..."
 
