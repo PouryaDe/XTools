@@ -2,9 +2,12 @@
 
 # ╔════════════════════════════════════════════════════════════════╗
 # ║  FAKETCP / PHANTUN TUNNEL (Anti-UDP Throttling Engine)        ║
+# ║  Version: 2.1.0                                                ║
 # ║  Iran & Kharej Multi-Tunnel with Stateless IP Spoofing        ║
 # ║  Converts UDP into High-Speed Fake TCP • Bypasses QoS/Limits   ║
 # ╚════════════════════════════════════════════════════════════════╝
+
+VERSION="2.1.0"
 
 # ─── Colors ───────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -27,6 +30,7 @@ print_header() {
     echo -e "${CYAN}${BOLD}"
     echo " ╔════════════════════════════════════════════════╗"
     echo " ║     FAKETCP / PHANTUN HIGH-SPEED TUNNEL       ║"
+    echo " ║                  v${VERSION}                        ║"
     echo " ╚════════════════════════════════════════════════╝"
     echo -e "${NC}"
 }
@@ -633,9 +637,10 @@ show_phantun_review() {
     local role="$1"
     echo ""
     print_double_line
-    echo -e " ${WHITE}${BOLD}  REVIEW YOUR FAKETCP / PHANTUN SETTINGS${NC}"
+    echo -e " ${WHITE}${BOLD}  REVIEW YOUR FAKETCP / PHANTUN SETTINGS (v${VERSION})${NC}"
     print_double_line
     echo ""
+    echo -e "  ${MAGENTA}Version:${NC}         ${WHITE}${BOLD}v${VERSION}${NC}"
     echo -e "  ${MAGENTA}Tunnel ID:${NC}       ${WHITE}${BOLD}${TUNNEL_ID}${NC}"
     echo -e "  ${MAGENTA}Role:${NC}            ${WHITE}${BOLD}${role}${NC}"
     echo -e "  ${MAGENTA}Interface:${NC}       ${WHITE}${BOLD}${IF_WAN}${NC}  ${DIM}(auto-detected)${NC}"
@@ -1698,5 +1703,10 @@ main_menu() {
 }
 
 # ─── Entry Point ──────────────────────────────────────────────────
+if [ "${1:-}" = "-v" ] || [ "${1:-}" = "--version" ] || [ "${1:-}" = "version" ]; then
+    echo "FakeTCP / Phantun Tunnel Engine v${VERSION}"
+    exit 0
+fi
+
 check_root
 main_menu
