@@ -15,7 +15,7 @@
 set -e
 
 # --- Script Version ---
-VERSION="1.1.0"
+VERSION="1.2.0"
 
 # --- Configuration & Paths ---
 CONF_DIR="/etc/wg-limiter"
@@ -189,6 +189,11 @@ get_active_nft_ports() {
 }
 
 # --- Initialize or Rebuild NFTables Rules ---
+# IMPORTANT: This function deletes and fully recreates the table on every call.
+# Named meters in nftables persist even after 'nft flush chain' or 'nft delete chain'.
+# The ONLY reliable way to destroy stale meter state is to delete the entire table.
+# Stale meter buckets from a previous deployment would continue dropping packets
+# even when the actual traffic rate is far below the configured limit.
 apply_nft_rules() {
     load_config
 
@@ -203,10 +208,13 @@ apply_nft_rules() {
         BURST_KB=2048
     fi
 
-    local dl_rate_kb=$(( DL_MBIT * 1000 / 8 ))
-    local ul_rate_kb=$(( UL_MBIT * 1000 / 8 ))
+    local dl_rate_kb
+    local ul_rate_kb
+    dl_rate_kb=$(( DL_MBIT * 1000 / 8 ))
+    ul_rate_kb=$(( UL_MBIT * 1000 / 8 ))
 
-    # Ensure burst buffer is at least 2048 KB or equal to full 1-second rate to prevent TCP sawtooth collapse
+    # Burst must be at least 1 full second of rate or 2048 KB, whichever is larger.
+    # This prevents TCP sawtooth collapse on bursty WireGuard UDP flows.
     local dl_burst_kb=$BURST_KB
     local ul_burst_kb=$BURST_KB
     if [ "$dl_burst_kb" -lt "$dl_rate_kb" ]; then dl_burst_kb=$dl_rate_kb; fi
@@ -214,29 +222,54 @@ apply_nft_rules() {
     if [ "$dl_burst_kb" -lt 2048 ]; then dl_burst_kb=2048; fi
     if [ "$ul_burst_kb" -lt 2048 ]; then ul_burst_kb=2048; fi
 
-    # 1. Ensure table and set exist
-    nft add table ${TABLE_FAMILY} ${TABLE_NAME} 2>/dev/null || true
-    nft add set ${TABLE_FAMILY} ${TABLE_NAME} ${SET_NAME} '{ type inet_service; flags interval; }' 2>/dev/null || true
+    # Step 1: Atomically destroy old table (and all meters inside it) then recreate.
+    nft delete table ${TABLE_FAMILY} ${TABLE_NAME} 2>/dev/null || true
+    nft add table ${TABLE_FAMILY} ${TABLE_NAME}
+    nft add set ${TABLE_FAMILY} ${TABLE_NAME} ${SET_NAME} '{ type inet_service; flags interval; }'
 
-    # 2. Upload filter chain (Client -> Server: client upload)
-    nft add chain ${TABLE_FAMILY} ${TABLE_NAME} wg_upload '{ type filter hook prerouting priority filter; policy accept; }' 2>/dev/null || true
-    nft flush chain ${TABLE_FAMILY} ${TABLE_NAME} wg_upload 2>/dev/null || true
-    nft add rule ${TABLE_FAMILY} ${TABLE_NAME} wg_upload iifname "${WAN_IF}" udp dport @${SET_NAME} meter wg_ul_meter size 65535 "{ udp dport limit rate over ${ul_rate_kb} kbytes/second burst ${ul_burst_kb} kbytes }" drop
+    # Step 2: Upload chain -- client upload = UDP arriving on WAN destined to WG port.
+    nft add chain ${TABLE_FAMILY} ${TABLE_NAME} wg_upload \
+        '{ type filter hook prerouting priority filter; policy accept; }'
+    nft add rule ${TABLE_FAMILY} ${TABLE_NAME} wg_upload \
+        iifname "${WAN_IF}" udp dport @${SET_NAME} \
+        meter wg_ul_meter size 65535 \
+        "{ udp dport limit rate over ${ul_rate_kb} kbytes/second burst ${ul_burst_kb} kbytes }" drop
 
-    # 3. Download filter chain (Server -> Client: client download)
-    nft add chain ${TABLE_FAMILY} ${TABLE_NAME} wg_download '{ type filter hook postrouting priority filter; policy accept; }' 2>/dev/null || true
-    nft flush chain ${TABLE_FAMILY} ${TABLE_NAME} wg_download 2>/dev/null || true
-    nft add rule ${TABLE_FAMILY} ${TABLE_NAME} wg_download oifname "${WAN_IF}" udp sport @${SET_NAME} meter wg_dl_meter size 65535 "{ udp sport limit rate over ${dl_rate_kb} kbytes/second burst ${dl_burst_kb} kbytes }" drop
+    # Step 3: Download chain -- client download = UDP leaving on WAN sourced from WG port.
+    nft add chain ${TABLE_FAMILY} ${TABLE_NAME} wg_download \
+        '{ type filter hook postrouting priority filter; policy accept; }'
+    nft add rule ${TABLE_FAMILY} ${TABLE_NAME} wg_download \
+        oifname "${WAN_IF}" udp sport @${SET_NAME} \
+        meter wg_dl_meter size 65535 \
+        "{ udp sport limit rate over ${dl_rate_kb} kbytes/second burst ${dl_burst_kb} kbytes }" drop
+
+    # Step 4: Immediately re-populate ports from DB so the set is never left empty
+    # after a rebuild (important when called from action_change_limits or self-healing).
+    local db_ports
+    db_ports=$(get_active_db_ports)
+    if [ -n "$db_ports" ]; then
+        local ports_csv
+        ports_csv=$(echo "$db_ports" | tr '\n' ',' | sed 's/,$//')
+        if [ -n "$ports_csv" ]; then
+            nft add element ${TABLE_FAMILY} ${TABLE_NAME} ${SET_NAME} "{ $ports_csv }" 2>/dev/null || true
+        fi
+    fi
 }
 
 # --- Sync Ports Between 3x-ui DB and NFTables Set ---
 sync_ports() {
     load_config
 
-    # Self-healing: restore table and rules if missing
+    # Self-healing: if the table is gone (e.g., after nftables service restart),
+    # call apply_nft_rules which rebuilds the table AND re-populates all ports,
+    # then return early -- no incremental diff needed.
     if ! is_limiter_active; then
         log_event "WARN" "NFTables table ${TABLE_NAME} was missing. Rebuilding ruleset..."
         apply_nft_rules
+        local total_restored
+        total_restored=$(get_active_nft_ports | wc -l)
+        log_event "OK" "Ruleset rebuilt. ${total_restored} active WireGuard ports restored from database."
+        return 0
     fi
 
     local db_ports
