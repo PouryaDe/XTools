@@ -176,6 +176,66 @@ install_prereqs() {
     msg_ok "All prerequisites verified."
 }
 
+# ─── Persist System Tuning across Reboots ─────────────────────────
+persist_sysctl_tuning() {
+    cat > /etc/sysctl.d/99-xmanager-tunnel.conf << 'EOF'
+# XManager High-Speed Kernel & Network Tuning
+net.ipv4.ip_forward = 1
+net.ipv4.conf.all.rp_filter = 0
+net.ipv4.conf.default.rp_filter = 0
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+net.ipv4.conf.default.accept_source_route = 0
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.icmp_ignore_bogus_error_responses = 1
+net.ipv4.tcp_syncookies = 1
+
+# TCP BBR & Queue Discipline
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_mtu_probing = 1
+
+# High-Performance Buffer Sizes
+net.core.rmem_default = 262144
+net.core.wmem_default = 262144
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.core.optmem_max = 2097152
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+net.ipv4.udp_rmem_min = 16384
+net.ipv4.udp_wmem_min = 16384
+net.ipv4.tcp_adv_win_scale = 1
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_notsent_lowat = 16384
+net.ipv4.tcp_autocorking = 0
+net.ipv4.ipfrag_high_thresh = 16777216
+net.ipv4.ipfrag_low_thresh = 8388608
+net.ipv4.ipfrag_time = 30
+net.core.netdev_max_backlog = 100000
+net.core.netdev_budget = 600
+net.core.netdev_budget_usecs = 8000
+
+# Connection Scalability & Limits
+fs.file-max = 2097152
+fs.nr_open = 2097152
+net.core.somaxconn = 100000
+net.ipv4.tcp_max_syn_backlog = 100000
+net.ipv4.ip_local_port_range = 1024 65535
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_keepalive_time = 120
+net.ipv4.tcp_keepalive_intvl = 10
+net.ipv4.tcp_keepalive_probes = 3
+net.netfilter.nf_conntrack_max = 2097152
+EOF
+    sysctl -p /etc/sysctl.d/99-xmanager-tunnel.conf >/dev/null 2>&1 || true
+}
+
 # ─── Generate IPIP-UP Script ─────────────────────────────────────
 generate_ipip_up() {
     local script_path="$1"
@@ -197,6 +257,9 @@ FOU_ENABLE="${FOU_ENABLE}"
 FOU_PORT="${FOU_PORT}"
 
 NFT_TABLE="fw_ipip_${TUNNEL_ID}"
+
+# ── Reload persistent sysctl config ──
+sysctl -p /etc/sysctl.d/99-xmanager-tunnel.conf >/dev/null 2>&1 || true
 
 # ── Security: Disable rp_filter across all interfaces (Prevent Spoofed Packet Drops) ──
 sysctl -w net.ipv4.conf.all.rp_filter=0     >/dev/null 2>&1 || true
@@ -302,7 +365,8 @@ ip link set \${TUN_IF} txqueuelen 10000
 ip link set \${TUN_IF} up
 ip link set dev \${IF_WAN} txqueuelen 10000 2>/dev/null || true
 
-# Disable hardware offload on tunnel to prevent softirq CPU spikes
+# Disable hardware offloads on WAN and tunnel to prevent corrupted frames and softirq spikes
+ethtool -K \${IF_WAN} tso off gso off gro off 2>/dev/null || true
 ethtool -K \${TUN_IF} tso off gso off gro off 2>/dev/null || true
 
 # Route advmss tuning: forces local sockets to clamp MSS automatically
@@ -592,7 +656,8 @@ show_ipip_review() {
     echo -e "    ${GREEN}✓${NC} Adaptive Low-Latency Buffers (No Bufferbloat)"
     echo -e "    ${GREEN}✓${NC} MSS Clamping (Forward & Output Hooks: ${show_mtu}-40)"
     echo -e "    ${GREEN}✓${NC} Route advmss Tuning (Zero Packet Fragmentation for Nginx/Xray)"
-    echo -e "    ${GREEN}✓${NC} NIC TSO/GSO Offload Protection (SoftIRQ Spike Prevention)"
+    echo -e "    ${GREEN}✓${NC} WAN & Tunnel TSO/GSO/GRO Offload Protection (Zero Throttling on ens33/eth0)"
+    echo -e "    ${GREEN}✓${NC} Persistent Kernel Tuning on Boot (/etc/sysctl.d/99-xmanager-tunnel.conf)"
     echo -e "    ${GREEN}✓${NC} Continuous Keep-Alive & Active Watchdog (every 10s)"
     echo ""
     echo -e "  ${CYAN}nftables Table:${NC} ${WHITE}fw_ipip_${TUNNEL_ID}${NC}"
@@ -691,6 +756,9 @@ setup_ipip_server() {
     local up_script="${SCRIPTS_DIR}/ipip${TUNNEL_ID}-up.sh"
     local down_script="${SCRIPTS_DIR}/ipip${TUNNEL_ID}-down.sh"
     local service_name="ipip-tunnel-${TUNNEL_ID}"
+
+    persist_sysctl_tuning
+    msg_ok "Persistent network tuning applied: /etc/sysctl.d/99-xmanager-tunnel.conf"
 
     generate_ipip_up "${up_script}"
     msg_ok "Up script created: ${up_script}"
