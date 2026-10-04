@@ -2,12 +2,12 @@
 
 # ╔════════════════════════════════════════════════════════════════╗
 # ║  FAKETCP / PHANTUN TUNNEL (Anti-UDP Throttling Engine)        ║
-# ║  Version: 2.1.0                                                ║
+# ║  Version: 2.1.1                                                ║
 # ║  Iran & Kharej Multi-Tunnel with Stateless IP Spoofing        ║
 # ║  Converts UDP into High-Speed Fake TCP • Bypasses QoS/Limits   ║
 # ╚════════════════════════════════════════════════════════════════╝
 
-VERSION="2.1.0"
+VERSION="2.1.1"
 
 # ─── Colors ───────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -221,6 +221,9 @@ install_prereqs() {
 # ─── Generate Phantun Service & Scripts ───────────────────────────
 generate_phantun_up() {
     local script_path="$1" role="$2"
+    local cli_port=$(( 50000 + TUNNEL_ID ))
+    local fou_port=$(( 51000 + TUNNEL_ID ))
+    local srv_port=$(( 52000 + TUNNEL_ID ))
     cat > "${script_path}" << PHANEOF
 #!/usr/bin/env bash
 set -eu
@@ -239,9 +242,9 @@ REMOTE_SPOOF="${REMOTE_SPOOF}"
 LOCAL_TUN="${LOCAL_TUN}"
 FAKE_PORT="${FAKE_PORT}"
 
-CLI_PORT=\$(( 50000 + ${TUNNEL_ID} ))
-FOU_PORT=\$(( 51000 + ${TUNNEL_ID} ))
-SRV_PORT=\$(( 52000 + ${TUNNEL_ID} ))
+CLI_PORT="${cli_port}"
+FOU_PORT="${fou_port}"
+SRV_PORT="${srv_port}"
 PTUN_DEV="ptun${TUNNEL_ID}"
 
 NFT_TABLE="fw_ftcp_${TUNNEL_ID}"
@@ -339,10 +342,10 @@ else
 import socket, select, sys
 
 s_phan = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-s_phan.bind(('127.0.0.1', ${CLI_PORT}))
+s_phan.bind(('127.0.0.1', ${cli_port}))
 
 s_fou = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-s_fou.bind(('127.0.0.1', ${SRV_PORT}))
+s_fou.bind(('127.0.0.1', ${srv_port}))
 
 last_addr = None
 while True:
@@ -351,7 +354,7 @@ while True:
         if s_phan in r:
             data, addr = s_phan.recvfrom(65535)
             last_addr = addr
-            s_fou.sendto(data, ('127.0.0.1', ${FOU_PORT}))
+            s_fou.sendto(data, ('127.0.0.1', ${fou_port}))
         if s_fou in r:
             data, _ = s_fou.recvfrom(65535)
             if last_addr:
@@ -435,13 +438,15 @@ PHANEOF
 # ─── Generate Phantun DOWN Script ────────────────────────────────
 generate_phantun_down() {
     local script_path="$1"
+    local cli_port=$(( 50000 + TUNNEL_ID ))
+    local fou_port=$(( 51000 + TUNNEL_ID ))
     cat > "${script_path}" << PHANEOF
 #!/usr/bin/env bash
 TUN_IF="${TUN_IF}"
 TUNNEL_ID="${TUNNEL_ID}"
 FAKE_PORT="${FAKE_PORT}"
-CLI_PORT=\$(( 50000 + TUNNEL_ID ))
-FOU_PORT=\$(( 51000 + TUNNEL_ID ))
+CLI_PORT="${cli_port}"
+FOU_PORT="${fou_port}"
 NFT_TABLE="fw_ftcp_${TUNNEL_ID}"
 PID_FILE="/tmp/.phantun_${TUNNEL_ID}.pid"
 BRIDGE_PID="/tmp/.phantun_${TUNNEL_ID}_bridge.pid"
