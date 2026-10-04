@@ -15,7 +15,7 @@
 set -e
 
 # --- Script Version ---
-VERSION="1.2.0"
+VERSION="1.3.0"
 
 # --- Configuration & Paths ---
 CONF_DIR="/etc/wg-limiter"
@@ -188,12 +188,12 @@ get_active_nft_ports() {
         sort -u || true
 }
 
-# --- Initialize or Rebuild NFTables Rules ---
-# IMPORTANT: This function deletes and fully recreates the table on every call.
-# Named meters in nftables persist even after 'nft flush chain' or 'nft delete chain'.
-# The ONLY reliable way to destroy stale meter state is to delete the entire table.
-# Stale meter buckets from a previous deployment would continue dropping packets
-# even when the actual traffic rate is far below the configured limit.
+# --- Initialize or Rebuild NFTables Rules (Atomic via nft -f) ---
+# IMPORTANT: This function deletes the old table on every call to destroy stale meter
+# state. Named meters persist in the kernel until the entire table is deleted; flushing
+# individual chains is NOT sufficient. The new table is then created in a single atomic
+# kernel transaction using 'nft -f', eliminating the multi-step gap where WireGuard
+# traffic could pass without active shaping rules.
 apply_nft_rules() {
     load_config
 
@@ -210,8 +210,10 @@ apply_nft_rules() {
 
     local dl_rate_kb
     local ul_rate_kb
-    dl_rate_kb=$(( DL_MBIT * 1000 / 8 ))
-    ul_rate_kb=$(( UL_MBIT * 1000 / 8 ))
+    # 1 Mbit/s = 125 KB/s (1,000,000 bps / 8 / 1000). Using *125 avoids
+    # integer truncation from the two-step division (* 1000 / 8).
+    dl_rate_kb=$(( DL_MBIT * 125 ))
+    ul_rate_kb=$(( UL_MBIT * 125 ))
 
     # Burst must be at least 1 full second of rate or 2048 KB, whichever is larger.
     # This prevents TCP sawtooth collapse on bursty WireGuard UDP flows.
@@ -222,28 +224,42 @@ apply_nft_rules() {
     if [ "$dl_burst_kb" -lt 2048 ]; then dl_burst_kb=2048; fi
     if [ "$ul_burst_kb" -lt 2048 ]; then ul_burst_kb=2048; fi
 
-    # Step 1: Atomically destroy old table (and all meters inside it) then recreate.
+    # Write the complete table definition to a temp file.
+    # NOTE: The meter keys on udp dport (per inbound port). In 3x-ui each WireGuard
+    # inbound is a unique port, so this equals per-inbound shaping. If multiple peers
+    # share one port they share the same token bucket.
+    local tmpfile
+    tmpfile=$(mktemp /tmp/wg-limiter-XXXXXX.nft)
+
+    cat > "$tmpfile" << EOF
+table ${TABLE_FAMILY} ${TABLE_NAME} {
+    set ${SET_NAME} {
+        type inet_service
+        flags interval
+    }
+    chain wg_upload {
+        type filter hook prerouting priority filter; policy accept;
+        iifname "${WAN_IF}" udp dport @${SET_NAME} meter wg_ul_meter size 65535 { udp dport limit rate over ${ul_rate_kb} kbytes/second burst ${ul_burst_kb} kbytes } drop
+    }
+    chain wg_download {
+        type filter hook postrouting priority filter; policy accept;
+        oifname "${WAN_IF}" udp sport @${SET_NAME} meter wg_dl_meter size 65535 { udp sport limit rate over ${dl_rate_kb} kbytes/second burst ${dl_burst_kb} kbytes } drop
+    }
+}
+EOF
+
+    # Step 1: Destroy old table to purge all stale meter state.
+    # Named meters persist until the entire table is deleted -- flushing chains
+    # alone is NOT sufficient to reset token bucket counters.
     nft delete table ${TABLE_FAMILY} ${TABLE_NAME} 2>/dev/null || true
-    nft add table ${TABLE_FAMILY} ${TABLE_NAME}
-    nft add set ${TABLE_FAMILY} ${TABLE_NAME} ${SET_NAME} '{ type inet_service; flags interval; }'
 
-    # Step 2: Upload chain -- client upload = UDP arriving on WAN destined to WG port.
-    nft add chain ${TABLE_FAMILY} ${TABLE_NAME} wg_upload \
-        '{ type filter hook prerouting priority filter; policy accept; }'
-    nft add rule ${TABLE_FAMILY} ${TABLE_NAME} wg_upload \
-        iifname "${WAN_IF}" udp dport @${SET_NAME} \
-        meter wg_ul_meter size 65535 \
-        "{ udp dport limit rate over ${ul_rate_kb} kbytes/second burst ${ul_burst_kb} kbytes }" drop
+    # Step 2: Apply the complete table in a single kernel transaction.
+    # 'nft -f' commits the entire ruleset atomically, so there is zero window
+    # between table teardown and reinstatement where traffic bypasses shaping.
+    nft -f "$tmpfile"
+    rm -f "$tmpfile"
 
-    # Step 3: Download chain -- client download = UDP leaving on WAN sourced from WG port.
-    nft add chain ${TABLE_FAMILY} ${TABLE_NAME} wg_download \
-        '{ type filter hook postrouting priority filter; policy accept; }'
-    nft add rule ${TABLE_FAMILY} ${TABLE_NAME} wg_download \
-        oifname "${WAN_IF}" udp sport @${SET_NAME} \
-        meter wg_dl_meter size 65535 \
-        "{ udp sport limit rate over ${dl_rate_kb} kbytes/second burst ${dl_burst_kb} kbytes }" drop
-
-    # Step 4: Immediately re-populate ports from DB so the set is never left empty
+    # Step 3: Immediately re-populate ports from DB so the set is never left empty
     # after a rebuild (important when called from action_change_limits or self-healing).
     local db_ports
     db_ports=$(get_active_db_ports)
@@ -284,11 +300,12 @@ sync_ports() {
     local nft_ports
     nft_ports=$(get_active_nft_ports)
 
-    # Compute added and removed ports using awk (immune to sort order discrepancies)
+    # Compute added and removed ports using comm (POSIX-safe, works inside containers
+    # where /dev/fd may be unavailable and <() process substitution can silently fail).
     local added_ports
     local removed_ports
-    added_ports=$(awk 'NR==FNR{nft[$1];next} !($1 in nft)' <(echo "$nft_ports") <(echo "$db_ports"))
-    removed_ports=$(awk 'NR==FNR{db[$1];next} !($1 in db)' <(echo "$db_ports") <(echo "$nft_ports"))
+    added_ports=$(comm -13 <(echo "$nft_ports" | sort -n) <(echo "$db_ports" | sort -n))
+    removed_ports=$(comm -23 <(echo "$nft_ports" | sort -n) <(echo "$db_ports" | sort -n))
 
     local add_count=0
     local del_count=0
@@ -652,9 +669,9 @@ cli_dispatch() {
 main_menu() {
     while true; do
         load_config
-        local is_act="${RED}Inactive [Inactive]${NC}"
+        local is_act="${RED}[Inactive]${NC}"
         if is_limiter_active; then
-            is_act="${GREEN}Active [Active]${NC}"
+            is_act="${GREEN}[Active]${NC}"
         fi
 
         local p_cnt=0
