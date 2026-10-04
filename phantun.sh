@@ -240,14 +240,14 @@ net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 net.ipv4.tcp_mtu_probing = 1
 
-# High-Performance Buffer Sizes
+# High-Performance Buffer Sizes (32MB Max)
 net.core.rmem_default = 262144
 net.core.wmem_default = 262144
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
+net.core.rmem_max = 33554432
+net.core.wmem_max = 33554432
 net.core.optmem_max = 2097152
-net.ipv4.tcp_rmem = 4096 87380 16777216
-net.ipv4.tcp_wmem = 4096 65536 16777216
+net.ipv4.tcp_rmem = 4096 87380 33554432
+net.ipv4.tcp_wmem = 4096 65536 33554432
 net.ipv4.udp_rmem_min = 16384
 net.ipv4.udp_wmem_min = 16384
 net.ipv4.tcp_adv_win_scale = 1
@@ -351,11 +351,11 @@ sysctl -w net.ipv4.tcp_mtu_probing=1           >/dev/null 2>&1 || true
 
 sysctl -w net.core.rmem_default=262144         >/dev/null 2>&1 || true
 sysctl -w net.core.wmem_default=262144         >/dev/null 2>&1 || true
-sysctl -w net.core.rmem_max=16777216           >/dev/null 2>&1 || true
-sysctl -w net.core.wmem_max=16777216           >/dev/null 2>&1 || true
+sysctl -w net.core.rmem_max=33554432           >/dev/null 2>&1 || true
+sysctl -w net.core.wmem_max=33554432           >/dev/null 2>&1 || true
 sysctl -w net.core.optmem_max=2097152          >/dev/null 2>&1 || true
-sysctl -w net.ipv4.tcp_rmem="4096 87380 16777216" >/dev/null 2>&1 || true
-sysctl -w net.ipv4.tcp_wmem="4096 65536 16777216" >/dev/null 2>&1 || true
+sysctl -w net.ipv4.tcp_rmem="4096 87380 33554432" >/dev/null 2>&1 || true
+sysctl -w net.ipv4.tcp_wmem="4096 65536 33554432" >/dev/null 2>&1 || true
 sysctl -w net.ipv4.udp_rmem_min=8192           >/dev/null 2>&1 || true
 sysctl -w net.ipv4.udp_wmem_min=8192           >/dev/null 2>&1 || true
 
@@ -468,6 +468,8 @@ ip addr replace \${LOCAL_TUN} dev \${TUN_IF} 2>/dev/null || ip addr add \${LOCAL
 ip link set \${TUN_IF} mtu \${MTU}
 ip link set \${TUN_IF} txqueuelen 10000
 ip link set \${TUN_IF} up
+# Network card ring buffer & queue tuning to prevent burst packet drops
+ethtool -G \${IF_WAN} rx 4096 tx 4096 2>/dev/null || ethtool -G \${IF_WAN} rx 2048 tx 2048 2>/dev/null || true
 ip link set dev \${IF_WAN} txqueuelen 10000 2>/dev/null || true
 
 # Disable hardware offloads on WAN and tunnel to prevent corrupted frames and softirq spikes
@@ -775,7 +777,8 @@ show_phantun_review() {
     echo -e "    ${GREEN}✓${NC} Anti-RST Kernel Protection (NFTables input drop)"
     echo -e "    ${GREEN}✓${NC} Tokio Async Multi-Threaded Engine (Ultra-low CPU usage)"
     echo -e "    ${GREEN}✓${NC} BBR Congestion Control + FQ Qdisc"
-    echo -e "    ${GREEN}✓${NC} WAN & Tunnel TSO/GSO/GRO Offload Protection (Zero Throttling on ens33/eth0)"
+    echo -e "    ${GREEN}✓${NC} 32MB High-Throughput Adaptive TCP Buffers (rmem/wmem)"
+    echo -e "    ${GREEN}✓${NC} NIC Ring Buffer (4096) & WAN/Tunnel TSO Offload Protection"
     echo -e "    ${GREEN}✓${NC} Persistent Kernel Tuning on Boot (/etc/sysctl.d/99-xmanager-tunnel.conf)"
     echo -e "    ${GREEN}✓${NC} Continuous Keep-Alive & Active Watchdog (every 10s)"
     echo ""
