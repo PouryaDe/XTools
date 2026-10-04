@@ -285,12 +285,33 @@ sync_ports() {
 install_systemd_units() {
     load_config
 
-    # Canonical script source path
-    local script_src
-    script_src=$(realpath "$0" 2>/dev/null || readlink -f "$0" || echo "$0")
-    if [ "$script_src" != "$INSTALL_BIN" ]; then
-        cp -f "$script_src" "$INSTALL_BIN"
-        chmod +x "$INSTALL_BIN"
+    # Canonical script source path (safely handle pipes and subshells)
+    local script_src=""
+    if [ -n "${BASH_SOURCE[0]}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
+        script_src=$(realpath "${BASH_SOURCE[0]}" 2>/dev/null || readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")
+    elif [ -n "$0" ] && [ -f "$0" ]; then
+        script_src=$(realpath "$0" 2>/dev/null || readlink -f "$0" 2>/dev/null || echo "$0")
+    fi
+
+    if [ -n "$script_src" ] && [ -f "$script_src" ]; then
+        if [ "$script_src" != "$INSTALL_BIN" ]; then
+            cp -f "$script_src" "$INSTALL_BIN" 2>/dev/null || true
+            chmod +x "$INSTALL_BIN" 2>/dev/null || true
+        fi
+    elif [ ! -f "$INSTALL_BIN" ]; then
+        # Search fallback locations if executed via pipe or stdin
+        local candidates=(
+            "/root/wg-limiter.sh"
+            "./Scripts/wg-limiter.sh"
+            "./wg-limiter.sh"
+        )
+        for candidate in "${candidates[@]}"; do
+            if [ -f "$candidate" ]; then
+                cp -f "$candidate" "$INSTALL_BIN" 2>/dev/null || true
+                chmod +x "$INSTALL_BIN" 2>/dev/null || true
+                break
+            fi
+        done
     fi
 
     # 1. Main Service (runs at boot to restore rules)
