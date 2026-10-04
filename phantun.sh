@@ -2,12 +2,12 @@
 
 # ╔════════════════════════════════════════════════════════════════╗
 # ║  FAKETCP / PHANTUN TUNNEL (Anti-UDP Throttling Engine)        ║
-# ║  Version: 2.1.1                                                ║
+# ║  Version: 2.1.2                                                ║
 # ║  Iran & Kharej Multi-Tunnel with Stateless IP Spoofing        ║
 # ║  Converts UDP into High-Speed Fake TCP • Bypasses QoS/Limits   ║
 # ╚════════════════════════════════════════════════════════════════╝
 
-VERSION="2.1.1"
+VERSION="2.1.2"
 
 # ─── Colors ───────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -315,6 +315,11 @@ pkill -9 -f "phantun_client.*--local.*127.0.0.1:\${CLI_PORT}" 2>/dev/null || tru
 pkill -9 -f "phantun_server.*--local.*[\"']?\${FAKE_PORT}[\"']?" 2>/dev/null || true
 pkill -9 -f "\${BRIDGE_PY}" 2>/dev/null || true
 
+# Force free internal UDP ports from lingering sockets
+fuser -k -9 -n udp \${CLI_PORT} 2>/dev/null || true
+fuser -k -9 -n udp \${FOU_PORT} 2>/dev/null || true
+fuser -k -9 -n udp \${SRV_PORT} 2>/dev/null || true
+
 # ── Setup Kernel Virtual Tunnel Interface (IPIP over Local FOU) ──
 modprobe ipip 2>/dev/null || true
 modprobe fou 2>/dev/null || true
@@ -322,7 +327,12 @@ modprobe fou 2>/dev/null || true
 ip link set dev \${TUN_IF} down 2>/dev/null || true
 ip tunnel del \${TUN_IF} 2>/dev/null || true
 ip link del \${TUN_IF}   2>/dev/null || true
+ip link del \${PTUN_DEV} 2>/dev/null || true
+
+# Clean up all possible kernel FOU ports associated with this tunnel ID
 ip fou del port \${FOU_PORT} 2>/dev/null || true
+ip fou del port \${CLI_PORT} 2>/dev/null || true
+ip fou del port \${SRV_PORT} 2>/dev/null || true
 
 MTU=1380
 MSS=1340
@@ -342,9 +352,19 @@ else
 import socket, select, sys
 
 s_phan = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s_phan.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+try:
+    s_phan.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+except (AttributeError, OSError):
+    pass
 s_phan.bind(('127.0.0.1', ${cli_port}))
 
 s_fou = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s_fou.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+try:
+    s_fou.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+except (AttributeError, OSError):
+    pass
 s_fou.bind(('127.0.0.1', ${srv_port}))
 
 last_addr = None
@@ -440,6 +460,7 @@ generate_phantun_down() {
     local script_path="$1"
     local cli_port=$(( 50000 + TUNNEL_ID ))
     local fou_port=$(( 51000 + TUNNEL_ID ))
+    local srv_port=$(( 52000 + TUNNEL_ID ))
     cat > "${script_path}" << PHANEOF
 #!/usr/bin/env bash
 TUN_IF="${TUN_IF}"
@@ -447,6 +468,7 @@ TUNNEL_ID="${TUNNEL_ID}"
 FAKE_PORT="${FAKE_PORT}"
 CLI_PORT="${cli_port}"
 FOU_PORT="${fou_port}"
+SRV_PORT="${srv_port}"
 NFT_TABLE="fw_ftcp_${TUNNEL_ID}"
 PID_FILE="/tmp/.phantun_${TUNNEL_ID}.pid"
 BRIDGE_PID="/tmp/.phantun_${TUNNEL_ID}_bridge.pid"
@@ -466,12 +488,19 @@ pkill -9 -f "phantun_server.*--local.*[\"']?\${FAKE_PORT}[\"']?" 2>/dev/null || 
 pkill -9 -f "\${BRIDGE_PY}" 2>/dev/null || true
 rm -f "\${BRIDGE_PY}"
 
+fuser -k -9 -n udp \${CLI_PORT} 2>/dev/null || true
+fuser -k -9 -n udp \${FOU_PORT} 2>/dev/null || true
+fuser -k -9 -n udp \${SRV_PORT} 2>/dev/null || true
+
 ip link set dev \${TUN_IF} down 2>/dev/null || true
 ip tunnel del \${TUN_IF} 2>/dev/null || true
 ip link del \${TUN_IF}   2>/dev/null || true
 ip link del ptun\${TUNNEL_ID} 2>/dev/null || true
 nft delete table ip \${NFT_TABLE} 2>/dev/null || true
+
 ip fou del port \${FOU_PORT} 2>/dev/null || true
+ip fou del port \${CLI_PORT} 2>/dev/null || true
+ip fou del port \${SRV_PORT} 2>/dev/null || true
 
 echo "FakeTCP tunnel \${TUN_IF} DOWN"
 PHANEOF
@@ -760,6 +789,21 @@ setup_phantun_server() {
     local up_script="${SCRIPTS_DIR}/ftcp${TUNNEL_ID}-up.sh"
     local down_script="${SCRIPTS_DIR}/ftcp${TUNNEL_ID}-down.sh"
     local service_name="phantun-tunnel-${TUNNEL_ID}"
+
+    # Pre-clean any lingering FOU ports, virtual devices or processes for this TUNNEL_ID
+    ip link set dev "${TUN_IF}" down 2>/dev/null || true
+    ip tunnel del "${TUN_IF}" 2>/dev/null || true
+    ip link del "${TUN_IF}" 2>/dev/null || true
+    ip link del "ptun${TUNNEL_ID}" 2>/dev/null || true
+    ip fou del port $(( 50000 + TUNNEL_ID )) 2>/dev/null || true
+    ip fou del port $(( 51000 + TUNNEL_ID )) 2>/dev/null || true
+    ip fou del port $(( 52000 + TUNNEL_ID )) 2>/dev/null || true
+    fuser -k -9 -n udp $(( 50000 + TUNNEL_ID )) 2>/dev/null || true
+    fuser -k -9 -n udp $(( 51000 + TUNNEL_ID )) 2>/dev/null || true
+    fuser -k -9 -n udp $(( 52000 + TUNNEL_ID )) 2>/dev/null || true
+    pkill -9 -f "phantun_client.*--local.*127.0.0.1:$(( 50000 + TUNNEL_ID ))" 2>/dev/null || true
+    pkill -9 -f "ftcp${TUNNEL_ID}-bridge.py" 2>/dev/null || true
+    rm -f "${SCRIPTS_DIR}/ftcp${TUNNEL_ID}-bridge.py"
 
     generate_phantun_up "${up_script}" "${role}"
     msg_ok "Up script created: ${up_script}"
@@ -1580,7 +1624,18 @@ do_delete() {
     ip link set dev "${tun_if}" down 2>/dev/null || true
     ip tunnel del "${tun_if}" 2>/dev/null || true
     ip link del "${tun_if}" 2>/dev/null || true
+    ip link del "ptun${tid}" 2>/dev/null || true
     nft delete table ip "fw_ftcp_${tid}" 2>/dev/null || true
+
+    ip fou del port $(( 50000 + tid )) 2>/dev/null || true
+    ip fou del port $(( 51000 + tid )) 2>/dev/null || true
+    ip fou del port $(( 52000 + tid )) 2>/dev/null || true
+
+    fuser -k -9 -n udp $(( 50000 + tid )) 2>/dev/null || true
+    fuser -k -9 -n udp $(( 51000 + tid )) 2>/dev/null || true
+    fuser -k -9 -n udp $(( 52000 + tid )) 2>/dev/null || true
+    pkill -9 -f "ftcp${tid}-bridge.py" 2>/dev/null || true
+    rm -f "${SCRIPTS_DIR}/ftcp${tid}-bridge.py"
 
     # 6. Remove files
     rm -f "${SYSTEMD_DIR}/${svc_name}.service"
