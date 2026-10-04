@@ -14,6 +14,9 @@
 
 set -e
 
+# --- Script Version ---
+VERSION="1.1.0"
+
 # --- Configuration & Paths ---
 CONF_DIR="/etc/wg-limiter"
 CONF_FILE="${CONF_DIR}/wg-limiter.conf"
@@ -107,7 +110,7 @@ load_config() {
         DB_PATH=$(detect_db_path)
         DL_MBIT=16
         UL_MBIT=16
-        BURST_KB=256
+        BURST_KB=2048
         SYNC_INTERVAL=10
         save_config
     fi
@@ -197,11 +200,19 @@ apply_nft_rules() {
         UL_MBIT=16
     fi
     if [[ ! "$BURST_KB" =~ ^[0-9]+$ ]] || [ "$BURST_KB" -le 0 ]; then
-        BURST_KB=256
+        BURST_KB=2048
     fi
 
     local dl_rate_kb=$(( DL_MBIT * 1000 / 8 ))
     local ul_rate_kb=$(( UL_MBIT * 1000 / 8 ))
+
+    # Ensure burst buffer is at least 2048 KB or equal to full 1-second rate to prevent TCP sawtooth collapse
+    local dl_burst_kb=$BURST_KB
+    local ul_burst_kb=$BURST_KB
+    if [ "$dl_burst_kb" -lt "$dl_rate_kb" ]; then dl_burst_kb=$dl_rate_kb; fi
+    if [ "$ul_burst_kb" -lt "$ul_rate_kb" ]; then ul_burst_kb=$ul_rate_kb; fi
+    if [ "$dl_burst_kb" -lt 2048 ]; then dl_burst_kb=2048; fi
+    if [ "$ul_burst_kb" -lt 2048 ]; then ul_burst_kb=2048; fi
 
     # 1. Ensure table and set exist
     nft add table ${TABLE_FAMILY} ${TABLE_NAME} 2>/dev/null || true
@@ -210,12 +221,12 @@ apply_nft_rules() {
     # 2. Upload filter chain (Client -> Server: client upload)
     nft add chain ${TABLE_FAMILY} ${TABLE_NAME} wg_upload '{ type filter hook prerouting priority filter; policy accept; }' 2>/dev/null || true
     nft flush chain ${TABLE_FAMILY} ${TABLE_NAME} wg_upload 2>/dev/null || true
-    nft add rule ${TABLE_FAMILY} ${TABLE_NAME} wg_upload iifname "${WAN_IF}" udp dport @${SET_NAME} meter wg_ul_meter size 65535 "{ udp dport limit rate over ${ul_rate_kb} kbytes/second burst ${BURST_KB} kbytes }" drop
+    nft add rule ${TABLE_FAMILY} ${TABLE_NAME} wg_upload iifname "${WAN_IF}" udp dport @${SET_NAME} meter wg_ul_meter size 65535 "{ udp dport limit rate over ${ul_rate_kb} kbytes/second burst ${ul_burst_kb} kbytes }" drop
 
     # 3. Download filter chain (Server -> Client: client download)
     nft add chain ${TABLE_FAMILY} ${TABLE_NAME} wg_download '{ type filter hook postrouting priority filter; policy accept; }' 2>/dev/null || true
     nft flush chain ${TABLE_FAMILY} ${TABLE_NAME} wg_download 2>/dev/null || true
-    nft add rule ${TABLE_FAMILY} ${TABLE_NAME} wg_download oifname "${WAN_IF}" udp sport @${SET_NAME} meter wg_dl_meter size 65535 "{ udp sport limit rate over ${dl_rate_kb} kbytes/second burst ${BURST_KB} kbytes }" drop
+    nft add rule ${TABLE_FAMILY} ${TABLE_NAME} wg_download oifname "${WAN_IF}" udp sport @${SET_NAME} meter wg_dl_meter size 65535 "{ udp sport limit rate over ${dl_rate_kb} kbytes/second burst ${dl_burst_kb} kbytes }" drop
 }
 
 # --- Sync Ports Between 3x-ui DB and NFTables Set ---
@@ -477,6 +488,7 @@ action_status() {
     echo -e "${BOLD}${CYAN}            Live Bandwidth Limiter Status            ${NC}"
     echo -e "${CYAN}=====================================================${NC}"
 
+    echo -e "Script Version:         ${BOLD}v${VERSION}${NC}"
     if is_limiter_active; then
         echo -e "Kernel Status:          ${BOLD}${GREEN}[Active] Active${NC}"
     else
@@ -590,6 +602,9 @@ cli_dispatch() {
         status)
             action_status
             ;;
+        version|-v|--version)
+            echo "WireGuard Bandwidth Limiter v${VERSION}"
+            ;;
         disable|uninstall)
             action_disable
             ;;
@@ -618,7 +633,8 @@ main_menu() {
         echo -e "${CYAN}+======================================================+${NC}"
         echo -e "${CYAN}|${NC}   ${BOLD}WireGuard Bandwidth Limiter for 3x-ui (NFTables)${NC}   ${CYAN}|${NC}"
         echo -e "${CYAN}+======================================================+${NC}"
-        echo -e " Status: ${is_act} | Active Ports: ${BOLD}${CYAN}${p_cnt}${NC} | DL/UL Limit: ${BOLD}${GREEN}${DL_MBIT}/${UL_MBIT} Mbit${NC}"
+        echo -e " Version: ${BOLD}${YELLOW}v${VERSION}${NC} | Status: ${is_act} | Active Ports: ${BOLD}${CYAN}${p_cnt}${NC}"
+        echo -e " Current Limits: Download: ${BOLD}${GREEN}${DL_MBIT} Mbit${NC} | Upload: ${BOLD}${GREEN}${UL_MBIT} Mbit${NC}"
         echo -e "${CYAN}------------------------------------------------------${NC}"
         echo -e " ${BOLD}1)${NC} Enable & Deploy Bandwidth Limiter"
         echo -e " ${BOLD}2)${NC} Change Download & Upload Speed Limits"
