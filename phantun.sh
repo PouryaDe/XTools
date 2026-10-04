@@ -143,7 +143,7 @@ install_prereqs() {
     msg_info "Checking prerequisites and Phantun Rust binaries..."
     local need_install=0
 
-    for cmd in nft ethtool ping curl tar; do
+    for cmd in nft ethtool ping curl tar python3; do
         if ! command -v "$cmd" &>/dev/null; then
             msg_warn "Required command '${cmd}' not found."
             need_install=1
@@ -157,9 +157,9 @@ install_prereqs() {
     if [ $need_install -eq 1 ]; then
         msg_info "Installing missing dependencies..."
         if command -v apt-get &>/dev/null; then
-            apt-get update -qq && apt-get install -y -qq nftables iproute2 iputils-ping ethtool curl tar procps
+            apt-get update -qq && apt-get install -y -qq nftables iproute2 iputils-ping ethtool curl tar procps python3
         elif command -v yum &>/dev/null || command -v dnf &>/dev/null; then
-            dnf install -y -q nftables iproute iputils ethtool curl tar procps-ng
+            dnf install -y -q nftables iproute iputils ethtool curl tar procps-ng python3
         fi
     fi
 
@@ -224,6 +224,7 @@ set -eu
 ROLE="${role}"
 IF_WAN="${IF_WAN}"
 TUN_IF="${TUN_IF}"
+TUNNEL_ID="${TUNNEL_ID}"
 
 LOCAL_REAL="${LOCAL_REAL}"
 REMOTE_REAL="${REMOTE_REAL}"
@@ -233,12 +234,18 @@ REMOTE_SPOOF="${REMOTE_SPOOF}"
 
 LOCAL_TUN="${LOCAL_TUN}"
 FAKE_PORT="${FAKE_PORT}"
-LOOP_UDP_PORT="${LOOP_UDP_PORT}"
+
+CLI_PORT=\$(( 50000 + ${TUNNEL_ID} ))
+FOU_PORT=\$(( 51000 + ${TUNNEL_ID} ))
+SRV_PORT=\$(( 52000 + ${TUNNEL_ID} ))
+PTUN_DEV="ptun${TUNNEL_ID}"
 
 NFT_TABLE="fw_ftcp_${TUNNEL_ID}"
 BIN_CLIENT="${BIN_CLIENT}"
 BIN_SERVER="${BIN_SERVER}"
 PID_FILE="/tmp/.phantun_${TUNNEL_ID}.pid"
+BRIDGE_PID="/tmp/.phantun_${TUNNEL_ID}_bridge.pid"
+BRIDGE_PY="${SCRIPTS_DIR}/ftcp${TUNNEL_ID}-bridge.py"
 
 # ── Security: rp_filter on all + required interfaces ──
 sysctl -w net.ipv4.conf.all.rp_filter=0     >/dev/null 2>&1 || true
@@ -293,17 +300,13 @@ if [ -f "\$PID_FILE" ]; then
     kill -9 \$(cat "\$PID_FILE" 2>/dev/null) 2>/dev/null || true
     rm -f "\$PID_FILE"
 fi
-
-# ── Launch Phantun Binary ──
-if [ "\$ROLE" = "Iran" ]; then
-    # Client: listens locally for UDP from tunnel, encapsulates into Fake TCP to Remote
-    "\$BIN_CLIENT" --local "127.0.0.1:\${LOOP_UDP_PORT}" --remote "\${REMOTE_REAL}:\${FAKE_PORT}" &
-    echo \$! > "\$PID_FILE"
-else
-    # Server: listens on public Fake TCP port, decapsulates and sends UDP to local loop
-    "\$BIN_SERVER" --local "0.0.0.0:\${FAKE_PORT}" --remote "127.0.0.1:\${LOOP_UDP_PORT}" &
-    echo \$! > "\$PID_FILE"
+if [ -f "\$BRIDGE_PID" ]; then
+    kill -9 \$(cat "\$BRIDGE_PID" 2>/dev/null) 2>/dev/null || true
+    rm -f "\$BRIDGE_PID"
 fi
+pkill -9 -f "phantun_client.*--local.*127.0.0.1:\${CLI_PORT}" 2>/dev/null || true
+pkill -9 -f "phantun_server.*--local.*[\"']?\${FAKE_PORT}[\"']?" 2>/dev/null || true
+pkill -9 -f "\${BRIDGE_PY}" 2>/dev/null || true
 
 # ── Setup Kernel Virtual Tunnel Interface (IPIP over Local FOU) ──
 modprobe ipip 2>/dev/null || true
@@ -312,12 +315,57 @@ modprobe fou 2>/dev/null || true
 ip link set dev \${TUN_IF} down 2>/dev/null || true
 ip tunnel del \${TUN_IF} 2>/dev/null || true
 ip link del \${TUN_IF}   2>/dev/null || true
-
-ip fou add port \${LOOP_UDP_PORT} ipproto 4 2>/dev/null || true
-ip link add name \${TUN_IF} type ipip local 127.0.0.1 remote 127.0.0.1 ttl 64 encap fou encap-sport auto encap-dport \${LOOP_UDP_PORT}
+ip fou del port \${FOU_PORT} 2>/dev/null || true
 
 MTU=1380
 MSS=1340
+
+# ── Launch Daemons and Configure Topology ──
+if [ "\$ROLE" = "Iran" ]; then
+    # Client: listens locally for UDP from tunnel, encapsulates into Fake TCP to Remote
+    "\$BIN_CLIENT" --local "127.0.0.1:\${CLI_PORT}" --remote "\${REMOTE_REAL}:\${FAKE_PORT}" --tun "\${PTUN_DEV}" --tun-local "192.168.200.1" --tun-peer "192.168.200.2" &
+    echo \$! > "\$PID_FILE"
+
+    ip fou add port \${FOU_PORT} ipproto 4 2>/dev/null || true
+    ip link add name \${TUN_IF} type ipip local 127.0.0.1 remote 127.0.0.1 ttl 64 encap fou encap-sport \${FOU_PORT} encap-dport \${CLI_PORT}
+else
+    # Kharej: setup python bridge to bridge dynamic phantun_server UDP sockets to kernel FOU
+    cat > "\${BRIDGE_PY}" << 'BRPYEOF'
+#!/usr/bin/env python3
+import socket, select, sys
+
+s_phan = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s_phan.bind(('127.0.0.1', ${CLI_PORT}))
+
+s_fou = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s_fou.bind(('127.0.0.1', ${SRV_PORT}))
+
+last_addr = None
+while True:
+    try:
+        r, _, _ = select.select([s_phan, s_fou], [], [])
+        if s_phan in r:
+            data, addr = s_phan.recvfrom(65535)
+            last_addr = addr
+            s_fou.sendto(data, ('127.0.0.1', ${FOU_PORT}))
+        if s_fou in r:
+            data, _ = s_fou.recvfrom(65535)
+            if last_addr:
+                s_phan.sendto(data, last_addr)
+    except Exception:
+        pass
+BRPYEOF
+    chmod 755 "\${BRIDGE_PY}"
+    python3 "\${BRIDGE_PY}" &
+    echo \$! > "\$BRIDGE_PID"
+
+    # Server: listens on public Fake TCP port, decapsulates and sends UDP to local bridge
+    "\$BIN_SERVER" --local "\${FAKE_PORT}" --remote "127.0.0.1:\${CLI_PORT}" --tun "\${PTUN_DEV}" --tun-local "192.168.201.1" --tun-peer "192.168.201.2" &
+    echo \$! > "\$PID_FILE"
+
+    ip fou add port \${FOU_PORT} ipproto 4 2>/dev/null || true
+    ip link add name \${TUN_IF} type ipip local 127.0.0.1 remote 127.0.0.1 ttl 64 encap fou encap-sport \${SRV_PORT} encap-dport \${SRV_PORT}
+fi
 
 ip addr replace \${LOCAL_TUN} dev \${TUN_IF} 2>/dev/null || ip addr add \${LOCAL_TUN} dev \${TUN_IF}
 ip link set \${TUN_IF} mtu \${MTU}
@@ -332,13 +380,23 @@ TUN_SUBNET=\$(echo \${LOCAL_TUN} | sed -E 's/\.[0-9]+\//.0\//')
 LOCAL_IP_ONLY=\$(echo \${LOCAL_TUN} | cut -d/ -f1)
 ip route replace \${TUN_SUBNET} dev \${TUN_IF} proto kernel scope link src \${LOCAL_IP_ONLY} advmss \${MSS} 2>/dev/null || true
 
-# ── nftables: Anti-RST Drop & IP Spoofing ──
+# ── nftables: Anti-RST Drop, DNAT/MASQ & IP Spoofing ──
 nft delete table ip \${NFT_TABLE} 2>/dev/null || true
 nft add table ip \${NFT_TABLE}
 
-# Critical: Drop FakeTCP incoming on kernel stack so Linux kernel does not reply with TCP RST!
-nft add chain ip \${NFT_TABLE} input '{ type filter hook input priority -100 ; }'
-nft add rule  ip \${NFT_TABLE} input iif "\${IF_WAN}" tcp dport \${FAKE_PORT} drop
+if [ "\$ROLE" = "Iran" ]; then
+    # Masquerade outbound traffic from Phantun tun device
+    nft add chain ip \${NFT_TABLE} postrouting '{ type nat hook postrouting priority srcnat ; policy accept; }'
+    nft add rule  ip \${NFT_TABLE} postrouting oif "\${IF_WAN}" ip saddr 192.168.200.0/24 masquerade
+else
+    # Kharej: DNAT incoming Fake TCP to Phantun TUN peer
+    nft add chain ip \${NFT_TABLE} prerouting '{ type nat hook prerouting priority dstnat ; policy accept; }'
+    nft add rule  ip \${NFT_TABLE} prerouting iif "\${IF_WAN}" tcp dport \${FAKE_PORT} dnat to 192.168.201.2
+
+    # Postrouting NAT for Phantun tun
+    nft add chain ip \${NFT_TABLE} postrouting '{ type nat hook postrouting priority srcnat ; policy accept; }'
+    nft add rule  ip \${NFT_TABLE} postrouting oif "\${IF_WAN}" ip saddr 192.168.201.0/24 masquerade
+fi
 
 DO_SPOOF=0
 if [ -n "\${LOCAL_SPOOF}" ] && [ -n "\${REMOTE_SPOOF}" ] && { [ "\${LOCAL_SPOOF}" != "\${LOCAL_REAL}" ] || [ "\${REMOTE_SPOOF}" != "\${REMOTE_REAL}" ]; }; then
@@ -346,11 +404,15 @@ if [ -n "\${LOCAL_SPOOF}" ] && [ -n "\${REMOTE_SPOOF}" ] && { [ "\${LOCAL_SPOOF}
 fi
 
 if [ "\$DO_SPOOF" -eq 1 ]; then
-    nft add chain ip \${NFT_TABLE} prerouting  '{ type filter hook prerouting  priority -300 ; }'
-    nft add chain ip \${NFT_TABLE} postrouting '{ type filter hook postrouting priority  300 ; }'
-
-    nft add rule ip \${NFT_TABLE} prerouting  iif "\${IF_WAN}" ip saddr \${REMOTE_SPOOF} ip daddr \${LOCAL_REAL} tcp dport \${FAKE_PORT} ip saddr set \${REMOTE_REAL} notrack
-    nft add rule ip \${NFT_TABLE} postrouting oif "\${IF_WAN}" ip saddr \${LOCAL_REAL} ip daddr \${REMOTE_REAL} tcp dport \${FAKE_PORT} ip saddr set \${LOCAL_SPOOF} notrack
+    if [ "\$ROLE" = "Iran" ]; then
+        # On Iran: restore incoming packets arriving from spoofed remote IP to real IP before conntrack
+        nft add chain ip \${NFT_TABLE} prerouting_spoof '{ type filter hook prerouting priority -300 ; }'
+        nft add rule ip \${NFT_TABLE} prerouting_spoof iif "\${IF_WAN}" ip saddr \${REMOTE_SPOOF} ip daddr \${LOCAL_REAL} tcp sport \${FAKE_PORT} ip saddr set \${REMOTE_REAL}
+    else
+        # On Kharej: spoof outgoing FakeTCP responses towards Iran with the configured spoof IP
+        nft add chain ip \${NFT_TABLE} postrouting_spoof '{ type filter hook postrouting priority 300 ; }'
+        nft add rule ip \${NFT_TABLE} postrouting_spoof oif "\${IF_WAN}" ip saddr \${LOCAL_REAL} ip daddr \${REMOTE_REAL} tcp sport \${FAKE_PORT} ip saddr set \${LOCAL_SPOOF} notrack
+    fi
 fi
 
 # MSS Clamping
@@ -372,22 +434,35 @@ generate_phantun_down() {
     cat > "${script_path}" << PHANEOF
 #!/usr/bin/env bash
 TUN_IF="${TUN_IF}"
-LOOP_UDP_PORT="${LOOP_UDP_PORT}"
+TUNNEL_ID="${TUNNEL_ID}"
+FAKE_PORT="${FAKE_PORT}"
+CLI_PORT=\$(( 50000 + TUNNEL_ID ))
+FOU_PORT=\$(( 51000 + TUNNEL_ID ))
 NFT_TABLE="fw_ftcp_${TUNNEL_ID}"
 PID_FILE="/tmp/.phantun_${TUNNEL_ID}.pid"
+BRIDGE_PID="/tmp/.phantun_${TUNNEL_ID}_bridge.pid"
+BRIDGE_PY="${SCRIPTS_DIR}/ftcp${TUNNEL_ID}-bridge.py"
 
-# Kill Phantun Daemon
+# Kill Phantun Daemon & Bridge
 if [ -f "\$PID_FILE" ]; then
     kill -9 \$(cat "\$PID_FILE" 2>/dev/null) 2>/dev/null || true
     rm -f "\$PID_FILE"
 fi
-pkill -9 -f "phantun.*${LOOP_UDP_PORT}" 2>/dev/null || true
+if [ -f "\$BRIDGE_PID" ]; then
+    kill -9 \$(cat "\$BRIDGE_PID" 2>/dev/null) 2>/dev/null || true
+    rm -f "\$BRIDGE_PID"
+fi
+pkill -9 -f "phantun_client.*--local.*127.0.0.1:\${CLI_PORT}" 2>/dev/null || true
+pkill -9 -f "phantun_server.*--local.*[\"']?\${FAKE_PORT}[\"']?" 2>/dev/null || true
+pkill -9 -f "\${BRIDGE_PY}" 2>/dev/null || true
+rm -f "\${BRIDGE_PY}"
 
 ip link set dev \${TUN_IF} down 2>/dev/null || true
 ip tunnel del \${TUN_IF} 2>/dev/null || true
 ip link del \${TUN_IF}   2>/dev/null || true
+ip link del ptun\${TUNNEL_ID} 2>/dev/null || true
 nft delete table ip \${NFT_TABLE} 2>/dev/null || true
-[ -n "\${LOOP_UDP_PORT}" ] && ip fou del port \${LOOP_UDP_PORT} 2>/dev/null || true
+ip fou del port \${FOU_PORT} 2>/dev/null || true
 
 echo "FakeTCP tunnel \${TUN_IF} DOWN"
 PHANEOF
