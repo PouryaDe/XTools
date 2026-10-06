@@ -64,6 +64,87 @@ validate_ipv4() {
     return 0
 }
 
+validate_subnet_prefix() {
+    local sub="$1"
+    local rx='^([0-9]{1,3}\.){2}[0-9]{1,3}$'
+    if [[ ! "$sub" =~ $rx ]]; then
+        return 1
+    fi
+    local IFS='.'
+    local -a octets=($sub)
+    for octet in "${octets[@]}"; do
+        if (( 10#$octet < 0 || 10#$octet > 255 )); then
+            return 1
+        fi
+    done
+    return 0
+}
+
+find_free_tunnel_subnet() {
+    local proto_base="$1"  # e.g. 10.82
+    local tid="$2"          # e.g. 1
+    local cand="${proto_base}.${tid}"
+    local oct2
+    oct2=$(echo "$proto_base" | cut -d. -f2)
+
+    is_subnet_taken() {
+        local s="$1"
+        if ip -o -4 addr show 2>/dev/null | awk -v iface="${TUN_IF:-}" '$2 != iface' | grep -q "inet ${s}\."; then
+            return 0
+        fi
+        if ip -4 route show 2>/dev/null | grep -v "dev ${TUN_IF:-dummy}\b" | grep -q "${s}\."; then
+            return 0
+        fi
+        for sc in "${SCRIPTS_DIR}"/*-up.sh; do
+            [ -f "$sc" ] || continue
+            [ -n "${TUN_IF:-}" ] && [ "$sc" = "${SCRIPTS_DIR}/${TUN_IF}-up.sh" ] && continue
+            local bsc; bsc=$(basename "$sc")
+            [[ "$bsc" =~ ^(fou|gre|ipip|awg|phantun|geneve|vxlan|xdp)${tid}-up\.sh$ ]] && continue
+            if grep -q "LOCAL_TUN=[\"']\?${s}\." "$sc" 2>/dev/null; then
+                return 0
+            fi
+        done
+        return 1
+    }
+
+    if ! is_subnet_taken "$cand"; then
+        echo "$cand"
+        return 0
+    fi
+
+    local i=1
+    while [ $i -le 254 ]; do
+        cand="${proto_base}.${i}"
+        if ! is_subnet_taken "$cand"; then
+            echo "$cand"
+            return 0
+        fi
+        i=$(( i + 1 ))
+    done
+    echo "10.$(( oct2 + 10 )).${tid}"
+}
+
+read_tcp_port() {
+    local prompt="$1" default="$2" var_name="$3"
+    local val=""
+    while true; do
+        read_input "$prompt" "$default" val
+        val=$(echo "$val" | tr -d '\r\n[:space:]')
+        if ! [[ "$val" =~ ^[0-9]+$ ]] || [ "$val" -lt 1 ] || [ "$val" -gt 65535 ]; then
+            msg_err "Invalid port number '${val}'. Must be between 1 and 65535."
+            continue
+        fi
+        if ss -tlnp 2>/dev/null | grep -q ":${val}\b"; then
+            msg_warn "Port ${val} appears to be in use by another TCP process (e.g. Nginx or webserver)."
+            read -p "  Use this port anyway? (y/N): " use_anyway
+            [[ ! "$use_anyway" =~ ^[Yy]$ ]] && continue
+        fi
+        printf -v "$var_name" "%s" "$val"
+        return 0
+    done
+}
+
+
 read_input() {
     local prompt="$1" default="$2" var_name="$3"
     local input_val
@@ -596,13 +677,14 @@ PID_FILE="/tmp/.phantun_${TUNNEL_ID}.pid"
 
 # Auto-detect REMOTE_TUN if missing
 if [ -z "\${REMOTE_TUN}" ]; then
-    UP_SCRIPT="/usr/local/bin/ftcp${TUNNEL_ID}-up.sh"
+    UP_SCRIPT="/usr/local/bin/\${TUN_IF}-up.sh"
     if [ -f "\$UP_SCRIPT" ]; then
         LT=\$(grep '^LOCAL_TUN=' "\$UP_SCRIPT" 2>/dev/null | cut -d'"' -f2)
+        SUBNET_PREFIX=\$(echo "\$LT" | sed -E 's/\.[0-9]+\/[0-9]+$//')
         if [[ "\$LT" == *".1/"* ]]; then
-            REMOTE_TUN="10.88.${TUNNEL_ID}.2"
+            REMOTE_TUN="\${SUBNET_PREFIX}.2"
         else
-            REMOTE_TUN="10.88.${TUNNEL_ID}.1"
+            REMOTE_TUN="\${SUBNET_PREFIX}.1"
         fi
     fi
 fi
@@ -834,7 +916,37 @@ setup_phantun_server() {
         read_ip "$remote_label" "" REMOTE_REAL
     done
 
-    echo -e "\n ${MAGENTA}${BOLD}[3/4] Spoof IPs (Optional)${NC}"
+    echo -e "\n ${MAGENTA}${BOLD}[3/4] Tunnel Subnet & Spoof IPs${NC}"
+    local existing_sub=""
+    for sc in "${SCRIPTS_DIR}"/*${TUNNEL_ID}-up.sh; do
+        [ -f "$sc" ] || continue
+        local lt; lt=$(grep '^LOCAL_TUN=' "$sc" 2>/dev/null | cut -d'"' -f2)
+        local pref; pref=$(echo "$lt" | sed -E 's/\.[0-9]+\/[0-9]+$//')
+        if validate_subnet_prefix "$pref"; then existing_sub="$pref"; break; fi
+    done
+    local def_subnet="${existing_sub}"
+    [ -z "$def_subnet" ] && def_subnet=$(find_free_tunnel_subnet "10.82" "${TUNNEL_ID}")
+    local val_sub=""
+    while true; do
+        read_input "Tunnel Subnet (/30 base)" "${def_subnet}" val_sub
+        val_sub=$(echo "$val_sub" | tr -d '\r\n[:space:]')
+        [ -z "$val_sub" ] && val_sub="${def_subnet}"
+        if validate_subnet_prefix "$val_sub"; then
+            TUN_SUBNET="$val_sub"
+            break
+        else
+            msg_err "Invalid subnet format '${val_sub}'. Expected format: X.X.X (e.g. 10.82.1)"
+        fi
+    done
+
+    if [ "$role" = "Iran" ]; then
+        LOCAL_TUN="${TUN_SUBNET}.1/30"
+        REMOTE_TUN="${TUN_SUBNET}.2"
+    else
+        LOCAL_TUN="${TUN_SUBNET}.2/30"
+        REMOTE_TUN="${TUN_SUBNET}.1"
+    fi
+
     if [ "$role" = "Iran" ]; then
         msg_info "Enter fake/intranet IPs if disguising traffic, or press Enter to use Real IPs."
         read_ip "Local Spoof IP" "${LOCAL_REAL}" LOCAL_SPOOF
@@ -845,17 +957,9 @@ setup_phantun_server() {
         read_ip "Remote Spoof IP (Iran's Local Spoof)" "${REMOTE_REAL}" REMOTE_SPOOF
     fi
 
-    if [ "$role" = "Iran" ]; then
-        LOCAL_TUN="10.88.${TUNNEL_ID}.1/30"
-        REMOTE_TUN="10.88.${TUNNEL_ID}.2"
-    else
-        LOCAL_TUN="10.88.${TUNNEL_ID}.2/30"
-        REMOTE_TUN="10.88.${TUNNEL_ID}.1"
-    fi
-
     echo -e "\n ${MAGENTA}${BOLD}[4/4] Fake TCP Port on WAN${NC}"
     msg_info "This is the TCP port seen by the ISP/firewall (e.g. 443, 8443, 2083)."
-    read_port "Fake TCP Port" "443" FAKE_PORT
+    read_tcp_port "Fake TCP Port" "443" FAKE_PORT
 
     show_phantun_review "${role}"
 
@@ -911,13 +1015,14 @@ setup_phantun_server() {
     if [ "$role" = "Iran" ]; then
         echo -e "  ${YELLOW}${BOLD}Settings to use for the Kharej side:${NC}"
         echo -e "    Tunnel ID:     ${CYAN}${BOLD}${TUNNEL_ID}${NC}"
+        echo -e "    Tunnel Subnet: ${CYAN}${BOLD}${TUN_SUBNET}${NC}  (must match!)"
         echo -e "    Remote IP:     ${CYAN}${BOLD}${LOCAL_REAL}${NC}"
         echo -e "    Fake TCP Port: ${CYAN}${BOLD}${FAKE_PORT}${NC}"
         echo -e "    Spoof Local:   ${CYAN}${BOLD}${REMOTE_SPOOF}${NC}  (swapped)"
         echo -e "    Spoof Remote:  ${CYAN}${BOLD}${LOCAL_SPOOF}${NC}  (swapped)"
     else
         echo -e " ${CYAN}Test connectivity:${NC}"
-        echo -e "    ping -c 3 10.88.${TUNNEL_ID}.1"
+        echo -e "    ping -c 3 ${REMOTE_TUN}"
     fi
     echo ""
     echo -e " ${CYAN}Service status:${NC}"
@@ -1023,13 +1128,15 @@ ensure_watchdog_exists() {
     if [ -f "$up_script" ]; then
         local lt
         lt=$(grep '^LOCAL_TUN=' "$up_script" 2>/dev/null | cut -d'"' -f2)
+        local subnet_prefix
+        subnet_prefix=$(echo "$lt" | sed -E 's/\.[0-9]+\/[0-9]+$//')
         if [[ "$lt" == *".1/"* ]]; then
-            remote_tun="10.88.${tid}.2"
+            remote_tun="${subnet_prefix}.2"
         else
-            remote_tun="10.88.${tid}.1"
+            remote_tun="${subnet_prefix}.1"
         fi
     fi
-    [ -z "$remote_tun" ] && remote_tun="10.88.${tid}.2"
+    [ -z "$remote_tun" ] && remote_tun="10.82.${tid}.2"
 
     local _saved_tid="${TUNNEL_ID:-}" _saved_tif="${TUN_IF:-}" _saved_rt="${REMOTE_TUN:-}"
     TUN_IF="ftcp${tid}"
@@ -1184,7 +1291,9 @@ do_watchdog_test() {
     if [ -f "$up_script" ]; then
         local lt
         lt=$(grep '^LOCAL_TUN=' "$up_script" 2>/dev/null | cut -d'"' -f2)
-        [[ "$lt" == *".1/"* ]] && remote_tun="10.88.${tid}.2" || remote_tun="10.88.${tid}.1"
+        local subnet_prefix
+        subnet_prefix=$(echo "$lt" | sed -E 's/\.[0-9]+\/[0-9]+$//')
+        [[ "$lt" == *".1/"* ]] && remote_tun="${subnet_prefix}.2" || remote_tun="${subnet_prefix}.1"
     fi
     echo -e "  3. Remote Tunnel IP: ${CYAN}${remote_tun:-unknown}${NC}"
 
@@ -1400,10 +1509,12 @@ do_health_check() {
         if [ -f "$script" ]; then
             local local_tun
             local_tun=$(grep '^LOCAL_TUN=' "$script" 2>/dev/null | cut -d'"' -f2)
+            local subnet_prefix
+            subnet_prefix=$(echo "$local_tun" | sed -E 's/\.[0-9]+\/[0-9]+$//')
             if [[ "$local_tun" == *".1/"* ]]; then
-                tun_ip="10.88.${tid}.2"
+                tun_ip="${subnet_prefix}.2"
             else
-                tun_ip="10.88.${tid}.1"
+                tun_ip="${subnet_prefix}.1"
             fi
         fi
 
