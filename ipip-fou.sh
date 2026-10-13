@@ -170,46 +170,117 @@ read_port() {
     done
 }
 
+read_tunnel_id() {
+    local var_name="$1"
+    local tid=""
+    while true; do
+        read_input "Tunnel ID (number between 1 and 255)" "" tid
+        tid=$(echo "$tid" | tr -d '\r\n[:space:]')
+        if [ -z "$tid" ]; then
+            msg_err "Tunnel ID is required! Please enter a number between 1 and 255."
+            continue
+        fi
+        if ! [[ "$tid" =~ ^[0-9]+$ ]] || [ "$tid" -lt 1 ] || [ "$tid" -gt 255 ]; then
+            msg_err "Invalid Tunnel ID '${tid}'! Must be an integer between 1 and 255."
+            continue
+        fi
+
+        local tun_dev="ipip${tid}"
+        local svc_file="${SYSTEMD_DIR}/ipip-tunnel-${tid}.service"
+        local up_file="${SCRIPTS_DIR}/ipip${tid}-up.sh"
+        if [ -f "$svc_file" ] || [ -f "$up_file" ] || ip link show "$tun_dev" &>/dev/null; then
+            msg_warn "Tunnel ID ${tid} (${tun_dev}) already exists on this server!"
+            read -p "  Do you want to overwrite and reconfigure it? (y/N): " ow_choice
+            if [[ "$ow_choice" =~ ^[Yy]$ ]]; then
+                printf -v "$var_name" "%s" "$tid"
+                return 0
+            else
+                msg_info "Please choose a different Tunnel ID."
+                continue
+            fi
+        fi
+
+        printf -v "$var_name" "%s" "$tid"
+        return 0
+    done
+}
+
+read_interface() {
+    local prompt="$1" default="$2" var_name="$3"
+    local iface=""
+    while true; do
+        read_input "$prompt" "$default" iface
+        iface=$(echo "$iface" | tr -d '\r\n[:space:]')
+        [ -z "$iface" ] && iface="$default"
+        if [ -z "$iface" ]; then
+            msg_err "Interface name cannot be empty."
+            continue
+        fi
+        if [[ ! "$iface" =~ ^[a-zA-Z0-9_.:-]+$ ]] || [ "${#iface}" -gt 20 ]; then
+            msg_err "Invalid interface name '${iface}'. Allowed characters: alphanumeric, '.', '_', ':', '-' (max 20 chars)."
+            continue
+        fi
+        if ip link show "$iface" &>/dev/null; then
+            printf -v "$var_name" "%s" "$iface"
+            return 0
+        else
+            msg_warn "Interface '${iface}' does not currently exist on this system!"
+            read -p "  Are you sure you want to use interface '${iface}'? (y/N): " if_confirm
+            if [[ "$if_confirm" =~ ^[Yy]$ ]]; then
+                printf -v "$var_name" "%s" "$iface"
+                return 0
+            fi
+            msg_info "Please enter a valid network interface name."
+        fi
+    done
+}
+
 get_default_fou_port() {
     local tid="$1"
     local target_proto="$2" # 4 for IPIP, 47 for GRE
     local base_port=51820
+    local my_script="${SCRIPTS_DIR}/ipip${tid}-up.sh"
+    local my_prev_port=""
+    [ -f "$my_script" ] && my_prev_port=$(grep '^FOU_PORT=' "$my_script" 2>/dev/null | cut -d'"' -f2)
 
-    local existing_fou_proto
-    existing_fou_proto=$(ip fou show 2>/dev/null | awk -v p="$base_port" '$2 == p {print $4}')
+    is_fou_port_in_use() {
+        local p="$1"
+        [ -n "$my_prev_port" ] && [ "$p" = "$my_prev_port" ] && return 1
 
-    if [ -z "$existing_fou_proto" ]; then
-        local conflict=0
+        local efp
+        efp=$(ip fou show 2>/dev/null | awk -v port="$p" '$2 == port {print $4}')
+        if [ -n "$efp" ]; then
+            return 0
+        fi
         for s in "${SCRIPTS_DIR}"/*-up.sh; do
             [ -f "$s" ] || continue
-            [ -n "${TUN_IF:-}" ] && [ "$s" = "${SCRIPTS_DIR}/${TUN_IF}-up.sh" ] && continue
-            if grep -q "FOU_PORT=\"${base_port}\"" "$s" 2>/dev/null; then
-                if [ "$target_proto" = "4" ] && grep -q 'ipproto 47\b' "$s" 2>/dev/null; then
-                    conflict=1; break
-                elif [ "$target_proto" = "47" ] && grep -q 'ipproto 4\b' "$s" 2>/dev/null; then
-                    conflict=1; break
-                fi
+            [ "$s" = "$my_script" ] && continue
+            if grep -qE "(FOU_PORT|AWG_PORT|XDP_PORT)=[\"']?${p}[\"']?" "$s" 2>/dev/null; then
+                return 0
             fi
         done
-        if [ $conflict -eq 0 ]; then
-            echo "$base_port"
+        if ss -ulnp 2>/dev/null | grep -q ":${p}\b"; then
             return 0
         fi
-    elif [ "$existing_fou_proto" = "$target_proto" ]; then
-        echo "$base_port"
-        return 0
+        return 1
+    }
+
+    local cand
+    if [ -n "$my_prev_port" ] && ! is_fou_port_in_use "$my_prev_port"; then
+        cand="$my_prev_port"
+    else
+        cand=$(( base_port + tid - 1 ))
+        [ "$cand" -lt "$base_port" ] && cand="$base_port"
     fi
 
-    local cand=$(( 51820 + tid ))
-    while true; do
-        local efp
-        efp=$(ip fou show 2>/dev/null | awk -v p="$cand" '$2 == p {print $4}')
-        if [ -z "$efp" ] || [ "$efp" = "$target_proto" ]; then
-            echo "$cand"
-            return 0
-        fi
+    local loops=0
+    while is_fou_port_in_use "$cand"; do
         cand=$(( cand + 1 ))
+        [ "$cand" -gt 65535 ] && cand=10000
+        loops=$(( loops + 1 ))
+        [ "$loops" -gt 1000 ] && break
     done
+    echo "$cand"
 }
 
 read_fou_port() {
@@ -855,27 +926,12 @@ setup_ipip_server() {
     AUTO_IP=$(detect_public_ip)
 
     echo -e "\n ${MAGENTA}${BOLD}[1/4] Tunnel Identity${NC}"
-    read_input "Tunnel ID (number between 1 and 255)" "" TUNNEL_ID
-    if ! [[ "$TUNNEL_ID" =~ ^[0-9]+$ ]] || [ "$TUNNEL_ID" -lt 1 ] || [ "$TUNNEL_ID" -gt 255 ]; then
-        msg_err "Tunnel ID must be a number between 1 and 255!"
-        return 1
-    fi
+    read_tunnel_id TUNNEL_ID
     TUN_IF="ipip${TUNNEL_ID}"
-
-    # Collision warning
-    if [ -f "${SYSTEMD_DIR}/ipip-tunnel-${TUNNEL_ID}.service" ] || ip link show "${TUN_IF}" &>/dev/null; then
-        msg_warn "Tunnel ID ${TUNNEL_ID} already exists!"
-        read -p "  Do you want to overwrite and reconfigure it? (y/N): " ow_choice
-        [[ ! "$ow_choice" =~ ^[Yy]$ ]] && { msg_warn "Cancelled."; return 0; }
-        stop_tunnel_services "${TUNNEL_ID}"
-    fi
 
     echo -e "\n ${MAGENTA}${BOLD}[2/4] Network Interfaces & Endpoints${NC}"
     msg_info "Interface auto-detected: ${BOLD}${IF_WAN}${NC}"
-    read_input "Change interface? (Enter to keep)" "${IF_WAN}" IF_WAN
-    if ! ip link show "${IF_WAN}" &>/dev/null; then
-        msg_warn "Interface '${IF_WAN}' does not currently exist on this system! Please verify."
-    fi
+    read_interface "Change interface? (Enter to keep)" "${IF_WAN}" IF_WAN
     [ -n "$AUTO_IP" ] && msg_info "Public IP auto-detected: ${BOLD}${AUTO_IP}${NC}"
 
     read_ip "This server's REAL IP" "${AUTO_IP}" LOCAL_REAL
