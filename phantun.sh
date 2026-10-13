@@ -124,6 +124,111 @@ find_free_tunnel_subnet() {
     echo "10.$(( oct2 + 10 )).${tid}"
 }
 
+read_tunnel_id() {
+    local var_name="$1"
+    local tid=""
+    while true; do
+        read_input "Tunnel ID (number between 1 and 255)" "" tid
+        tid=$(echo "$tid" | tr -d '\r\n[:space:]')
+        if [ -z "$tid" ]; then
+            msg_err "Tunnel ID is required! Please enter a number between 1 and 255."
+            continue
+        fi
+        if ! [[ "$tid" =~ ^[0-9]+$ ]] || [ "$tid" -lt 1 ] || [ "$tid" -gt 255 ]; then
+            msg_err "Invalid Tunnel ID '${tid}'! Must be an integer between 1 and 255."
+            continue
+        fi
+
+        local tun_dev="ftcp${tid}"
+        local svc_file="${SYSTEMD_DIR}/phantun-tunnel-${tid}.service"
+        local up_file="${SCRIPTS_DIR}/ftcp${tid}-up.sh"
+        if [ -f "$svc_file" ] || [ -f "$up_file" ] || ip link show "$tun_dev" &>/dev/null; then
+            msg_warn "Tunnel ID ${tid} (${tun_dev}) already exists on this server!"
+            read -p "  Do you want to overwrite and reconfigure it? (y/N): " ow_choice
+            if [[ "$ow_choice" =~ ^[Yy]$ ]]; then
+                printf -v "$var_name" "%s" "$tid"
+                return 0
+            else
+                msg_info "Please choose a different Tunnel ID."
+                continue
+            fi
+        fi
+
+        printf -v "$var_name" "%s" "$tid"
+        return 0
+    done
+}
+
+read_interface() {
+    local prompt="$1" default="$2" var_name="$3"
+    local iface=""
+    while true; do
+        read_input "$prompt" "$default" iface
+        iface=$(echo "$iface" | tr -d '\r\n[:space:]')
+        [ -z "$iface" ] && iface="$default"
+        if [ -z "$iface" ]; then
+            msg_err "Interface name cannot be empty."
+            continue
+        fi
+        if [[ ! "$iface" =~ ^[a-zA-Z0-9_.:-]+$ ]] || [ "${#iface}" -gt 20 ]; then
+            msg_err "Invalid interface name '${iface}'. Allowed characters: alphanumeric, '.', '_', ':', '-' (max 20 chars)."
+            continue
+        fi
+        if ip link show "$iface" &>/dev/null; then
+            printf -v "$var_name" "%s" "$iface"
+            return 0
+        else
+            msg_warn "Interface '${iface}' does not currently exist on this system!"
+            read -p "  Are you sure you want to use interface '${iface}'? (y/N): " if_confirm
+            if [[ "$if_confirm" =~ ^[Yy]$ ]]; then
+                printf -v "$var_name" "%s" "$iface"
+                return 0
+            fi
+            msg_info "Please enter a valid network interface name."
+        fi
+    done
+}
+
+get_default_fake_tcp_port() {
+    local tid="$1"
+    local my_script="${SCRIPTS_DIR}/ftcp${tid}-up.sh"
+    local my_prev_port=""
+    [ -f "$my_script" ] && my_prev_port=$(grep '^FAKE_PORT=' "$my_script" 2>/dev/null | cut -d'"' -f2)
+
+    is_tcp_port_taken() {
+        local p="$1"
+        [ -n "$my_prev_port" ] && [ "$p" = "$my_prev_port" ] && return 1
+
+        if ss -tlnp 2>/dev/null | grep -q ":${p}\b"; then return 0; fi
+        for s in "${SCRIPTS_DIR}"/*-up.sh; do
+            [ -f "$s" ] || continue
+            [ "$s" = "$my_script" ] && continue
+            if grep -qE "(FAKE_PORT)=[\"']?${p}[\"']?" "$s" 2>/dev/null; then return 0; fi
+        done
+        return 1
+    }
+
+    if [ -n "$my_prev_port" ] && ! is_tcp_port_taken "$my_prev_port"; then
+        echo "$my_prev_port"
+        return 0
+    fi
+
+    if [ "$tid" -eq 1 ] && ! is_tcp_port_taken "443"; then
+        echo "443"
+        return 0
+    fi
+
+    local cand=$(( 8440 + tid ))
+    local loops=0
+    while is_tcp_port_taken "$cand"; do
+        cand=$(( cand + 1 ))
+        [ "$cand" -gt 65535 ] && cand=10000
+        loops=$(( loops + 1 ))
+        [ "$loops" -gt 1000 ] && break
+    done
+    echo "$cand"
+}
+
 read_tcp_port() {
     local prompt="$1" default="$2" var_name="$3"
     local val=""
@@ -885,25 +990,13 @@ setup_phantun_server() {
     AUTO_IP=$(detect_public_ip)
 
     echo -e "\n ${MAGENTA}${BOLD}[1/4] Tunnel Identity${NC}"
-    read_input "Tunnel ID (number between 1 and 255)" "" TUNNEL_ID
-    if ! [[ "$TUNNEL_ID" =~ ^[0-9]+$ ]] || [ "$TUNNEL_ID" -lt 1 ] || [ "$TUNNEL_ID" -gt 255 ]; then
-        msg_err "Tunnel ID must be a number between 1 and 255!"
-        return 1
-    fi
+    read_tunnel_id TUNNEL_ID
     TUN_IF="ftcp${TUNNEL_ID}"
     LOOP_UDP_PORT=$(( 50000 + TUNNEL_ID ))
 
-    # Collision warning
-    if [ -f "${SYSTEMD_DIR}/phantun-tunnel-${TUNNEL_ID}.service" ] || ip link show "${TUN_IF}" &>/dev/null; then
-        msg_warn "Tunnel ID ${TUNNEL_ID} already exists!"
-        read -p "  Do you want to overwrite and reconfigure it? (y/N): " ow_choice
-        [[ ! "$ow_choice" =~ ^[Yy]$ ]] && { msg_warn "Cancelled."; return 0; }
-        stop_tunnel_services "${TUNNEL_ID}"
-    fi
-
     echo -e "\n ${MAGENTA}${BOLD}[2/4] Network Interfaces & Endpoints${NC}"
     msg_info "Interface auto-detected: ${BOLD}${IF_WAN}${NC}"
-    read_input "Change interface? (Enter to keep)" "${IF_WAN}" IF_WAN
+    read_interface "Change interface? (Enter to keep)" "${IF_WAN}" IF_WAN
     [ -n "$AUTO_IP" ] && msg_info "Public IP auto-detected: ${BOLD}${AUTO_IP}${NC}"
 
     read_ip "This server's REAL IP" "${AUTO_IP}" LOCAL_REAL
@@ -959,7 +1052,9 @@ setup_phantun_server() {
 
     echo -e "\n ${MAGENTA}${BOLD}[4/4] Fake TCP Port on WAN${NC}"
     msg_info "This is the TCP port seen by the ISP/firewall (e.g. 443, 8443, 2083)."
-    read_tcp_port "Fake TCP Port" "443" FAKE_PORT
+    local def_fake_port
+    def_fake_port=$(get_default_fake_tcp_port "${TUNNEL_ID}")
+    read_tcp_port "Fake TCP Port" "${def_fake_port}" FAKE_PORT
 
     show_phantun_review "${role}"
 
