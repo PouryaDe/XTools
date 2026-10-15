@@ -1168,7 +1168,7 @@ EOF
             if has_opt "${R_OPTS[$i]}" check; then
                 server+=" $HEALTH_CHECK"
             fi
-            printf 'listen fwd_%s\n    bind *:%s reuseport\n    %s\n\n' "${R_LISTEN[$i]}" "${R_LISTEN[$i]}" "$server"
+            printf 'listen fwd_%s\n    bind *:%s\n    %s\n\n' "${R_LISTEN[$i]}" "${R_LISTEN[$i]}" "$server"
         done
     } >"$out"
 }
