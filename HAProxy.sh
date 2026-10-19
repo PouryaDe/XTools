@@ -433,7 +433,16 @@ preflight() {
         if (( HEAL_MODE )); then
             exit 0
         fi
-        die "Another instance of this script is already running."
+        local locker_pid=""
+        if command -v fuser >/dev/null 2>&1; then
+            locker_pid=$(fuser "$LOCK_FILE" 2>/dev/null | tr -s ' ' '\n' | grep -v '^$' | head -n 1)
+        elif command -v lsof >/dev/null 2>&1; then
+            locker_pid=$(lsof -t "$LOCK_FILE" 2>/dev/null | head -n 1)
+        fi
+        if [[ -n "$locker_pid" ]]; then
+            die "Another instance of this script is already running (PID: $locker_pid). Stop it with: kill -9 $locker_pid"
+        fi
+        die "Another instance of this script is already running. You can release it with: fuser -k $LOCK_FILE"
     fi
 }
 
