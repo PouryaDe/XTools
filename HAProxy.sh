@@ -2094,8 +2094,9 @@ net.core.somaxconn = $DYN_SOMAXCONN
 net.core.netdev_max_backlog = 16384
 net.ipv4.tcp_max_syn_backlog = $DYN_SOMAXCONN
 
-# Outgoing connections to the foreign server (full ephemeral range)
-net.ipv4.ip_local_port_range = 1024 65535
+# Outgoing connections to the foreign server (ephemeral range 20000-65535 avoids collision with relay listen ports)
+net.ipv4.ip_local_port_range = 20000 65535
+net.ipv4.ip_local_reserved_ports = 80,443,2053,2083,2087,2096,8443,9000-9999
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_fin_timeout = 15
 
