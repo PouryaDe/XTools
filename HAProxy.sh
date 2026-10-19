@@ -1342,8 +1342,8 @@ activate_service() {  # activate_service UNIT RULE_COUNT
     reload_or_start "$1"
 }
 
-verify_running() {
-    local i p o n_tcp n_udp
+verify_running() {  # verify_running [quiet]
+    local i p o n_tcp n_udp quiet="${1:-0}" m
     local -a missing=()
     n_tcp=$(count_rules tcp)
     n_udp=$(count_rules udp)
@@ -1370,7 +1370,19 @@ verify_running() {
         fi
         sleep 1
     done
-    error "Not running or not listening: ${missing[*]}"
+    if (( ! quiet )); then
+        error "Not running or not listening: ${missing[*]}"
+        for m in "${missing[@]}"; do
+            local proto="${m#*/}" prt="${m%/*}"
+            if [[ "$proto" == tcp || "$proto" == udp ]]; then
+                local o
+                o=$(port_owner "$proto" "$prt")
+                if [[ -n "$o" ]]; then
+                    error "Port $m is currently occupied by: $o"
+                fi
+            fi
+        done
+    fi
     return 1
 }
 
@@ -1458,9 +1470,10 @@ apply_rules() {
 
     # Clears systemd's "start request repeated too quickly" state, if any.
     svc reset-failed haproxy "$UDP_SERVICE" >/dev/null 2>&1 || true
-    if activate_service haproxy "$n_tcp" \
-        && activate_service "$UDP_SERVICE" "$n_udp" \
-        && verify_running; then
+    activate_service haproxy "$n_tcp"
+    activate_service "$UDP_SERVICE" "$n_udp"
+
+    if verify_running 1; then
         update_counters
         ensure_boot_units
         if (( n_tcp + n_udp == 0 )); then
@@ -1471,8 +1484,23 @@ apply_rules() {
         return 0
     fi
 
+    # If reload left any ports unlistened (e.g. old worker socket drain lock), try a clean restart before giving up
+    if (( n_tcp > 0 || n_udp > 0 )); then
+        warning "Reload did not bind all ports cleanly. Attempting a full restart..."
+        if (( n_tcp > 0 )); then svc restart haproxy; fi
+        if (( n_udp > 0 )); then svc restart "$UDP_SERVICE"; fi
+        if verify_running 0; then
+            update_counters
+            ensure_boot_units
+            success "Forwarding is active with the new configuration after full restart."
+            return 0
+        fi
+    else
+        verify_running 0 || true
+    fi
+
     error "The forwarder did not come up correctly with the new configuration."
-    svc status haproxy "$UDP_SERVICE" --no-pager -l -n 10 2>/dev/null || true
+    journalctl -u haproxy -u "$UDP_SERVICE" --no-pager -n 25 2>/dev/null || svc status haproxy "$UDP_SERVICE" --no-pager -l -n 10 2>/dev/null || true
     if (( HEAL_MODE )); then
         die "Repair failed; the next check will try again."
     fi
