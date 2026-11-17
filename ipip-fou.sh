@@ -6,7 +6,7 @@
 # ║  Zero GRE Signature • Minimal Overhead • Kernel-Level Speed   ║
 # ╚════════════════════════════════════════════════════════════════╝
 
-VERSION="2.2.0"
+VERSION="2.3.0"
 
 # ─── Colors ───────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -238,19 +238,20 @@ read_interface() {
 get_default_fou_port() {
     local tid="$1"
     local target_proto="$2" # 4 for IPIP, 47 for GRE
-    local base_port=51820
     local my_script="${SCRIPTS_DIR}/ipip${tid}-up.sh"
     local my_prev_port=""
     [ -f "$my_script" ] && my_prev_port=$(grep '^FOU_PORT=' "$my_script" 2>/dev/null | cut -d'"' -f2)
 
     is_fou_port_in_use() {
         local p="$1"
-        [ -n "$my_prev_port" ] && [ "$p" = "$my_prev_port" ] && return 1
-
         local efp
         efp=$(ip fou show 2>/dev/null | awk -v port="$p" '$2 == port {print $4}')
         if [ -n "$efp" ]; then
-            return 0
+            if [ -n "$my_prev_port" ] && [ "$p" = "$my_prev_port" ] && [ "$efp" = "$target_proto" ]; then
+                :
+            else
+                return 0
+            fi
         fi
         for s in "${SCRIPTS_DIR}"/*-up.sh; do
             [ -f "$s" ] || continue
@@ -259,27 +260,41 @@ get_default_fou_port() {
                 return 0
             fi
         done
-        if ss -ulnp 2>/dev/null | grep -q ":${p}\b"; then
+        # Reject ports bound by a user-space UDP process (e.g. Xray, OpenVPN, WireGuard)
+        if ss -ulnp 2>/dev/null | grep -E ":${p}\b" | grep -q 'users:('; then
+            return 0
+        fi
+        if [ "$p" != "$my_prev_port" ] && ss -ulnp 2>/dev/null | grep -qE ":${p}\b"; then
             return 0
         fi
         return 1
     }
 
-    local cand
+    local cand=""
     if [ -n "$my_prev_port" ] && ! is_fou_port_in_use "$my_prev_port"; then
         cand="$my_prev_port"
     else
-        cand=$(( base_port + tid - 1 ))
-        [ "$cand" -lt "$base_port" ] && cand="$base_port"
+        # Standard UDP service ports pass ISP/Anti-DDoS policers cleanly (0% loss vs 5182x throttling)
+        local preferred_ports=(4500 8443 1194 500 3478 2083 2096 2053 2087 443)
+        local pp
+        for pp in "${preferred_ports[@]}"; do
+            if ! is_fou_port_in_use "$pp"; then
+                cand="$pp"
+                break
+            fi
+        done
     fi
 
-    local loops=0
-    while is_fou_port_in_use "$cand"; do
-        cand=$(( cand + 1 ))
-        [ "$cand" -gt 65535 ] && cand=10000
-        loops=$(( loops + 1 ))
-        [ "$loops" -gt 1000 ] && break
-    done
+    if [ -z "$cand" ]; then
+        cand=$(( 10000 + tid ))
+        local loops=0
+        while is_fou_port_in_use "$cand"; do
+            cand=$(( cand + 1 ))
+            [ "$cand" -gt 65535 ] && cand=10000
+            loops=$(( loops + 1 ))
+            [ "$loops" -gt 1000 ] && break
+        done
+    fi
     echo "$cand"
 }
 
@@ -294,6 +309,13 @@ read_fou_port() {
             continue
         fi
 
+        # Check if a user-space daemon already owns this UDP port
+        if ss -ulnp 2>/dev/null | grep -E ":${val}\b" | grep -q 'users:('; then
+            msg_err "UDP port ${val} is already bound by an active service on this server!"
+            msg_err "Please choose an unused UDP port (e.g., 4500, 8443, 1194)."
+            continue
+        fi
+
         # Check kernel FOU table for protocol conflict
         local existing_fou_proto
         existing_fou_proto=$(ip fou show 2>/dev/null | awk -v p="$val" '$2 == p {print $4}')
@@ -305,7 +327,7 @@ read_fou_port() {
             [ "$target_proto" = "47" ] && p_req="GRE (ipproto 47)"
             msg_err "Port ${val} is already registered in Linux kernel FOU for ${p_curr}!"
             msg_err "A single UDP port cannot handle both ${p_curr} and ${p_req} simultaneously."
-            msg_err "Please choose a different port (e.g., $(( 51820 + TUNNEL_ID )))."
+            msg_err "Please choose a different port (e.g., 4500, 8443, 1194)."
             continue
         fi
 
@@ -328,6 +350,10 @@ read_fou_port() {
             msg_err "Port ${val} is configured in '${conflict_script}' for an incompatible tunnel protocol!"
             msg_err "Please select an independent port to prevent tunnel failure."
             continue
+        fi
+
+        if [ "$val" -ge 51820 ] && [ "$val" -le 51850 ]; then
+            msg_warn "Port ${val} is in the WireGuard range (51820-51850), which some ISPs/Anti-DDoS rate-limit. Standard UDP ports (4500, 8443, 1194, 443) are recommended."
         fi
 
         printf -v "$var_name" "%s" "$val"
@@ -444,7 +470,7 @@ net.ipv4.ipfrag_high_thresh = 16777216
 net.ipv4.ipfrag_low_thresh = 8388608
 net.ipv4.ipfrag_time = 30
 net.core.netdev_max_backlog = 100000
-net.core.netdev_budget = 600
+net.core.netdev_budget = 1200
 net.core.netdev_budget_usecs = 8000
 
 # Connection Scalability & Limits
@@ -536,7 +562,7 @@ sysctl -w net.ipv4.ipfrag_high_thresh=16777216 >/dev/null 2>&1 || true
 sysctl -w net.ipv4.ipfrag_low_thresh=8388608   >/dev/null 2>&1 || true
 sysctl -w net.ipv4.ipfrag_time=30              >/dev/null 2>&1 || true
 sysctl -w net.core.netdev_max_backlog=100000   >/dev/null 2>&1 || true
-sysctl -w net.core.netdev_budget=600           >/dev/null 2>&1 || true
+sysctl -w net.core.netdev_budget=1200          >/dev/null 2>&1 || true
 sysctl -w net.core.netdev_budget_usecs=8000    >/dev/null 2>&1 || true
 
 # ── Performance: Max connections & bandwidth ──
@@ -579,8 +605,8 @@ if [ "\${FOU_ENABLE}" = "yes" ]; then
     if [ -z "\$EXISTING_PROTO" ]; then
         ip fou add port \${FOU_PORT} ipproto 4
     fi
-    # Create IPIP interface encapsulated into FOU UDP (Zero GRE Header)
-    ip link add name \${TUN_IF} type ipip local \${LOCAL_REAL} remote \${REMOTE_REAL} ttl 64 encap fou encap-sport auto encap-dport \${FOU_PORT}
+    # Create IPIP interface encapsulated into FOU UDP with encap-csum (Prevents UDP csum=0 ISP/Anti-DDoS drops)
+    ip link add name \${TUN_IF} type ipip local \${LOCAL_REAL} remote \${REMOTE_REAL} ttl 64 encap fou encap-csum encap-sport auto encap-dport \${FOU_PORT}
     MTU=1400
     MSS=1360
 else
@@ -612,9 +638,9 @@ sysctl -w net.ipv6.conf.\${TUN_IF}.disable_ipv6=1 >/dev/null 2>&1 || true
 # Scoped rp_filter for tunnel interface
 sysctl -w net.ipv4.conf.\${TUN_IF}.rp_filter=0    >/dev/null 2>&1 || true
 
-# ── Qdisc: Fair Queue ──
-tc qdisc add dev \${IF_WAN} root fq 2>/dev/null || true
-tc qdisc replace dev \${TUN_IF} root fq 2>/dev/null || true
+# ── Qdisc: Fair Queue (flow_limit 1000 prevents per-flow tail drops under heavy tunnel load) ──
+tc qdisc replace dev \${IF_WAN} root fq flow_limit 1000 2>/dev/null || tc qdisc replace dev \${IF_WAN} root fq 2>/dev/null || true
+tc qdisc replace dev \${TUN_IF} root fq flow_limit 1000 2>/dev/null || tc qdisc replace dev \${TUN_IF} root fq 2>/dev/null || true
 
 # ── RPS & RFS: distribute across cores ──
 CORES=\$(nproc 2>/dev/null || echo 1)
@@ -654,6 +680,12 @@ if [ "\$DO_SPOOF" -eq 1 ]; then
         nft add rule ip \${NFT_TABLE} prerouting  iif "\${IF_WAN}" ip protocol ipip ip saddr \${REMOTE_SPOOF} ip daddr \${LOCAL_REAL} ip saddr set \${REMOTE_REAL} notrack
         nft add rule ip \${NFT_TABLE} postrouting oif "\${IF_WAN}" ip protocol ipip ip saddr \${LOCAL_REAL} ip daddr \${REMOTE_REAL} ip saddr set \${LOCAL_SPOOF} notrack
     fi
+elif [ "\${FOU_ENABLE}" = "yes" ]; then
+    # Bypass conntrack & generic dstnat/port-forward tables for FOU outer UDP traffic
+    nft add chain ip \${NFT_TABLE} prerouting  '{ type filter hook prerouting  priority -300 ; }'
+    nft add chain ip \${NFT_TABLE} postrouting '{ type filter hook postrouting priority  300 ; }'
+    nft add rule ip \${NFT_TABLE} prerouting  iif "\${IF_WAN}" ip saddr \${REMOTE_REAL} ip daddr \${LOCAL_REAL} udp dport \${FOU_PORT} notrack
+    nft add rule ip \${NFT_TABLE} postrouting oif "\${IF_WAN}" ip saddr \${LOCAL_REAL} ip daddr \${REMOTE_REAL} udp dport \${FOU_PORT} notrack
 fi
 
 # MSS Clamping
@@ -897,8 +929,8 @@ show_ipip_review() {
     print_line
     echo -e "  ${CYAN}Optimizations & Anti-DPI Features:${NC}"
     echo -e "    ${GREEN}✓${NC} Zero-GRE Signature (Pure IPv4-in-UDP ipproto 4)"
-    echo -e "    ${GREEN}✓${NC} FOU Stealth Mode (UDP Port ${FOU_PORT})"
-    echo -e "    ${GREEN}✓${NC} BBR Congestion Control + FQ Qdisc"
+    echo -e "    ${GREEN}✓${NC} FOU Stealth Mode (UDP Port ${FOU_PORT}, encap-csum Enabled)"
+    echo -e "    ${GREEN}✓${NC} BBR Congestion Control + FQ Qdisc (flow_limit 1000)"
     echo -e "    ${GREEN}✓${NC} Adaptive Low-Latency Buffers (No Bufferbloat)"
     echo -e "    ${GREEN}✓${NC} MSS Clamping (Forward & Output Hooks: ${show_mtu}-40)"
     echo -e "    ${GREEN}✓${NC} Route advmss Tuning (Zero Packet Fragmentation for Nginx/Xray)"
@@ -1743,9 +1775,14 @@ do_status() {
         fp=$(grep '^FOU_PORT=' "$script" 2>/dev/null | cut -d'"' -f2)
         local role="Kharej"; [[ "$lt" == *".1/"* ]] && role="Iran"
 
+        local csum_mode="noencap-csum (WARN: 0-checksum)"
+        if grep -q 'encap-csum' "$script" 2>/dev/null; then
+            csum_mode="encap-csum (OK)"
+        fi
         echo -e "  ${MAGENTA}Role:${NC}          ${BOLD}${role}${NC}"
         echo -e "  ${MAGENTA}Encapsulation:${NC} ${BOLD}IPIP over FOU (ipproto 4)${NC}"
         echo -e "  ${MAGENTA}FOU Port:${NC}      ${BOLD}${fp:-N/A}${NC}"
+        echo -e "  ${MAGENTA}FOU Checksum:${NC}  ${BOLD}${csum_mode}${NC}"
         echo -e "  ${MAGENTA}Local Real:${NC}    ${GREEN}${lr}${NC}"
         echo -e "  ${MAGENTA}Remote Real:${NC}   ${BLUE}${rr}${NC}"
         echo -e "  ${MAGENTA}Local Spoof:${NC}   ${DIM}${ls}${NC}"
@@ -1926,6 +1963,62 @@ do_view_scripts() {
     fi
 }
 
+do_upgrade_tunnels() {
+    echo ""
+    echo -e " ${CYAN}${BOLD}Upgrade Existing IPIP-FOU Tunnels (encap-csum + fq flow_limit 1000):${NC}"
+    print_line
+
+    local all_ids; mapfile -t all_ids < <(get_all_tunnel_ids)
+    [ ${#all_ids[@]} -eq 0 ] && { msg_warn "No IPIP/FOU tunnels found."; return; }
+
+    local updated_ids=()
+    for tid in "${all_ids[@]}"; do
+        local up_script="${SCRIPTS_DIR}/ipip${tid}-up.sh"
+        [ -f "$up_script" ] || continue
+
+        local changed=0
+        if grep -q 'encap fou' "$up_script" 2>/dev/null && ! grep -q 'encap-csum' "$up_script" 2>/dev/null; then
+            sed -i 's/encap fou /encap fou encap-csum /g' "$up_script"
+            changed=1
+        fi
+        if grep -qE 'root fq($| )' "$up_script" 2>/dev/null; then
+            if ! grep -q 'flow_limit 1000' "$up_script" 2>/dev/null; then
+                sed -i -E 's/tc qdisc (add|replace) dev \$\{IF_WAN\} root fq\b/tc qdisc replace dev ${IF_WAN} root fq flow_limit 1000/g' "$up_script"
+                sed -i -E 's/tc qdisc (add|replace) dev \$\{TUN_IF\} root fq\b/tc qdisc replace dev ${TUN_IF} root fq flow_limit 1000/g' "$up_script"
+                changed=1
+            fi
+        fi
+        if grep -q 'net.core.netdev_budget=600' "$up_script" 2>/dev/null; then
+            sed -i 's/net\.core\.netdev_budget=600/net.core.netdev_budget=1200/g' "$up_script"
+            changed=1
+        fi
+
+        if [ "$changed" -eq 1 ]; then
+            msg_ok "Patched ${up_script} (encap-csum + fq flow_limit 1000)."
+            updated_ids+=("$tid")
+        else
+            msg_info "Tunnel ${tid} (${up_script}) is already up to date."
+        fi
+    done
+
+    persist_sysctl_tuning
+    msg_ok "Updated /etc/sysctl.d/99-xmanager-tunnel.conf"
+
+    if [ ${#updated_ids[@]} -gt 0 ]; then
+        echo ""
+        read -p "  Restart upgraded tunnels now to apply changes? (y/N): " rst_choice
+        if [[ "$rst_choice" =~ ^[Yy]$ ]]; then
+            for tid in "${updated_ids[@]}"; do
+                restart_tunnel_services "$tid"
+                msg_ok "Tunnel ${tid} restarted."
+            done
+        else
+            msg_warn "Remember to restart upgraded tunnels (both Iran & Kharej) for changes to take effect."
+        fi
+    fi
+    echo ""
+}
+
 # ─── Main Menu ────────────────────────────────────────────────────
 main_menu() {
     while true; do
@@ -1961,8 +2054,9 @@ main_menu() {
         echo -e " ${BOLD}${WHITE}Danger${NC}"
         echo -e "  ${RED}17)${NC} Delete a Tunnel"
         echo ""
-        echo -e " ${BOLD}${WHITE}Install${NC}"
+        echo -e " ${BOLD}${WHITE}Install & Maintenance${NC}"
         echo -e "  ${MAGENTA}18)${NC} Install Prerequisites"
+        echo -e "  ${GREEN}19)${NC} Upgrade Existing Tunnels (Enable encap-csum & fq flow_limit)"
         echo ""
         echo -e "  ${DIM}0)${NC}  Exit"
         echo ""
@@ -1987,6 +2081,7 @@ main_menu() {
             16|wd|watchdog) watchdog_menu ;;
             17) do_delete ;;
             18) install_prereqs ;;
+            19) do_upgrade_tunnels ;;
             0)  echo -e "\n ${GREEN}Goodbye!${NC}\n"; exit 0 ;;
             *)  msg_err "Invalid option." ;;
         esac
