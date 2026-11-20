@@ -1,9 +1,11 @@
 #!/bin/bash
 
 # ╔════════════════════════════════════════════════════════════════╗
-# ║  FOU TUNNEL SETUP (Optimized for Electron App Model)          ║
-# ║  Iran & Kharej Setup Script (Foo-over-UDP Multi-Tunnel)       ║
+# ║  GRE OVER FOU TUNNEL MANAGER v2.3.0                            ║
+# ║  Hardened Multi-Tunnel Setup (Foo-over-UDP + Atomic nftables)  ║
 # ╚════════════════════════════════════════════════════════════════╝
+
+VERSION="2.3.0"
 
 # ─── Colors ───────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -13,6 +15,7 @@ WHITE='\033[1;37m'; DIM='\033[2m'; BOLD='\033[1m'; NC='\033[0m'
 # ─── Paths ────────────────────────────────────────────────────────
 SCRIPTS_DIR="/usr/local/bin"
 SYSTEMD_DIR="/etc/systemd/system"
+STATE_DIR="/run/xmanager-gre"
 
 # ─── UI Helpers ───────────────────────────────────────────────────
 print_line() { echo -e "${CYAN}────────────────────────────────────────────────────${NC}"; }
@@ -23,7 +26,7 @@ print_header() {
     echo ""
     echo -e "${CYAN}${BOLD}"
     echo " ╔════════════════════════════════════════════════╗"
-    echo " ║       FOU TUNNEL SETUP (Electron Model)       ║"
+    echo " ║      GRE OVER FOU TUNNEL MANAGER v${VERSION}        ║"
     echo " ╚════════════════════════════════════════════════╝"
     echo -e "${NC}"
 }
@@ -37,6 +40,38 @@ check_root() {
     if [ "$EUID" -ne 0 ]; then
         msg_err "This script must be run as root."
         exit 1
+    fi
+}
+
+format_bytes() {
+    local bytes="${1:-0}"
+    [[ ! "$bytes" =~ ^[0-9]+$ ]] && bytes=0
+    if [ "$bytes" -ge 1073741824 ]; then
+        awk -v b="$bytes" 'BEGIN {printf "%.2f GB", b/1073741824}'
+    elif [ "$bytes" -ge 1048576 ]; then
+        awk -v b="$bytes" 'BEGIN {printf "%.1f MB", b/1048576}'
+    elif [ "$bytes" -ge 1024 ]; then
+        awk -v b="$bytes" 'BEGIN {printf "%.1f KB", b/1024}'
+    else
+        echo "${bytes} B"
+    fi
+}
+
+extract_up_var() {
+    local key="$1" file="$2"
+    grep -E "^${key}=" "$file" 2>/dev/null | head -1 | sed -E "s/^${key}=//; s/[[:space:]]+#.*$//; s/^[\"']//; s/[\"'][[:space:]]*$//" | tr -d '\r'
+}
+
+derive_remote_tun_from_local() {
+    local lt="$1"
+    local subnet_prefix
+    subnet_prefix=$(echo "$lt" | sed -E 's/\.[0-9]+\/[0-9]+$//')
+    if [[ "$subnet_prefix" =~ ^([0-9]{1,3}\.){2}[0-9]{1,3}$ ]]; then
+        if [[ "$lt" == *".1/"* ]]; then
+            echo "${subnet_prefix}.2"
+        else
+            echo "${subnet_prefix}.1"
+        fi
     fi
 }
 
@@ -73,34 +108,40 @@ validate_subnet_prefix() {
     return 0
 }
 
+is_tunnel_subnet_in_use() {
+    local s="$1"
+    local exclude_if="${2:-${TUN_IF:-}}"
+    if ip -o -4 addr show 2>/dev/null | awk -v iface="${exclude_if}" '$2 != iface' | grep -Fq "inet ${s}."; then
+        return 0
+    fi
+    if [ -n "$exclude_if" ]; then
+        if ip -4 route show 2>/dev/null | grep -vE "dev ${exclude_if}([[:space:]]|$)" | grep -Fq "${s}."; then
+            return 0
+        fi
+    else
+        if ip -4 route show 2>/dev/null | grep -Fq "${s}."; then
+            return 0
+        fi
+    fi
+    local sc
+    for sc in "${SCRIPTS_DIR}"/*-up.sh; do
+        [ -f "$sc" ] || continue
+        [ -n "$exclude_if" ] && [ "$sc" = "${SCRIPTS_DIR}/${exclude_if}-up.sh" ] && continue
+        if grep -Fq "LOCAL_TUN=\"${s}." "$sc" 2>/dev/null || grep -Fq "LOCAL_TUN='${s}." "$sc" 2>/dev/null || grep -Fq "LOCAL_TUN=${s}." "$sc" 2>/dev/null; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 find_free_tunnel_subnet() {
     local proto_base="$1"  # e.g. 10.80
-    local tid="$2"          # e.g. 1
+    local tid="$2"         # e.g. 1
     local cand="${proto_base}.${tid}"
     local oct2
     oct2=$(echo "$proto_base" | cut -d. -f2)
 
-    is_subnet_taken() {
-        local s="$1"
-        if ip -o -4 addr show 2>/dev/null | awk -v iface="${TUN_IF:-}" '$2 != iface' | grep -q "inet ${s}\."; then
-            return 0
-        fi
-        if ip -4 route show 2>/dev/null | grep -v "dev ${TUN_IF:-dummy}\b" | grep -q "${s}\."; then
-            return 0
-        fi
-        for sc in "${SCRIPTS_DIR}"/*-up.sh; do
-            [ -f "$sc" ] || continue
-            [ -n "${TUN_IF:-}" ] && [ "$sc" = "${SCRIPTS_DIR}/${TUN_IF}-up.sh" ] && continue
-            local bsc; bsc=$(basename "$sc")
-            [[ "$bsc" =~ ^(fou|gre|ipip|awg|phantun|geneve|vxlan|xdp)${tid}-up\.sh$ ]] && continue
-            if grep -q "LOCAL_TUN=[\"']\?${s}\." "$sc" 2>/dev/null; then
-                return 0
-            fi
-        done
-        return 1
-    }
-
-    if ! is_subnet_taken "$cand"; then
+    if ! is_tunnel_subnet_in_use "$cand" "${TUN_IF:-}"; then
         echo "$cand"
         return 0
     fi
@@ -108,7 +149,7 @@ find_free_tunnel_subnet() {
     local i=1
     while [ $i -le 254 ]; do
         cand="${proto_base}.${i}"
-        if ! is_subnet_taken "$cand"; then
+        if ! is_tunnel_subnet_in_use "$cand" "${TUN_IF:-}"; then
             echo "$cand"
             return 0
         fi
@@ -116,7 +157,6 @@ find_free_tunnel_subnet() {
     done
     echo "10.$(( oct2 + 10 )).${tid}"
 }
-
 
 read_input() {
     local prompt="$1" default="$2" var_name="$3"
@@ -234,48 +274,71 @@ read_interface() {
 get_default_fou_port() {
     local tid="$1"
     local target_proto="$2" # 47 for GRE, 4 for IPIP
-    local base_port=51820
     local my_script="${SCRIPTS_DIR}/gre${tid}-up.sh"
     local my_prev_port=""
-    [ -f "$my_script" ] && my_prev_port=$(grep '^FOU_PORT=' "$my_script" 2>/dev/null | cut -d'"' -f2)
+    [ -f "$my_script" ] && my_prev_port=$(extract_up_var "FOU_PORT" "$my_script")
 
     is_fou_port_in_use() {
         local p="$1"
-        [ -n "$my_prev_port" ] && [ "$p" = "$my_prev_port" ] && return 1
 
-        local efp
-        efp=$(ip fou show 2>/dev/null | awk -v port="$p" '$2 == port {print $4}')
-        if [ -n "$efp" ]; then
+        # Always reject UDP ports bound by a user-space process (e.g. Xray, OpenVPN, WireGuard)
+        if ss -Hulnp 2>/dev/null | awk -v port="$p" '$4 ~ ":" port "$" && /users:\(/ {found=1} END{exit !found}'; then
             return 0
         fi
+
+        # Check kernel FOU table (both ipproto and gue modes)
+        local efp
+        efp=$(ip fou show 2>/dev/null | awk -v port="$p" '$2 == port {if ($3=="gue") print "gue"; else print $4}' | head -1)
+        if [ -n "$efp" ]; then
+            if [ -n "$my_prev_port" ] && [ "$p" = "$my_prev_port" ] && [ "$efp" = "$target_proto" ]; then
+                :
+            else
+                return 0
+            fi
+        fi
+
+        # Check other tunnel up-scripts across all protocols
+        local s
         for s in "${SCRIPTS_DIR}"/*-up.sh; do
             [ -f "$s" ] || continue
             [ "$s" = "$my_script" ] && continue
-            if grep -qE "(FOU_PORT|AWG_PORT|XDP_PORT)=[\"']?${p}[\"']?" "$s" 2>/dev/null; then
+            if grep -Eq "^(FOU_PORT|AWG_PORT|XDP_PORT|GENEVE_PORT|VXLAN_PORT)=[\"']?${p}[\"']?$" "$s" 2>/dev/null; then
                 return 0
             fi
         done
-        if ss -ulnp 2>/dev/null | grep -q ":${p}\b"; then
+
+        # Reject any other active kernel UDP listener unless it belongs to this tunnel's previous port
+        if [ "$p" != "$my_prev_port" ] && ss -Hulnp 2>/dev/null | awk -v port="$p" '$4 ~ ":" port "$" {found=1} END{exit !found}'; then
             return 0
         fi
         return 1
     }
 
-    local cand
+    local cand=""
     if [ -n "$my_prev_port" ] && ! is_fou_port_in_use "$my_prev_port"; then
         cand="$my_prev_port"
     else
-        cand=$(( base_port + tid - 1 ))
-        [ "$cand" -lt "$base_port" ] && cand="$base_port"
+        # Standard UDP service ports avoid ISP/Anti-DDoS rate-limiting on WireGuard ports (51820-51850)
+        local preferred_ports=(4500 8443 1194 500 3478 2083 2096 2053 2087 443)
+        local pp
+        for pp in "${preferred_ports[@]}"; do
+            if ! is_fou_port_in_use "$pp"; then
+                cand="$pp"
+                break
+            fi
+        done
     fi
 
-    local loops=0
-    while is_fou_port_in_use "$cand"; do
-        cand=$(( cand + 1 ))
-        [ "$cand" -gt 65535 ] && cand=10000
-        loops=$(( loops + 1 ))
-        [ "$loops" -gt 1000 ] && break
-    done
+    if [ -z "$cand" ]; then
+        cand=$(( 10000 + tid ))
+        local loops=0
+        while is_fou_port_in_use "$cand"; do
+            cand=$(( cand + 1 ))
+            [ "$cand" -gt 65535 ] && cand=10000
+            loops=$(( loops + 1 ))
+            [ "$loops" -gt 1000 ] && break
+        done
+    fi
     echo "$cand"
 }
 
@@ -290,47 +353,64 @@ read_fou_port() {
             continue
         fi
 
-        # Check kernel FOU table for protocol conflict
+        # Reject ports bound by an active user-space UDP service
+        if ss -Hulnp 2>/dev/null | awk -v port="$val" '$4 ~ ":" port "$" && /users:\(/ {found=1} END{exit !found}'; then
+            msg_err "UDP port ${val} is already bound by an active user-space service on this server!"
+            msg_err "Please choose an unused UDP port (e.g., 4500, 8443, 1194)."
+            continue
+        fi
+
+        # Check kernel FOU table for protocol conflict (including GUE)
         local existing_fou_proto
-        existing_fou_proto=$(ip fou show 2>/dev/null | awk -v p="$val" '$2 == p {print $4}')
+        existing_fou_proto=$(ip fou show 2>/dev/null | awk -v p="$val" '$2 == p {if ($3=="gue") print "gue"; else print $4}' | head -1)
         if [ -n "$existing_fou_proto" ] && [ "$existing_fou_proto" != "$target_proto" ]; then
-            local p_curr="Unknown" p_req="Unknown"
+            local p_curr="ipproto ${existing_fou_proto}" p_req="Unknown"
             [ "$existing_fou_proto" = "4" ] && p_curr="IPIP (ipproto 4)"
             [ "$existing_fou_proto" = "47" ] && p_curr="GRE (ipproto 47)"
+            [ "$existing_fou_proto" = "gue" ] && p_curr="GUE (Generic UDP Encapsulation)"
             [ "$target_proto" = "4" ] && p_req="IPIP (ipproto 4)"
             [ "$target_proto" = "47" ] && p_req="GRE (ipproto 47)"
             msg_err "Port ${val} is already registered in Linux kernel FOU for ${p_curr}!"
             msg_err "A single UDP port cannot handle both ${p_curr} and ${p_req} simultaneously."
-            msg_err "Please choose a different port (e.g., $(( 51820 + TUNNEL_ID )))."
+            msg_err "Please choose a different port (e.g., 4500, 8443, 1194)."
             continue
         fi
 
-        # Check existing tunnel up scripts for conflicting protocol
-        local conflict_script=""
+        # Check existing tunnel up-scripts for conflicting protocol or non-FOU UDP port usage
+        local conflict_script="" conflict_reason="" s
         for s in "${SCRIPTS_DIR}"/*-up.sh; do
             [ -f "$s" ] || continue
             [ -n "${TUN_IF:-}" ] && [ "$s" = "${SCRIPTS_DIR}/${TUN_IF}-up.sh" ] && continue
-            if grep -q "FOU_PORT=\"${val}\"" "$s" 2>/dev/null; then
-                if [ "$target_proto" = "47" ] && grep -q 'ipproto 4\b' "$s" 2>/dev/null; then
+            if grep -Eq "^FOU_PORT=[\"']?${val}[\"']?$" "$s" 2>/dev/null; then
+                if [ "$target_proto" = "47" ] && grep -qE 'ipproto 4([^0-9]|$)' "$s" 2>/dev/null; then
                     conflict_script="$s"
+                    conflict_reason="IPIP over FOU"
                     break
-                elif [ "$target_proto" = "4" ] && grep -q 'ipproto 47\b' "$s" 2>/dev/null; then
+                elif [ "$target_proto" = "4" ] && grep -qE 'ipproto 47([^0-9]|$)' "$s" 2>/dev/null; then
                     conflict_script="$s"
+                    conflict_reason="GRE over FOU"
                     break
                 fi
+            elif grep -Eq "^(AWG_PORT|XDP_PORT|GENEVE_PORT|VXLAN_PORT)=[\"']?${val}[\"']?$" "$s" 2>/dev/null; then
+                conflict_script="$s"
+                conflict_reason="another tunnel protocol"
+                break
             fi
         done
         if [ -n "$conflict_script" ]; then
-            msg_err "Port ${val} is configured in '${conflict_script}' for an incompatible tunnel protocol!"
+            msg_err "Port ${val} is configured in '${conflict_script}' (${conflict_reason})!"
             msg_err "Please select an independent port to prevent tunnel failure."
             continue
+        fi
+
+        if [ "$val" -ge 51820 ] && [ "$val" -le 51850 ]; then
+            msg_warn "Port ${val} is in the WireGuard range (51820-51850), which some ISPs/Anti-DDoS rate-limit. Standard UDP ports (4500, 8443, 1194, 443) are recommended."
         fi
 
         printf -v "$var_name" "%s" "$val"
         return 0
     done
 }
-
 
 read_gre_key() {
     local prompt="$1" default="$2" var_name="$3"
@@ -347,26 +427,42 @@ read_gre_key() {
     done
 }
 
+read_mtu() {
+    local prompt="$1" default="$2" var_name="$3"
+    local val=""
+    while true; do
+        read_input "$prompt" "$default" val
+        val=$(echo "$val" | tr -d '\r\n[:space:]')
+        [ -z "$val" ] && val="$default"
+        if [[ "$val" =~ ^[0-9]+$ ]] && [ "$val" -ge 1280 ] && [ "$val" -le 1464 ]; then
+            printf -v "$var_name" "%s" "$val"
+            return 0
+        else
+            msg_err "Invalid MTU '${val}'. Must be an integer between 1280 and 1464."
+        fi
+    done
+}
+
 # ─── Auto-Detect ──────────────────────────────────────────────────
 detect_interface() {
     local iface=""
-    iface=$(ip route show default 2>/dev/null | awk '/default/ {print $5}' | head -1)
+    iface=$(ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')
     if [ -z "$iface" ]; then
-        iface=$(ip -o link show up 2>/dev/null | awk -F': ' '{print $2}' | sed 's/@.*//' | grep -v -E '^(lo|gre.*|tun.*|tap.*|docker.*|veth.*|erspan.*)$' | head -1)
+        iface=$(ip -o link show up 2>/dev/null | awk -F': ' '{print $2}' | sed 's/@.*//' | grep -v -E '^(lo|gre.*|ipip.*|awg.*|ftcp.*|gnv.*|vxlan.*|xdptun.*|mpbond.*|tun.*|tap.*|docker.*|veth.*|erspan.*)$' | head -1)
     fi
     [ -z "$iface" ] && iface="eth0"
     echo "$iface"
 }
 
 detect_public_ip() {
-    local ip="" iface
-    iface=$(detect_interface)
+    local ip="" iface="${1:-}"
+    [ -z "$iface" ] && iface=$(detect_interface)
     if [ -n "$iface" ]; then
         ip=$(ip -4 addr show "$iface" 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 | head -1)
     fi
     if [ -z "$ip" ] || [[ "$ip" =~ ^(127\.|10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.) ]]; then
         local ext_ip
-        ext_ip=$(curl -s4 --connect-timeout 2 https://api.ipify.org 2>/dev/null || curl -s4 --connect-timeout 2 https://ifconfig.me 2>/dev/null || true)
+        ext_ip=$(curl -s4 --connect-timeout 2 --max-time 4 https://api.ipify.org 2>/dev/null || curl -s4 --connect-timeout 2 --max-time 4 https://ifconfig.me 2>/dev/null || true)
         if validate_ipv4 "$ext_ip"; then
             ip="$ext_ip"
         fi
@@ -377,7 +473,42 @@ detect_public_ip() {
     echo "$ip"
 }
 
-# ─── Install Prerequisites ───────────────────────────────────────
+# ─── Prerequisites & Kernel Persistence ───────────────────────────
+write_modules_load_conf() {
+    mkdir -p /etc/modules-load.d
+    cat > /etc/modules-load.d/99-xmanager-gre.conf << 'EOF'
+# XManager GRE over FOU required kernel modules
+ip_gre
+fou
+tcp_bbr
+nf_conntrack
+EOF
+}
+
+check_prereqs_ready() {
+    local missing=0
+    local cmd mod
+    for cmd in nft ip ethtool ping; do
+        if ! command -v "$cmd" &>/dev/null; then
+            msg_warn "Required command '${cmd}' not found."
+            missing=1
+        fi
+    done
+    for mod in ip_gre fou; do
+        if ! modprobe "$mod" 2>/dev/null; then
+            msg_warn "Kernel module '${mod}' could not be loaded."
+            missing=1
+        fi
+    done
+    if [ "$missing" -eq 1 ]; then
+        read -p "  Install missing prerequisites now? (Y/n): " inst_choice
+        if [[ ! "$inst_choice" =~ ^[Nn]$ ]]; then
+            install_prereqs || return 1
+        fi
+    fi
+    return 0
+}
+
 install_prereqs() {
     echo ""
     msg_info "Checking prerequisites..."
@@ -387,14 +518,6 @@ install_prereqs() {
         if ! command -v "$cmd" &>/dev/null; then
             msg_warn "Required command '${cmd}' not found."
             need_install=1
-        fi
-    done
-
-    for mod in ip_gre fou tcp_bbr nf_conntrack; do
-        if ! modprobe "$mod" 2>/dev/null; then
-            msg_warn "Kernel module '${mod}' not loaded or unavailable."
-        else
-            msg_ok "Kernel module '${mod}' ready."
         fi
     done
 
@@ -411,13 +534,40 @@ install_prereqs() {
             return 1
         fi
     fi
+
+    for mod in ip_gre fou tcp_bbr nf_conntrack; do
+        if ! modprobe "$mod" 2>/dev/null; then
+            msg_warn "Kernel module '${mod}' not loaded or unavailable."
+        else
+            msg_ok "Kernel module '${mod}' ready."
+        fi
+    done
+
+    write_modules_load_conf
+    msg_ok "Persistent modules config written: /etc/modules-load.d/99-xmanager-gre.conf"
     msg_ok "All prerequisites verified."
 }
 
-# ─── Persist System Tuning across Reboots ─────────────────────────
 persist_sysctl_tuning() {
-    cat > /etc/sysctl.d/99-xmanager-tunnel.conf << 'EOF'
-# XManager High-Speed Kernel & Network Tuning
+    write_modules_load_conf
+
+    local mem_kb mem_mb MAX_BUF CT_MAX CT_HASH
+    mem_kb=$(awk '/MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 4194304)
+    [[ ! "$mem_kb" =~ ^[0-9]+$ ]] && mem_kb=4194304
+    mem_mb=$(( mem_kb / 1024 ))
+
+    if [ "$mem_mb" -le 2048 ]; then
+        MAX_BUF=16777216
+        CT_MAX=524288
+        CT_HASH=131072
+    else
+        MAX_BUF=33554432
+        CT_MAX=2097152
+        CT_HASH=524288
+    fi
+
+    cat > /etc/sysctl.d/99-xmanager-tunnel.conf << EOF
+# XManager High-Speed Kernel & Network Tuning (RAM-scaled: ${mem_mb}MB)
 net.ipv4.ip_forward = 1
 net.ipv4.conf.all.rp_filter = 0
 net.ipv4.conf.default.rp_filter = 0
@@ -436,14 +586,14 @@ net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 net.ipv4.tcp_mtu_probing = 1
 
-# High-Performance Buffer Sizes (32MB Max)
+# High-Performance Buffer Sizes (RAM-aware)
 net.core.rmem_default = 262144
 net.core.wmem_default = 262144
-net.core.rmem_max = 33554432
-net.core.wmem_max = 33554432
+net.core.rmem_max = ${MAX_BUF}
+net.core.wmem_max = ${MAX_BUF}
 net.core.optmem_max = 2097152
-net.ipv4.tcp_rmem = 4096 87380 33554432
-net.ipv4.tcp_wmem = 4096 65536 33554432
+net.ipv4.tcp_rmem = 4096 87380 ${MAX_BUF}
+net.ipv4.tcp_wmem = 4096 65536 ${MAX_BUF}
 net.ipv4.udp_rmem_min = 16384
 net.ipv4.udp_wmem_min = 16384
 net.ipv4.tcp_adv_win_scale = 1
@@ -455,7 +605,7 @@ net.ipv4.ipfrag_high_thresh = 16777216
 net.ipv4.ipfrag_low_thresh = 8388608
 net.ipv4.ipfrag_time = 30
 net.core.netdev_max_backlog = 100000
-net.core.netdev_budget = 600
+net.core.netdev_budget = 1200
 net.core.netdev_budget_usecs = 8000
 
 # Connection Scalability & Limits
@@ -463,23 +613,36 @@ fs.file-max = 2097152
 fs.nr_open = 2097152
 net.core.somaxconn = 100000
 net.ipv4.tcp_max_syn_backlog = 100000
-net.ipv4.ip_local_port_range = 1024 65535
+net.ipv4.ip_local_port_range = 10000 65535
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_fin_timeout = 15
 net.ipv4.tcp_keepalive_time = 120
 net.ipv4.tcp_keepalive_intvl = 10
 net.ipv4.tcp_keepalive_probes = 3
-net.netfilter.nf_conntrack_max = 2097152
+net.ipv4.tcp_max_tw_buckets = 2000000
+net.ipv4.tcp_window_scaling = 1
+net.ipv4.tcp_sack = 1
+net.ipv4.tcp_no_metrics_save = 1
+net.ipv4.tcp_moderate_rcvbuf = 1
+net.netfilter.nf_conntrack_max = ${CT_MAX}
 EOF
+
+    modprobe tcp_bbr 2>/dev/null || true
+    modprobe nf_conntrack 2>/dev/null || true
     sysctl -p /etc/sysctl.d/99-xmanager-tunnel.conf >/dev/null 2>&1 || true
+    if [ -w /sys/module/nf_conntrack/parameters/hashsize ]; then
+        echo "${CT_HASH}" > /sys/module/nf_conntrack/parameters/hashsize 2>/dev/null || true
+    fi
 }
 
 # ─── Generate FOU-UP Script ──────────────────────────────────────
 generate_gre_up() {
     local script_path="$1"
-    cat > "${script_path}" << GREEOF
+    local tun_mtu="${TUN_MTU:-1392}"
+
+    cat > "${script_path}" << GREHDR
 #!/usr/bin/env bash
-set -eu
+set -euo pipefail
 
 IF_WAN="${IF_WAN}"
 TUN_IF="${TUN_IF}"
@@ -494,295 +657,418 @@ LOCAL_TUN="${LOCAL_TUN}"
 GRE_KEY="${GRE_KEY}"
 FOU_ENABLE="${FOU_ENABLE}"
 FOU_PORT="${FOU_PORT}"
+TUN_MTU="${tun_mtu}"
 
-NFT_TABLE="fw_${TUNNEL_ID}"
+NFT_TABLE="fw_gre_${TUNNEL_ID}"
+LEGACY_NFT_TABLE="fw_${TUNNEL_ID}"
+STATE_DIR="${STATE_DIR}"
+GREHDR
 
-# ── Reload persistent sysctl config ──
+    cat >> "${script_path}" << 'GREBODY'
+# Clear any intentional-stop marker when starting up
+mkdir -p -m 700 "${STATE_DIR}"
+rm -f "${STATE_DIR}/${TUN_IF}.stopped"
+
+# Load required kernel modules and apply persistent sysctl tuning
+modprobe tcp_bbr 2>/dev/null || true
+modprobe nf_conntrack 2>/dev/null || true
+modprobe ip_gre 2>/dev/null || true
 sysctl -p /etc/sysctl.d/99-xmanager-tunnel.conf >/dev/null 2>&1 || true
 
-# ── Security: rp_filter on all + required interfaces ──
-sysctl -w net.ipv4.conf.all.rp_filter=0     >/dev/null 2>&1 || true
+# Disable rp_filter on WAN (converts dots to slashes for VLAN sub-interfaces)
+SYSCTL_WAN="${IF_WAN//./\/}"
+sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1 || true
 sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1 || true
-for iface in \${IF_WAN}; do
-    sysctl -w net.ipv4.conf.\${iface}.rp_filter=0 >/dev/null 2>&1 || true
-done
+sysctl -w "net.ipv4.conf.${SYSCTL_WAN}.rp_filter=0" >/dev/null 2>&1 || true
 
-# ── Security: Network hardening ──
-sysctl -w net.ipv4.ip_forward=1                              >/dev/null 2>&1 || true
-sysctl -w net.ipv4.conf.all.accept_redirects=0               >/dev/null 2>&1 || true
-sysctl -w net.ipv4.conf.all.send_redirects=0                 >/dev/null 2>&1 || true
-sysctl -w net.ipv4.conf.all.accept_source_route=0            >/dev/null 2>&1 || true
-sysctl -w net.ipv4.conf.default.accept_redirects=0           >/dev/null 2>&1 || true
-sysctl -w net.ipv4.conf.default.send_redirects=0             >/dev/null 2>&1 || true
-sysctl -w net.ipv4.conf.default.accept_source_route=0        >/dev/null 2>&1 || true
-sysctl -w net.ipv4.icmp_echo_ignore_broadcasts=1             >/dev/null 2>&1 || true
-sysctl -w net.ipv4.icmp_ignore_bogus_error_responses=1       >/dev/null 2>&1 || true
-sysctl -w net.ipv4.tcp_syncookies=1                          >/dev/null 2>&1 || true
-
-# ── Performance: TCP (BBR + Adaptive low-latency buffers) ──
-modprobe tcp_bbr 2>/dev/null || true
-sysctl -w net.ipv4.tcp_congestion_control=bbr  >/dev/null 2>&1 || true
-sysctl -w net.core.default_qdisc=fq            >/dev/null 2>&1 || true
-sysctl -w net.ipv4.tcp_mtu_probing=1           >/dev/null 2>&1 || true
-
-# Adaptive buffer sizes: prevents bufferbloat & RAM exhaustion under heavy concurrent connections
-sysctl -w net.core.rmem_default=262144         >/dev/null 2>&1 || true
-sysctl -w net.core.wmem_default=262144         >/dev/null 2>&1 || true
-sysctl -w net.core.rmem_max=33554432           >/dev/null 2>&1 || true
-sysctl -w net.core.wmem_max=33554432           >/dev/null 2>&1 || true
-sysctl -w net.core.optmem_max=2097152          >/dev/null 2>&1 || true
-sysctl -w net.ipv4.tcp_rmem="4096 87380 33554432" >/dev/null 2>&1 || true
-sysctl -w net.ipv4.tcp_wmem="4096 65536 33554432" >/dev/null 2>&1 || true
-sysctl -w net.ipv4.udp_rmem_min=8192           >/dev/null 2>&1 || true
-sysctl -w net.ipv4.udp_wmem_min=8192           >/dev/null 2>&1 || true
-
-sysctl -w net.ipv4.tcp_adv_win_scale=1         >/dev/null 2>&1 || true
-sysctl -w net.ipv4.tcp_fastopen=3              >/dev/null 2>&1 || true
-sysctl -w net.ipv4.tcp_slow_start_after_idle=0 >/dev/null 2>&1 || true
-sysctl -w net.ipv4.tcp_notsent_lowat=16384     >/dev/null 2>&1 || true
-sysctl -w net.ipv4.tcp_autocorking=0           >/dev/null 2>&1 || true
-sysctl -w net.ipv4.ipfrag_high_thresh=16777216 >/dev/null 2>&1 || true
-sysctl -w net.ipv4.ipfrag_low_thresh=8388608   >/dev/null 2>&1 || true
-sysctl -w net.ipv4.ipfrag_time=30              >/dev/null 2>&1 || true
-sysctl -w net.core.netdev_max_backlog=100000   >/dev/null 2>&1 || true
-sysctl -w net.core.netdev_budget=600           >/dev/null 2>&1 || true
-sysctl -w net.core.netdev_budget_usecs=8000    >/dev/null 2>&1 || true
-
-# ── Performance: Max connections & bandwidth ──
-modprobe nf_conntrack 2>/dev/null || true
-sysctl -w fs.file-max=2097152                          >/dev/null 2>&1 || true
-sysctl -w fs.nr_open=2097152                           >/dev/null 2>&1 || true
-sysctl -w net.core.somaxconn=100000                    >/dev/null 2>&1 || true
-sysctl -w net.ipv4.tcp_max_syn_backlog=100000          >/dev/null 2>&1 || true
-sysctl -w net.ipv4.ip_local_port_range="1024 65535"    >/dev/null 2>&1 || true
-sysctl -w net.ipv4.tcp_tw_reuse=1                      >/dev/null 2>&1 || true
-sysctl -w net.ipv4.tcp_fin_timeout=15                  >/dev/null 2>&1 || true
-sysctl -w net.ipv4.tcp_keepalive_time=120              >/dev/null 2>&1 || true
-sysctl -w net.ipv4.tcp_keepalive_intvl=10              >/dev/null 2>&1 || true
-sysctl -w net.ipv4.tcp_keepalive_probes=3              >/dev/null 2>&1 || true
-sysctl -w net.ipv4.tcp_max_tw_buckets=2000000          >/dev/null 2>&1 || true
-sysctl -w net.ipv4.tcp_window_scaling=1                >/dev/null 2>&1 || true
-sysctl -w net.ipv4.tcp_sack=1                          >/dev/null 2>&1 || true
-sysctl -w net.ipv4.tcp_no_metrics_save=1               >/dev/null 2>&1 || true
-sysctl -w net.ipv4.tcp_moderate_rcvbuf=1               >/dev/null 2>&1 || true
-sysctl -w net.netfilter.nf_conntrack_max=2097152       >/dev/null 2>&1 || true
-[ -d /sys/module/nf_conntrack/parameters ] && echo 524288 > /sys/module/nf_conntrack/parameters/hashsize 2>/dev/null || true
-ulimit -n 1048576 2>/dev/null || true
-
-# ── GRE Tunnel ──
-modprobe ip_gre || true
-
-ip link set dev \${TUN_IF} down 2>/dev/null || true
-ip tunnel del \${TUN_IF} 2>/dev/null || true
-ip link del \${TUN_IF}   2>/dev/null || true
-
-if [ "\${FOU_ENABLE}" = "yes" ]; then
-    modprobe fou 2>/dev/null || true
-    # Safely ensure FOU listener on FOU_PORT with protocol 47 (GRE)
-    EXISTING_PROTO=\$(ip fou show 2>/dev/null | awk -v p="\${FOU_PORT}" '\$2 == p {print \$4}')
-    if [ -n "\$EXISTING_PROTO" ] && [ "\$EXISTING_PROTO" != "47" ]; then
-        echo "ERROR: FOU port \${FOU_PORT} is already bound to ipproto \${EXISTING_PROTO}! Cannot bind GRE (ipproto 47)." >&2
+# Wait up to 10s for WAN interface to appear during boot
+wait_cnt=0
+while ! ip link show "${IF_WAN}" >/dev/null 2>&1; do
+    wait_cnt=$((wait_cnt + 1))
+    if [ "$wait_cnt" -ge 10 ]; then
+        echo "ERROR: WAN interface '${IF_WAN}' not found after 10s!" >&2
         exit 1
     fi
-    if [ -z "\$EXISTING_PROTO" ]; then
-        ip fou add port \${FOU_PORT} ipproto 47
+    sleep 1
+done
+
+# Clean up any leftover tunnel interface
+ip link set dev "${TUN_IF}" down 2>/dev/null || true
+ip tunnel del "${TUN_IF}" 2>/dev/null || true
+ip link del "${TUN_IF}" 2>/dev/null || true
+
+# Create GRE tunnel (with Foo-over-UDP encapsulation and UDP checksum enabled)
+if [ "${FOU_ENABLE}" = "yes" ]; then
+    modprobe fou 2>/dev/null || true
+    EXISTING_PROTO=$(ip fou show 2>/dev/null | awk -v p="${FOU_PORT}" '$2 == p {if ($3=="gue") print "gue"; else print $4}' | head -1 || true)
+    if [ -n "${EXISTING_PROTO}" ] && [ "${EXISTING_PROTO}" != "47" ]; then
+        echo "ERROR: FOU port ${FOU_PORT} is already bound to ${EXISTING_PROTO}! Cannot bind GRE (ipproto 47)." >&2
+        exit 1
     fi
-    ip link add name \${TUN_IF} type gre local \${LOCAL_REAL} remote \${REMOTE_REAL} ttl 64 key \${GRE_KEY} encap fou encap-sport auto encap-dport \${FOU_PORT}
-    MTU=1392
-    MSS=1352
+    if [ -z "${EXISTING_PROTO}" ]; then
+        ip fou add port "${FOU_PORT}" ipproto 47
+    fi
+    ip link add name "${TUN_IF}" type gre local "${LOCAL_REAL}" remote "${REMOTE_REAL}" ttl 64 key "${GRE_KEY}" encap fou encap-csum encap-sport auto encap-dport "${FOU_PORT}"
+    MTU="${TUN_MTU:-1392}"
+    MSS=$(( MTU - 40 ))
 else
-    ip link add name \${TUN_IF} type gre local \${LOCAL_REAL} remote \${REMOTE_REAL} ttl 64 key \${GRE_KEY}
-    MTU=1400
-    MSS=1360
+    ip link add name "${TUN_IF}" type gre local "${LOCAL_REAL}" remote "${REMOTE_REAL}" ttl 64 key "${GRE_KEY}"
+    MTU="${TUN_MTU:-1400}"
+    MSS=$(( MTU - 40 ))
 fi
 
-ip addr replace \${LOCAL_TUN} dev \${TUN_IF} 2>/dev/null || ip addr add \${LOCAL_TUN} dev \${TUN_IF}
-ip link set \${TUN_IF} mtu \${MTU}
-ip link set \${TUN_IF} txqueuelen 10000
-ip link set \${TUN_IF} up
-# Network card ring buffer & queue tuning to prevent burst packet drops
-ethtool -G \${IF_WAN} rx 4096 tx 4096 2>/dev/null || ethtool -G \${IF_WAN} rx 2048 tx 2048 2>/dev/null || true
-ip link set dev \${IF_WAN} txqueuelen 10000 2>/dev/null || true
+# Configure tunnel interface parameters BEFORE bringing link UP (prevents IPv6 RS / rp_filter race)
+sysctl -w "net.ipv6.conf.${TUN_IF}.disable_ipv6=1" >/dev/null 2>&1 || true
+sysctl -w "net.ipv4.conf.${TUN_IF}.rp_filter=0" >/dev/null 2>&1 || true
+ip addr replace "${LOCAL_TUN}" dev "${TUN_IF}" 2>/dev/null || ip addr add "${LOCAL_TUN}" dev "${TUN_IF}"
+ip link set "${TUN_IF}" mtu "${MTU}"
+ip link set "${TUN_IF}" txqueuelen 10000
+ethtool -K "${TUN_IF}" tso off gso off gro off 2>/dev/null || true
+ip link set "${TUN_IF}" up
 
-# Disable hardware offloads on WAN and tunnel to prevent corrupted frames and softirq spikes
-ethtool -K \${IF_WAN} tso off gso off gro off 2>/dev/null || true
-ethtool -K \${TUN_IF} tso off gso off gro off 2>/dev/null || true
+# Route advmss tuning forces locally originated TCP sockets to clamp MSS automatically
+TUN_SUBNET=$(echo "${LOCAL_TUN}" | sed -E 's/\.[0-9]+\//.0\//')
+LOCAL_IP_ONLY=$(echo "${LOCAL_TUN}" | cut -d/ -f1)
+ip route replace "${TUN_SUBNET}" dev "${TUN_IF}" proto kernel scope link src "${LOCAL_IP_ONLY}" advmss "${MSS}" 2>/dev/null || true
 
-# Route advmss tuning: forces local sockets to clamp MSS automatically
-TUN_SUBNET=\$(echo \${LOCAL_TUN} | sed -E 's/\.[0-9]+\//.0\//')
-LOCAL_IP_ONLY=\$(echo \${LOCAL_TUN} | cut -d/ -f1)
-ip route replace \${TUN_SUBNET} dev \${TUN_IF} proto kernel scope link src \${LOCAL_IP_ONLY} advmss \${MSS} 2>/dev/null || true
+# Non-disruptive WAN ring buffer tuning (only increase if current < target; avoids link reset on restart)
+RING_INFO=$(ethtool -g "${IF_WAN}" 2>/dev/null || true)
+if [ -n "${RING_INFO}" ]; then
+    read -r MAX_RX MAX_TX CUR_RX CUR_TX < <(echo "${RING_INFO}" | awk '
+        /^Pre-set maximums:/ { sec="max"; next }
+        /^Current hardware settings:/ { sec="cur"; next }
+        /^RX:[[:space:]]+/ { if (sec=="max") mr=$2; else if (sec=="cur") cr=$2 }
+        /^TX:[[:space:]]+/ { if (sec=="max") mt=$2; else if (sec=="cur") ct=$2 }
+        END { printf "%s %s %s %s\n", (mr==""?"n/a":mr), (mt==""?"n/a":mt), (cr==""?"n/a":cr), (ct==""?"n/a":ct) }
+    ')
+    RING_ARGS=()
+    if [[ "${MAX_RX}" =~ ^[0-9]+$ ]] && [[ "${CUR_RX}" =~ ^[0-9]+$ ]]; then
+        TGT_RX=4096; [ "${MAX_RX}" -lt "${TGT_RX}" ] && TGT_RX="${MAX_RX}"
+        [ "${TGT_RX}" -gt 0 ] && [ "${CUR_RX}" -lt "${TGT_RX}" ] && RING_ARGS+=(rx "${TGT_RX}")
+    fi
+    if [[ "${MAX_TX}" =~ ^[0-9]+$ ]] && [[ "${CUR_TX}" =~ ^[0-9]+$ ]]; then
+        TGT_TX=4096; [ "${MAX_TX}" -lt "${TGT_TX}" ] && TGT_TX="${MAX_TX}"
+        [ "${TGT_TX}" -gt 0 ] && [ "${CUR_TX}" -lt "${TGT_TX}" ] && RING_ARGS+=(tx "${TGT_TX}")
+    fi
+    if [ ${#RING_ARGS[@]} -gt 0 ]; then
+        ethtool -G "${IF_WAN}" "${RING_ARGS[@]}" 2>/dev/null || true
+    fi
+fi
+ip link set dev "${IF_WAN}" txqueuelen 10000 2>/dev/null || true
 
-# Keepalive: detect dead peer (every 10s, 3 retries)
-ip tunnel change \${TUN_IF} keepalive 10 3 2>/dev/null || true
+# Disable hardware offloads on WAN to prevent corrupted FOU frames and softirq spikes
+ethtool -K "${IF_WAN}" tso off gso off gro off 2>/dev/null || true
+ethtool -K "${IF_WAN}" tx-udp_tnl-segmentation off tx-udp_tnl-csum-segmentation off 2>/dev/null || true
 
-# Disable IPv6 on tunnel (prevent leaks)
-sysctl -w net.ipv6.conf.\${TUN_IF}.disable_ipv6=1 >/dev/null 2>&1 || true
-# Scoped rp_filter for tunnel interface
-sysctl -w net.ipv4.conf.\${TUN_IF}.rp_filter=0    >/dev/null 2>&1 || true
+# Qdisc: Fair Queue with elevated flow_limit to prevent burst tail drops
+tc qdisc replace dev "${IF_WAN}" root fq flow_limit 1000 2>/dev/null || tc qdisc replace dev "${IF_WAN}" root fq 2>/dev/null || true
+tc qdisc replace dev "${TUN_IF}" root fq flow_limit 1000 2>/dev/null || tc qdisc replace dev "${TUN_IF}" root fq 2>/dev/null || true
 
-# ── Qdisc: Fair Queue ──
-tc qdisc add dev \${IF_WAN} root fq 2>/dev/null || true
-tc qdisc replace dev \${TUN_IF} root fq 2>/dev/null || true
-
-# ── RPS & RFS: distribute across cores ──
-CORES=\$(nproc 2>/dev/null || echo 1)
-if [ "\${CORES}" -gt 1 ]; then
-    if [ "\${CORES}" -gt 32 ]; then
+# Smart RPS & RFS: distribute packets across CPU cores only when RX queues < cores (preserve hardware RSS)
+CORES=$(nproc 2>/dev/null || echo 1)
+RX_QUEUES=$({ find "/sys/class/net/${IF_WAN}/queues" -maxdepth 1 -type d -name 'rx-*' 2>/dev/null || true; } | wc -l | tr -d '[:space:]')
+[[ ! "${RX_QUEUES}" =~ ^[0-9]+$ ]] && RX_QUEUES=0
+if [ "${CORES}" -gt 1 ] && [ "${RX_QUEUES}" -gt 0 ] && [ "${RX_QUEUES}" -lt "${CORES}" ]; then
+    if [ "${CORES}" -ge 32 ]; then
         RPS_MASK="ffffffff"
     else
-        RPS_MASK=\$(printf '%x' \$(( (1 << CORES) - 1 )))
+        RPS_MASK=$(printf '%x' $(( (1 << CORES) - 1 )))
     fi
-    for q in /sys/class/net/\${IF_WAN}/queues/rx-*/rps_cpus; do
-        [ -f "\${q}" ] && echo \${RPS_MASK} > "\${q}" 2>/dev/null || true
+    FLOW_PER_Q=$(( 32768 / RX_QUEUES ))
+    [ "${FLOW_PER_Q}" -lt 2048 ] && FLOW_PER_Q=2048
+    for q in /sys/class/net/${IF_WAN}/queues/rx-*/rps_cpus; do
+        [ -f "${q}" ] && echo "${RPS_MASK}" > "${q}" 2>/dev/null || true
     done
-    for q in /sys/class/net/\${IF_WAN}/queues/rx-*/rps_flow_cnt; do
-        [ -f "\${q}" ] && echo 32768 > "\${q}" 2>/dev/null || true
+    for q in /sys/class/net/${IF_WAN}/queues/rx-*/rps_flow_cnt; do
+        [ -f "${q}" ] && echo "${FLOW_PER_Q}" > "${q}" 2>/dev/null || true
     done
     echo 32768 > /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null || true
 fi
 
-# ── nftables ──
-nft delete table ip \${NFT_TABLE} 2>/dev/null || true
-nft add table ip \${NFT_TABLE}
+# Surgically remove legacy fw_${ID} table if it belongs to this tunnel
+if nft list table ip "${LEGACY_NFT_TABLE}" 2>/dev/null | grep -qE "\"?${TUN_IF}\"?|fwd_mss"; then
+    nft delete table ip "${LEGACY_NFT_TABLE}" 2>/dev/null || true
+fi
 
-# Check if IP spoofing is enabled and needed
+# Determine whether stateless IP spoofing is enabled
 DO_SPOOF=0
-if [ -n "\${LOCAL_SPOOF}" ] && [ -n "\${REMOTE_SPOOF}" ] && { [ "\${LOCAL_SPOOF}" != "\${LOCAL_REAL}" ] || [ "\${REMOTE_SPOOF}" != "\${REMOTE_REAL}" ]; }; then
+if [ -n "${LOCAL_SPOOF}" ] && [ -n "${REMOTE_SPOOF}" ] && { [ "${LOCAL_SPOOF}" != "${LOCAL_REAL}" ] || [ "${REMOTE_SPOOF}" != "${REMOTE_REAL}" ]; }; then
     DO_SPOOF=1
 fi
 
-if [ "\$DO_SPOOF" -eq 1 ]; then
-    nft add chain ip \${NFT_TABLE} prerouting  '{ type filter hook prerouting  priority -300 ; }'
-    nft add chain ip \${NFT_TABLE} postrouting '{ type filter hook postrouting priority  300 ; }'
-
-    if [ "\${FOU_ENABLE}" = "yes" ]; then
-        nft add rule ip \${NFT_TABLE} prerouting  iif "\${IF_WAN}" ip saddr \${REMOTE_SPOOF} ip daddr \${LOCAL_REAL} udp dport \${FOU_PORT} ip saddr set \${REMOTE_REAL} notrack
-        nft add rule ip \${NFT_TABLE} postrouting oif "\${IF_WAN}" ip saddr \${LOCAL_REAL} ip daddr \${REMOTE_REAL} udp dport \${FOU_PORT} ip saddr set \${LOCAL_SPOOF} notrack
+# Apply atomic nftables ruleset (zero leak window + proper output/prerouting notrack + bidirectional MSS clamping)
+{
+    echo "table ip ${NFT_TABLE}"
+    echo "delete table ip ${NFT_TABLE}"
+    echo "table ip ${NFT_TABLE} {"
+    echo "    chain prerouting {"
+    echo "        type filter hook prerouting priority -300; policy accept;"
+    if [ "${FOU_ENABLE}" = "yes" ]; then
+        if [ "${DO_SPOOF}" -eq 1 ]; then
+            echo "        iifname \"${IF_WAN}\" ip saddr ${REMOTE_SPOOF} ip daddr ${LOCAL_REAL} udp dport ${FOU_PORT} ip saddr set ${REMOTE_REAL} notrack"
+        else
+            echo "        iifname \"${IF_WAN}\" ip saddr ${REMOTE_REAL} ip daddr ${LOCAL_REAL} udp dport ${FOU_PORT} notrack"
+        fi
     else
-        nft add rule ip \${NFT_TABLE} prerouting  iif "\${IF_WAN}" ip protocol gre ip saddr \${REMOTE_SPOOF} ip daddr \${LOCAL_REAL} ip saddr set \${REMOTE_REAL} notrack
-        nft add rule ip \${NFT_TABLE} postrouting oif "\${IF_WAN}" ip protocol gre ip saddr \${LOCAL_REAL} ip daddr \${REMOTE_REAL} ip saddr set \${LOCAL_SPOOF} notrack
+        if [ "${DO_SPOOF}" -eq 1 ]; then
+            echo "        iifname \"${IF_WAN}\" ip protocol gre ip saddr ${REMOTE_SPOOF} ip daddr ${LOCAL_REAL} ip saddr set ${REMOTE_REAL} notrack"
+        else
+            echo "        iifname \"${IF_WAN}\" ip protocol gre ip saddr ${REMOTE_REAL} ip daddr ${LOCAL_REAL} notrack"
+        fi
     fi
-fi
+    echo "    }"
+    echo "    chain output {"
+    echo "        type filter hook output priority -300; policy accept;"
+    if [ "${FOU_ENABLE}" = "yes" ]; then
+        echo "        oifname \"${IF_WAN}\" ip saddr ${LOCAL_REAL} ip daddr ${REMOTE_REAL} udp dport ${FOU_PORT} notrack"
+    else
+        echo "        oifname \"${IF_WAN}\" ip protocol gre ip saddr ${LOCAL_REAL} ip daddr ${REMOTE_REAL} notrack"
+    fi
+    echo "    }"
+    if [ "${DO_SPOOF}" -eq 1 ]; then
+        echo "    chain postrouting {"
+        echo "        type filter hook postrouting priority 300; policy accept;"
+        if [ "${FOU_ENABLE}" = "yes" ]; then
+            echo "        oifname \"${IF_WAN}\" ip saddr ${LOCAL_REAL} ip daddr ${REMOTE_REAL} udp dport ${FOU_PORT} ip saddr set ${LOCAL_SPOOF}"
+        else
+            echo "        oifname \"${IF_WAN}\" ip protocol gre ip saddr ${LOCAL_REAL} ip daddr ${REMOTE_REAL} ip saddr set ${LOCAL_SPOOF}"
+        fi
+        echo "    }"
+    fi
+    echo "    chain fwd_mss {"
+    echo "        type filter hook forward priority -150; policy accept;"
+    echo "        oifname \"${TUN_IF}\" tcp flags & (syn | rst) == syn tcp option maxseg size > ${MSS} tcp option maxseg size set ${MSS}"
+    echo "        iifname \"${TUN_IF}\" tcp flags & (syn | rst) == syn tcp option maxseg size > ${MSS} tcp option maxseg size set ${MSS}"
+    echo "    }"
+    echo "    chain out_mss {"
+    echo "        type filter hook output priority -150; policy accept;"
+    echo "        oifname \"${TUN_IF}\" tcp flags & (syn | rst) == syn tcp option maxseg size > ${MSS} tcp option maxseg size set ${MSS}"
+    echo "    }"
+    echo "}"
+} | nft -f -
 
-# MSS Clamping
-nft add chain ip \${NFT_TABLE} fwd_mss '{ type filter hook forward priority 0 ; }'
-nft add rule  ip \${NFT_TABLE} fwd_mss oif "\${TUN_IF}" tcp flags syn tcp option maxseg size set \${MSS}
-nft add rule  ip \${NFT_TABLE} fwd_mss iif "\${TUN_IF}" tcp flags syn tcp option maxseg size set \${MSS}
-
-nft add chain ip \${NFT_TABLE} out_mss '{ type filter hook output priority 0 ; }'
-nft add rule  ip \${NFT_TABLE} out_mss oif "\${TUN_IF}" tcp flags syn tcp option maxseg size set \${MSS}
-
-echo "GRE tunnel \${TUN_IF} UP (table: \${NFT_TABLE})"
-GREEOF
+echo "GRE tunnel ${TUN_IF} UP (table: ${NFT_TABLE}, mtu: ${MTU}, mss: ${MSS})"
+GREBODY
     chmod 750 "${script_path}"
 }
 
 # ─── Generate FOU-DOWN Script ────────────────────────────────────
 generate_gre_down() {
     local script_path="$1"
-    cat > "${script_path}" << GREEOF
+    cat > "${script_path}" << GREHDR
 #!/usr/bin/env bash
 TUN_IF="${TUN_IF}"
-NFT_TABLE="fw_${TUNNEL_ID}"
+NFT_TABLE="fw_gre_${TUNNEL_ID}"
+LEGACY_NFT_TABLE="fw_${TUNNEL_ID}"
 FOU_PORT="${FOU_PORT}"
+STATE_DIR="${STATE_DIR}"
+GREHDR
 
-ip link set dev \${TUN_IF} down 2>/dev/null || true
-ip tunnel del \${TUN_IF} 2>/dev/null || true
-ip link del \${TUN_IF}   2>/dev/null || true
-nft delete table ip \${NFT_TABLE} 2>/dev/null || true
-# Free FOU socket ONLY if no other active up-script uses this FOU_PORT
-if [ -n "\${FOU_PORT}" ]; then
+    cat >> "${script_path}" << 'GREBODY'
+ip link set dev "${TUN_IF}" down 2>/dev/null || true
+ip tunnel del "${TUN_IF}" 2>/dev/null || true
+ip link del "${TUN_IF}" 2>/dev/null || true
+
+nft delete table ip "${NFT_TABLE}" 2>/dev/null || true
+if nft list table ip "${LEGACY_NFT_TABLE}" 2>/dev/null | grep -qE "\"?${TUN_IF}\"?|fwd_mss"; then
+    nft delete table ip "${LEGACY_NFT_TABLE}" 2>/dev/null || true
+fi
+
+# Free FOU socket ONLY if no other up-script uses this FOU_PORT
+if [ -n "${FOU_PORT}" ]; then
     other_using=0
     for s in /usr/local/bin/*-up.sh; do
-        [ -f "\$s" ] || continue
-        [ "\$s" = "/usr/local/bin/\${TUN_IF}-up.sh" ] && continue
-        if grep -q "FOU_PORT=\"\${FOU_PORT}\"" "\$s" 2>/dev/null; then
+        [ -f "$s" ] || continue
+        [ "$s" = "/usr/local/bin/${TUN_IF}-up.sh" ] && continue
+        if grep -Eq "^FOU_PORT=[\"']?${FOU_PORT}[\"']?$" "$s" 2>/dev/null; then
             other_using=1
             break
         fi
     done
-    if [ "\$other_using" -eq 0 ]; then
-        ip fou del port "\${FOU_PORT}" 2>/dev/null || true
+    if [ "$other_using" -eq 0 ]; then
+        ip fou del port "${FOU_PORT}" 2>/dev/null || true
     fi
 fi
 
-echo "GRE tunnel \${TUN_IF} DOWN (table: \${NFT_TABLE})"
-GREEOF
+echo "GRE tunnel ${TUN_IF} DOWN (table: ${NFT_TABLE})"
+GREBODY
     chmod 750 "${script_path}"
 }
 
 # ─── Generate Watchdog Script ─────────────────────────────────────
 generate_watchdog() {
     local script_path="$1"
-    cat > "${script_path}" << WDEOF
+    cat > "${script_path}" << WDHDR
 #!/usr/bin/env bash
 TUN_IF="${TUN_IF}"
 REMOTE_TUN="${REMOTE_TUN}"
 SERVICE="gre-tunnel-${TUNNEL_ID}"
+KA_SERVICE="gre-keepalive-${TUNNEL_ID}"
+NFT_TABLE="fw_gre_${TUNNEL_ID}"
+FOU_ENABLE="${FOU_ENABLE:-yes}"
+FOU_PORT="${FOU_PORT:-}"
+STATE_DIR="${STATE_DIR}"
 MAX_FAIL=3
-FAIL_FILE="/tmp/.wd_\${TUN_IF}"
-LOG_TAG="wd-\${TUN_IF}"
+WDHDR
 
-# Auto-detect REMOTE_TUN if missing
-if [ -z "\${REMOTE_TUN}" ]; then
-    UP_SCRIPT="/usr/local/bin/\${TUN_IF}-up.sh"
-    if [ -f "\$UP_SCRIPT" ]; then
-        LT=\$(grep '^LOCAL_TUN=' "\$UP_SCRIPT" 2>/dev/null | cut -d'"' -f2)
-        SUBNET_PREFIX=\$(echo "\$LT" | sed -E 's/\.[0-9]+\/[0-9]+$//')
-        if [[ "\$LT" == *".1/"* ]]; then
-            REMOTE_TUN="\${SUBNET_PREFIX}.2"
-        else
-            REMOTE_TUN="\${SUBNET_PREFIX}.1"
-        fi
-    fi
-fi
+    cat >> "${script_path}" << 'WDBODY'
+mkdir -p -m 700 "${STATE_DIR}"
 
-# Skip if service is not active (was stopped intentionally or during deletion) or disabled
-if ! systemctl is-active "\${SERVICE}" &>/dev/null; then
-    exit 0
-fi
-if ! systemctl is-enabled "\${SERVICE}" &>/dev/null; then
-    exit 0
-fi
-
-# Check interface exists
-if ! ip link show \${TUN_IF} &>/dev/null; then
-    logger -t "\${LOG_TAG}" "Interface \${TUN_IF} missing - restarting \${SERVICE}" 2>/dev/null || true
-    systemctl restart "\${SERVICE}" 2>/dev/null || true
-    systemctl restart "gre-keepalive-${TUNNEL_ID}" 2>/dev/null || true
-    exit 0
-fi
-
-# Ping remote tunnel endpoint
-if [ -n "\${REMOTE_TUN}" ]; then
-    if ping -c 2 -W 2 -I \${TUN_IF} \${REMOTE_TUN} &>/dev/null; then
-        echo 0 > "\${FAIL_FILE}" 2>/dev/null
+if command -v flock >/dev/null 2>&1; then
+    exec 9>"${STATE_DIR}/${TUN_IF}.lock"
+    if ! flock -n 9; then
         exit 0
     fi
 fi
 
-# Track consecutive failures safely
-FAILS=\$(cat "\${FAIL_FILE}" 2>/dev/null | tr -d '[:space:]')
-[[ ! "\${FAILS}" =~ ^[0-9]+$ ]] && FAILS=0
-FAILS=\$((FAILS + 1))
-echo "\${FAILS}" > "\${FAIL_FILE}" 2>/dev/null
+FAIL_FILE="${STATE_DIR}/${TUN_IF}.fails"
+RESTART_COUNT_FILE="${STATE_DIR}/${TUN_IF}.restarts"
+LAST_RESTART_FILE="${STATE_DIR}/${TUN_IF}.last_restart"
+TIER1_COUNT_FILE="${STATE_DIR}/${TUN_IF}.t1_restarts"
+TIER1_LAST_FILE="${STATE_DIR}/${TUN_IF}.t1_last"
+STOP_MARKER="${STATE_DIR}/${TUN_IF}.stopped"
+LOG_TAG="wd-${TUN_IF}"
 
-if [ "\${FAILS}" -ge "\${MAX_FAIL}" ]; then
-    logger -t "\${LOG_TAG}" "Tunnel \${TUN_IF} DOWN after \${FAILS} failures - restarting \${SERVICE}" 2>/dev/null || true
-    systemctl restart "\${SERVICE}" 2>/dev/null || true
-    systemctl restart "gre-keepalive-${TUNNEL_ID}" 2>/dev/null || true
-    echo 0 > "\${FAIL_FILE}" 2>/dev/null
-else
-    logger -t "\${LOG_TAG}" "Tunnel \${TUN_IF} ping failed (\${FAILS}/\${MAX_FAIL})" 2>/dev/null || true
+# Auto-detect REMOTE_TUN safely if missing
+if [ -z "${REMOTE_TUN}" ]; then
+    UP_SCRIPT="/usr/local/bin/${TUN_IF}-up.sh"
+    if [ -f "${UP_SCRIPT}" ]; then
+        LT=$(grep '^LOCAL_TUN=' "${UP_SCRIPT}" 2>/dev/null | head -1 | cut -d'"' -f2)
+        SUBNET_PREFIX=$(echo "${LT}" | sed -E 's/\.[0-9]+\/[0-9]+$//')
+        if [[ "${SUBNET_PREFIX}" =~ ^([0-9]{1,3}\.){2}[0-9]{1,3}$ ]]; then
+            if [[ "${LT}" == *".1/"* ]]; then
+                REMOTE_TUN="${SUBNET_PREFIX}.2"
+            else
+                REMOTE_TUN="${SUBNET_PREFIX}.1"
+            fi
+        fi
+    fi
 fi
-WDEOF
+
+# Skip if disabled or intentionally stopped
+if ! systemctl is-enabled "${SERVICE}" &>/dev/null || [ -f "${STOP_MARKER}" ]; then
+    exit 0
+fi
+
+restart_stack() {
+    local reason="$1"
+    logger -t "${LOG_TAG}" "${reason} - restarting ${SERVICE}" 2>/dev/null || true
+    systemctl restart "${SERVICE}" 2>/dev/null || true
+    if systemctl list-unit-files "${KA_SERVICE}.service" --no-legend 2>/dev/null | grep -q "${KA_SERVICE}"; then
+        systemctl restart "${KA_SERVICE}" 2>/dev/null || true
+    fi
+}
+
+tier1_heal() {
+    local reason="$1"
+    local t1_cnt t1_last now elapsed
+    t1_cnt=$(cat "${TIER1_COUNT_FILE}" 2>/dev/null | tr -d '[:space:]')
+    [[ ! "${t1_cnt}" =~ ^[0-9]+$ ]] && t1_cnt=0
+    t1_last=$(cat "${TIER1_LAST_FILE}" 2>/dev/null | tr -d '[:space:]')
+    [[ ! "${t1_last}" =~ ^[0-9]+$ ]] && t1_last=0
+    now=$(date +%s)
+    elapsed=$((now - t1_last))
+
+    # Allow first 2 local recoveries immediately; throttle repeated failures to 60s to prevent crash-loop spam
+    if [ "${t1_cnt}" -ge 2 ] && [ "${elapsed}" -lt 60 ]; then
+        local rem=$((60 - elapsed))
+        logger -t "${LOG_TAG}" "${reason}; Tier-1 recovery throttled (${rem}s remaining)" 2>/dev/null || true
+        exit 0
+    fi
+
+    restart_stack "${reason}"
+    echo "${now}" > "${TIER1_LAST_FILE}" 2>/dev/null || true
+    echo $((t1_cnt + 1)) > "${TIER1_COUNT_FILE}" 2>/dev/null || true
+    echo 0 > "${FAIL_FILE}" 2>/dev/null || true
+    exit 0
+}
+
+# Tier 1: Immediate local kernel & service integrity self-heal
+if systemctl is-failed "${SERVICE}" &>/dev/null; then
+    tier1_heal "Service ${SERVICE} is in failed state"
+fi
+
+if ! systemctl is-active "${SERVICE}" &>/dev/null; then
+    exit 0
+fi
+
+if ! ip link show "${TUN_IF}" &>/dev/null; then
+    tier1_heal "Interface ${TUN_IF} missing"
+fi
+
+if ! ip -o link show "${TUN_IF}" 2>/dev/null | grep -qE "<([^>]*,)?UP([,>])"; then
+    tier1_heal "Interface ${TUN_IF} is DOWN"
+fi
+
+if ! ip -4 addr show dev "${TUN_IF}" 2>/dev/null | grep -q "inet "; then
+    tier1_heal "Interface ${TUN_IF} has no IPv4 address"
+fi
+
+if [ "${FOU_ENABLE}" = "yes" ] && [ -n "${FOU_PORT}" ]; then
+    if ! ip fou show 2>/dev/null | awk -v p="${FOU_PORT}" '$2 == p && $3 == "ipproto" && $4 == "47" {ok=1} END{exit !ok}'; then
+        tier1_heal "FOU listener on UDP port ${FOU_PORT} (ipproto 47) missing"
+    fi
+fi
+
+if ! nft list table ip "${NFT_TABLE}" &>/dev/null; then
+    tier1_heal "nftables table ${NFT_TABLE} missing (possible ruleset flush)"
+fi
+
+# Tier 2: Remote endpoint connectivity check with exponential backoff cooldown
+if [ -n "${REMOTE_TUN}" ]; then
+    if ping -c 3 -W 2 -i 0.5 -I "${TUN_IF}" "${REMOTE_TUN}" &>/dev/null; then
+        echo 0 > "${FAIL_FILE}" 2>/dev/null || true
+        echo 0 > "${RESTART_COUNT_FILE}" 2>/dev/null || true
+        echo 0 > "${TIER1_COUNT_FILE}" 2>/dev/null || true
+        rm -f "${LAST_RESTART_FILE}" "${TIER1_LAST_FILE}" 2>/dev/null || true
+        exit 0
+    fi
+else
+    exit 0
+fi
+
+FAILS=$(cat "${FAIL_FILE}" 2>/dev/null | tr -d '[:space:]')
+[[ ! "${FAILS}" =~ ^[0-9]+$ ]] && FAILS=0
+FAILS=$((FAILS + 1))
+echo "${FAILS}" > "${FAIL_FILE}" 2>/dev/null || true
+
+if [ "${FAILS}" -ge "${MAX_FAIL}" ]; then
+    RESTARTS=$(cat "${RESTART_COUNT_FILE}" 2>/dev/null | tr -d '[:space:]')
+    [[ ! "${RESTARTS}" =~ ^[0-9]+$ ]] && RESTARTS=0
+    LAST_TS=$(cat "${LAST_RESTART_FILE}" 2>/dev/null | tr -d '[:space:]')
+    [[ ! "${LAST_TS}" =~ ^[0-9]+$ ]] && LAST_TS=0
+
+    COOLDOWN=0
+    if [ "${RESTARTS}" -eq 1 ]; then
+        COOLDOWN=60
+    elif [ "${RESTARTS}" -eq 2 ]; then
+        COOLDOWN=120
+    elif [ "${RESTARTS}" -ge 3 ]; then
+        COOLDOWN=300
+    fi
+
+    NOW=$(date +%s)
+    ELAPSED=$((NOW - LAST_TS))
+
+    if [ "${ELAPSED}" -ge "${COOLDOWN}" ]; then
+        restart_stack "Tunnel ${TUN_IF} unreachable after ${FAILS} checks (backoff level ${RESTARTS})"
+        echo "${NOW}" > "${LAST_RESTART_FILE}" 2>/dev/null || true
+        echo $((RESTARTS + 1)) > "${RESTART_COUNT_FILE}" 2>/dev/null || true
+        echo 0 > "${FAIL_FILE}" 2>/dev/null || true
+    else
+        REM=$((COOLDOWN - ELAPSED))
+        logger -t "${LOG_TAG}" "Tunnel ${TUN_IF} unreachable (${FAILS}/${MAX_FAIL}); restart in cooldown (${REM}s remaining)" 2>/dev/null || true
+    fi
+else
+    logger -t "${LOG_TAG}" "Tunnel ${TUN_IF} ping failed (${FAILS}/${MAX_FAIL})" 2>/dev/null || true
+fi
+WDBODY
     chmod 750 "${script_path}"
 }
 
 # ─── Create Systemd Units ─────────────────────────────────────────
 create_watchdog_timer() {
-    local tunnel_id="$1" wd_script="$2"
+    local tunnel_id="$1" wd_script="$2" auto_start="${3:-yes}"
     local svc="gre-watchdog-${tunnel_id}"
 
     cat > "${SYSTEMD_DIR}/${svc}.service" << EOF
@@ -802,8 +1088,7 @@ EOF
 Description=GRE Tunnel ${tunnel_id} Watchdog Timer
 
 [Timer]
-OnBootSec=15
-OnUnitActiveSec=10
+OnBootSec=30
 OnUnitInactiveSec=10
 AccuracySec=1
 
@@ -812,19 +1097,21 @@ WantedBy=timers.target
 EOF
 
     chmod 644 "${SYSTEMD_DIR}/${svc}.service" "${SYSTEMD_DIR}/${svc}.timer"
-    systemctl daemon-reload
-    systemctl enable "${svc}.timer" &>/dev/null || true
-    systemctl start "${svc}.timer" &>/dev/null || true
+    if [ "$auto_start" = "yes" ]; then
+        systemctl daemon-reload
+        systemctl enable "${svc}.timer" &>/dev/null || true
+        systemctl restart "${svc}.timer" &>/dev/null || true
+    fi
 }
 
 create_gre_service() {
-    local tunnel_id="$1" service_name="$2" up_script="$3" down_script="$4" description="$5"
+    local tunnel_id="$1" service_name="$2" up_script="$3" down_script="$4" description="$5" auto_start="${6:-yes}"
     local service_path="${SYSTEMD_DIR}/${service_name}.service"
 
     cat > "${service_path}" << EOF
 [Unit]
 Description=${description}
-After=network-online.target
+After=network-online.target nftables.service
 Wants=network-online.target
 
 [Service]
@@ -839,13 +1126,20 @@ WantedBy=multi-user.target
 EOF
 
     chmod 644 "${service_path}"
-    systemctl daemon-reload
-    systemctl enable "${service_name}" &>/dev/null || true
-    systemctl start "${service_name}" &>/dev/null || true
+    if [ "$auto_start" = "yes" ]; then
+        systemctl daemon-reload
+        systemctl enable "${service_name}" &>/dev/null || true
+        if ! systemctl restart "${service_name}" 2>/dev/null || ! systemctl is-active --quiet "${service_name}"; then
+            msg_err "Failed to start service '${service_name}'!"
+            journalctl -u "${service_name}" -n 10 --no-pager 2>/dev/null || true
+            return 1
+        fi
+    fi
+    return 0
 }
 
 create_keepalive_service() {
-    local tunnel_id="$1" remote_tun_ip="$2"
+    local tunnel_id="$1" remote_tun_ip="$2" auto_start="${3:-yes}"
     local service_name="gre-keepalive-${tunnel_id}"
     local service_path="${SYSTEMD_DIR}/${service_name}.service"
     local sleep_offset=$(( tunnel_id % 5 ))
@@ -859,7 +1153,7 @@ PartOf=gre-tunnel-${tunnel_id}.service
 
 [Service]
 Type=simple
-ExecStart=/bin/bash -c 'sleep ${sleep_offset}; while true; do ping -c 1 -W 2 -I gre${tunnel_id} ${remote_tun_ip} >/dev/null 2>&1; sleep 5; done'
+ExecStart=/bin/bash -c 'sleep ${sleep_offset}; while true; do ping -c 12 -i 5 -W 2 -I gre${tunnel_id} ${remote_tun_ip} >/dev/null 2>&1 || sleep 5; done'
 Restart=always
 RestartSec=5
 LimitNOFILE=65535
@@ -869,22 +1163,34 @@ WantedBy=multi-user.target
 EOF
 
     chmod 644 "${service_path}"
-    systemctl daemon-reload
-    systemctl enable "${service_name}" &>/dev/null || true
-    systemctl start "${service_name}" &>/dev/null || true
+    if [ "$auto_start" = "yes" ]; then
+        systemctl daemon-reload
+        systemctl enable "${service_name}" &>/dev/null || true
+        systemctl restart "${service_name}" &>/dev/null || true
+    fi
 }
 
 # ─── Review Box ───────────────────────────────────────────────────
 show_gre_review() {
     local role="$1"
+    local show_mtu="${TUN_MTU:-1392}"
+    local show_mss=$(( show_mtu - 40 ))
+    local if_note="(auto-detected)"
+    [ "${IF_WAN_MANUAL:-0}" -eq 1 ] && if_note="(manual)"
+
+    local spoof_status="${YELLOW}Disabled${NC} ${DIM}(Real IPs + output/prerouting notrack)${NC}"
+    if [ "${LOCAL_SPOOF}" != "${LOCAL_REAL}" ] || [ "${REMOTE_SPOOF}" != "${REMOTE_REAL}" ]; then
+        spoof_status="${GREEN}Enabled${NC} ${DIM}(Stateless Spoofing + notrack)${NC}"
+    fi
+
     echo ""
     print_double_line
-    echo -e " ${WHITE}${BOLD}  REVIEW YOUR FOU SETTINGS${NC}"
+    echo -e " ${WHITE}${BOLD}  REVIEW YOUR GRE OVER FOU SETTINGS${NC}"
     print_double_line
     echo ""
     echo -e "  ${MAGENTA}Tunnel ID:${NC}       ${WHITE}${BOLD}${TUNNEL_ID}${NC}"
     echo -e "  ${MAGENTA}Role:${NC}            ${WHITE}${BOLD}${role}${NC}"
-    echo -e "  ${MAGENTA}Interface:${NC}       ${WHITE}${BOLD}${IF_WAN}${NC}  ${DIM}(auto-detected)${NC}"
+    echo -e "  ${MAGENTA}Interface:${NC}       ${WHITE}${BOLD}${IF_WAN}${NC}  ${DIM}${if_note}${NC}"
     echo -e "  ${MAGENTA}Tunnel Dev:${NC}      ${WHITE}${BOLD}${TUN_IF}${NC}"
     echo -e "  ${MAGENTA}GRE Key:${NC}         ${WHITE}${BOLD}${GRE_KEY}${NC}  ${DIM}(must match both sides)${NC}"
     echo ""
@@ -894,28 +1200,25 @@ show_gre_review() {
     echo -e "    Remote:  ${BLUE}${BOLD}${REMOTE_REAL}${NC}"
     echo ""
     print_line
-    echo -e "  ${CYAN}Spoof IPs (nftables):${NC}"
+    echo -e "  ${CYAN}Spoof IPs (nftables):${NC} ${spoof_status}"
     echo -e "    Local Spoof:   ${MAGENTA}${BOLD}${LOCAL_SPOOF}${NC}"
     echo -e "    Remote Spoof:  ${MAGENTA}${BOLD}${REMOTE_SPOOF}${NC}"
     echo ""
-    local show_mtu="1392"
     print_line
     echo -e "  ${CYAN}Tunnel Network:${NC}"
-    echo -e "    Local TUN:  ${GREEN}${BOLD}${LOCAL_TUN}${NC}  ${DIM}(MTU: ${show_mtu})${NC}"
+    echo -e "    Local TUN:  ${GREEN}${BOLD}${LOCAL_TUN}${NC}  ${DIM}(MTU: ${show_mtu}, MSS: ${show_mss})${NC}"
     echo ""
     print_line
-    echo -e "  ${CYAN}Optimizations:${NC}"
-    echo -e "    ${GREEN}✓${NC} FOU Stealth Mode (UDP Port ${FOU_PORT})"
-    echo -e "    ${GREEN}✓${NC} BBR Congestion Control + FQ Qdisc"
-    echo -e "    ${GREEN}✓${NC} Adaptive Low-Latency Buffers (No Bufferbloat)"
-    echo -e "    ${GREEN}✓${NC} MSS Clamping (Forward & Output Hooks: ${show_mtu}-40)"
-    echo -e "    ${GREEN}✓${NC} Route advmss Tuning (Zero Packet Fragmentation for Nginx/Xray)"
-    echo -e "    ${GREEN}✓${NC} 32MB High-Throughput Adaptive TCP Buffers (rmem/wmem)"
-    echo -e "    ${GREEN}✓${NC} NIC Ring Buffer (4096) & WAN/Tunnel TSO Offload Protection"
-    echo -e "    ${GREEN}✓${NC} Persistent Kernel Tuning on Boot (/etc/sysctl.d/99-xmanager-tunnel.conf)"
-    echo -e "    ${GREEN}✓${NC} Continuous Keep-Alive & Active Watchdog (every 10s)"
+    echo -e "  ${CYAN}Optimizations & Hardening (v${VERSION}):${NC}"
+    echo -e "    ${GREEN}✓${NC} FOU Encapsulation (UDP Port ${FOU_PORT}, encap-csum Enabled)"
+    echo -e "    ${GREEN}✓${NC} Atomic nftables (prerouting -300 & output -300 notrack)"
+    echo -e "    ${GREEN}✓${NC} Bidirectional SYN/SYN-ACK MSS Clamping (max ${show_mss})"
+    echo -e "    ${GREEN}✓${NC} BBR Congestion Control + FQ Qdisc (flow_limit 1000)"
+    echo -e "    ${GREEN}✓${NC} Non-disruptive NIC Ring Buffer & TSO/GSO/GRO/UDP-TNL Protection"
+    echo -e "    ${GREEN}✓${NC} RAM-Scaled Persistent Sysctl + Boot Modules (/etc/modules-load.d)"
+    echo -e "    ${GREEN}✓${NC} Two-Tier Self-Healing Watchdog (with Backoff Cooldown)"
     echo ""
-    echo -e "  ${CYAN}nftables Table:${NC} ${WHITE}fw_${TUNNEL_ID}${NC}"
+    echo -e "  ${CYAN}nftables Table:${NC} ${WHITE}fw_gre_${TUNNEL_ID}${NC}"
     echo ""
     print_double_line
     echo ""
@@ -925,25 +1228,44 @@ show_gre_review() {
 setup_fou_server() {
     local role="$1" # "Iran" or "Kharej"
     print_header
-    echo -e " ${GREEN}${BOLD}>>> Setup ${role} Server (FOU)${NC}"
+    echo -e " ${GREEN}${BOLD}>>> Setup ${role} Server (GRE over FOU)${NC}"
     echo ""
     print_line
 
-    IF_WAN=$(detect_interface)
-    local AUTO_IP
-    AUTO_IP=$(detect_public_ip)
+    check_prereqs_ready || return 1
+
+    local AUTO_IF
+    AUTO_IF=$(detect_interface)
+    IF_WAN="${AUTO_IF}"
+    IF_WAN_MANUAL=0
 
     echo -e "\n ${MAGENTA}${BOLD}[1/4] Tunnel Identity${NC}"
     read_tunnel_id TUNNEL_ID
     TUN_IF="gre${TUNNEL_ID}"
-    GRE_KEY="${TUNNEL_ID}"
+
+    local existing_up="${SCRIPTS_DIR}/${TUN_IF}-up.sh"
+    local existing_down="${SCRIPTS_DIR}/${TUN_IF}-down.sh"
+    local service_name="gre-tunnel-${TUNNEL_ID}"
+    local is_overwrite=0
+    if [ -f "$existing_up" ] || [ -f "$existing_down" ] || [ -f "${SYSTEMD_DIR}/${service_name}.service" ] || ip link show "$TUN_IF" &>/dev/null; then
+        is_overwrite=1
+    fi
 
     echo -e "\n ${MAGENTA}${BOLD}[2/4] Network Interfaces & Endpoints${NC}"
     msg_info "Interface auto-detected: ${BOLD}${IF_WAN}${NC}"
     read_interface "Change interface? (Enter to keep)" "${IF_WAN}" IF_WAN
+    [ "$IF_WAN" != "$AUTO_IF" ] && IF_WAN_MANUAL=1
+
+    local AUTO_IP
+    AUTO_IP=$(detect_public_ip "${IF_WAN}")
     [ -n "$AUTO_IP" ] && msg_info "Public IP auto-detected: ${BOLD}${AUTO_IP}${NC}"
 
     read_ip "This server's REAL IP" "${AUTO_IP}" LOCAL_REAL
+    if ! ip -4 addr show dev "${IF_WAN}" 2>/dev/null | grep -Fq "inet ${LOCAL_REAL}/"; then
+        msg_warn "IP ${LOCAL_REAL} is not directly configured on ${IF_WAN} (behind NAT?)."
+        msg_warn "Ensure UDP FOU port is forwarded cleanly to this host's local IP."
+    fi
+
     local remote_label="Remote server's REAL IP (Kharej)"
     [ "$role" = "Kharej" ] && remote_label="Remote server's REAL IP (Iran)"
     read_ip "$remote_label" "" REMOTE_REAL
@@ -955,23 +1277,28 @@ setup_fou_server() {
 
     echo -e "\n ${MAGENTA}${BOLD}[3/4] Tunnel Subnet & Spoof IPs${NC}"
     local existing_sub=""
-    for sc in "${SCRIPTS_DIR}"/*${TUNNEL_ID}-up.sh; do
-        [ -f "$sc" ] || continue
-        local lt; lt=$(grep '^LOCAL_TUN=' "$sc" 2>/dev/null | cut -d'"' -f2)
-        local pref; pref=$(echo "$lt" | sed -E 's/\.[0-9]+\/[0-9]+$//')
+    if [ -f "$existing_up" ]; then
+        local lt pref
+        lt=$(extract_up_var "LOCAL_TUN" "$existing_up")
+        pref=$(echo "$lt" | sed -E 's/\.[0-9]+\/[0-9]+$//')
         if validate_subnet_prefix "$pref"; then
             existing_sub="$pref"
-            break
         fi
-    done
+    fi
     local def_subnet="${existing_sub}"
     [ -z "$def_subnet" ] && def_subnet=$(find_free_tunnel_subnet "10.80" "${TUNNEL_ID}")
+
     local val_sub=""
     while true; do
         read_input "Tunnel Subnet (/30 base)" "${def_subnet}" val_sub
         val_sub=$(echo "$val_sub" | tr -d '\r\n[:space:]')
         [ -z "$val_sub" ] && val_sub="${def_subnet}"
         if validate_subnet_prefix "$val_sub"; then
+            if is_tunnel_subnet_in_use "$val_sub" "${TUN_IF}"; then
+                msg_warn "Subnet ${val_sub}.0/30 appears to be in use by another interface or tunnel!"
+                read -p "  Use subnet ${val_sub}.0/30 anyway? (y/N): " sub_ow
+                [[ ! "$sub_ow" =~ ^[Yy]$ ]] && continue
+            fi
             TUN_SUBNET="$val_sub"
             break
         else
@@ -1001,9 +1328,19 @@ setup_fou_server() {
         msg_warn "Local Spoof IP and Remote Spoof IP are identical! Traffic loop may occur."
     fi
 
-    echo -e "\n ${MAGENTA}${BOLD}[4/4] GRE Key & FOU UDP Port${NC}"
-    msg_info "GRE Key must be identical on both sides."
-    read_gre_key "GRE Key" "${TUNNEL_ID}" GRE_KEY
+    echo -e "\n ${MAGENTA}${BOLD}[4/4] GRE Key, MTU & FOU UDP Port${NC}"
+    msg_info "GRE Key and MTU should match on both sides."
+    local def_key="${TUNNEL_ID}"
+    local def_mtu="1392"
+    if [ -f "$existing_up" ]; then
+        local pk pm
+        pk=$(extract_up_var "GRE_KEY" "$existing_up")
+        pm=$(extract_up_var "TUN_MTU" "$existing_up")
+        [[ "$pk" =~ ^[0-9]+$ ]] && def_key="$pk"
+        [[ "$pm" =~ ^[0-9]+$ ]] && [ "$pm" -ge 1280 ] && [ "$pm" -le 1464 ] && def_mtu="$pm"
+    fi
+    read_gre_key "GRE Key" "${def_key}" GRE_KEY
+    read_mtu "Tunnel MTU (1280-1464)" "${def_mtu}" TUN_MTU
 
     local def_fou_port
     def_fou_port=$(get_default_fou_port "${TUNNEL_ID}" "47")
@@ -1016,9 +1353,17 @@ setup_fou_server() {
     [[ "$confirm" =~ ^[Nn]$ ]] && { msg_warn "Cancelled."; return 0; }
 
     echo ""
-    local up_script="${SCRIPTS_DIR}/gre${TUNNEL_ID}-up.sh"
-    local down_script="${SCRIPTS_DIR}/gre${TUNNEL_ID}-down.sh"
-    local service_name="gre-tunnel-${TUNNEL_ID}"
+    local up_script="${SCRIPTS_DIR}/${TUN_IF}-up.sh"
+    local down_script="${SCRIPTS_DIR}/${TUN_IF}-down.sh"
+
+    # Tear down existing tunnel completely before overwriting so old FOU port and nft table are released cleanly
+    if [ "$is_overwrite" -eq 1 ]; then
+        msg_info "Stopping existing Tunnel ${TUNNEL_ID} before reconfiguring..."
+        stop_tunnel_services "${TUNNEL_ID}"
+        if [ -f "$down_script" ]; then
+            bash "$down_script" 2>/dev/null || true
+        fi
+    fi
 
     persist_sysctl_tuning
     msg_ok "Persistent network tuning applied: /etc/sysctl.d/99-xmanager-tunnel.conf"
@@ -1029,20 +1374,23 @@ setup_fou_server() {
     generate_gre_down "${down_script}"
     msg_ok "Down script created: ${down_script}"
 
-    create_gre_service "${TUNNEL_ID}" "${service_name}" "${up_script}" "${down_script}" "GRE Tunnel ${TUNNEL_ID} - ${role}"
+    if ! create_gre_service "${TUNNEL_ID}" "${service_name}" "${up_script}" "${down_script}" "GRE Tunnel ${TUNNEL_ID} - ${role}" "yes"; then
+        msg_err "Tunnel ${TUNNEL_ID} setup aborted because systemd service failed to start."
+        return 1
+    fi
     msg_ok "Tunnel service started: ${service_name}"
 
-    create_keepalive_service "${TUNNEL_ID}" "${REMOTE_TUN}"
+    create_keepalive_service "${TUNNEL_ID}" "${REMOTE_TUN}" "yes"
     msg_ok "Keep-alive service started: gre-keepalive-${TUNNEL_ID}"
 
-    local wd_script="${SCRIPTS_DIR}/gre${TUNNEL_ID}-watchdog.sh"
+    local wd_script="${SCRIPTS_DIR}/${TUN_IF}-watchdog.sh"
     generate_watchdog "${wd_script}"
-    create_watchdog_timer "${TUNNEL_ID}" "${wd_script}"
+    create_watchdog_timer "${TUNNEL_ID}" "${wd_script}" "yes"
     msg_ok "Watchdog timer started (every 10s)"
 
     echo ""
     print_double_line
-    echo -e " ${GREEN}${BOLD}  ${role} FOU Tunnel ${TUNNEL_ID} Setup Complete!${NC}"
+    echo -e " ${GREEN}${BOLD}  ${role} GRE-FOU Tunnel ${TUNNEL_ID} Setup Complete!${NC}"
     print_double_line
     echo ""
 
@@ -1051,13 +1399,14 @@ setup_fou_server() {
         echo -e "    Tunnel ID:     ${CYAN}${BOLD}${TUNNEL_ID}${NC}"
         echo -e "    Tunnel Subnet: ${CYAN}${BOLD}${TUN_SUBNET}${NC}  (must match!)"
         echo -e "    GRE Key:       ${CYAN}${BOLD}${GRE_KEY}${NC}  (must match!)"
+        echo -e "    Tunnel MTU:    ${CYAN}${BOLD}${TUN_MTU}${NC}  (must match!)"
         echo -e "    Remote IP:     ${CYAN}${BOLD}${LOCAL_REAL}${NC}"
         echo -e "    FOU UDP Port:  ${CYAN}${BOLD}${FOU_PORT}${NC}"
         echo -e "    Spoof Local:   ${CYAN}${BOLD}${REMOTE_SPOOF}${NC}  (swap!)"
         echo -e "    Spoof Remote:  ${CYAN}${BOLD}${LOCAL_SPOOF}${NC}  (swap!)"
     else
         echo -e " ${CYAN}Test connectivity:${NC}"
-        echo -e "    ping -c 3 ${REMOTE_TUN}"
+        echo -e "    ping -c 3 -I ${TUN_IF} ${REMOTE_TUN}"
     fi
     echo ""
     echo -e " ${CYAN}Service status:${NC}"
@@ -1074,9 +1423,9 @@ get_all_tunnel_ids() {
     # 1. From systemd unit files on disk
     for f in "${SYSTEMD_DIR}"/gre-tunnel-*.service; do
         [ -f "$f" ] || continue
-        local b
+        local b id
         b=$(basename "$f")
-        local id="${b#gre-tunnel-}"
+        id="${b#gre-tunnel-}"
         id="${id%.service}"
         [[ "$id" =~ ^[0-9]+$ ]] && ids+=("$id")
     done
@@ -1096,9 +1445,9 @@ get_all_tunnel_ids() {
     # 3. From scripts in SCRIPTS_DIR
     for f in "${SCRIPTS_DIR}"/gre*-up.sh; do
         [ -f "$f" ] || continue
-        local b
+        local b id
         b=$(basename "$f")
-        local id="${b#gre}"
+        id="${b#gre}"
         id="${id%-up.sh}"
         [[ "$id" =~ ^[0-9]+$ ]] && ids+=("$id")
     done
@@ -1109,9 +1458,9 @@ get_all_tunnel_ids() {
         [[ "$id" =~ ^[0-9]+$ ]] && ids+=("$id")
     done
 
-    # 5. From nftables tables (fw_10, etc.)
-    for tbl in $(nft list tables 2>/dev/null | grep 'fw_' | awk '{print $NF}'); do
-        local id="${tbl#fw_}"
+    # 5. From GRE-scoped nftables tables (fw_gre_10, etc.)
+    for tbl in $(nft list tables 2>/dev/null | awk '$2 == "ip" && $3 ~ /^fw_gre_[0-9]+$/ {print $3}'); do
+        local id="${tbl#fw_gre_}"
         [[ "$id" =~ ^[0-9]+$ ]] && ids+=("$id")
     done
 
@@ -1124,9 +1473,17 @@ get_all_tunnel_ids() {
 start_tunnel_services() {
     local tid="$1"
     local name="gre-tunnel-${tid}"
+    local tun_if="gre${tid}"
+
+    mkdir -p -m 700 "${STATE_DIR}"
+    rm -f "${STATE_DIR}/${tun_if}.stopped"
     systemctl daemon-reload 2>/dev/null || true
     systemctl enable "${name}" 2>/dev/null || true
-    systemctl start "${name}" 2>/dev/null || true
+    if ! systemctl start "${name}" 2>/dev/null || ! systemctl is-active --quiet "${name}"; then
+        msg_err "Failed to start ${name}!"
+        journalctl -u "${name}" -n 8 --no-pager 2>/dev/null || true
+        return 1
+    fi
     if [ -f "${SYSTEMD_DIR}/gre-keepalive-${tid}.service" ]; then
         systemctl enable "gre-keepalive-${tid}" 2>/dev/null || true
         systemctl start "gre-keepalive-${tid}" 2>/dev/null || true
@@ -1135,11 +1492,16 @@ start_tunnel_services() {
         systemctl enable "gre-watchdog-${tid}.timer" 2>/dev/null || true
         systemctl start "gre-watchdog-${tid}.timer" 2>/dev/null || true
     fi
+    return 0
 }
 
 stop_tunnel_services() {
     local tid="$1"
     local name="gre-tunnel-${tid}"
+    local tun_if="gre${tid}"
+
+    mkdir -p -m 700 "${STATE_DIR}"
+    touch "${STATE_DIR}/${tun_if}.stopped"
     systemctl stop "gre-watchdog-${tid}.timer" 2>/dev/null || true
     systemctl stop "gre-watchdog-${tid}.service" 2>/dev/null || true
     systemctl stop "gre-keepalive-${tid}" 2>/dev/null || true
@@ -1149,13 +1511,27 @@ stop_tunnel_services() {
 restart_tunnel_services() {
     local tid="$1"
     local name="gre-tunnel-${tid}"
-    systemctl restart "${name}" 2>/dev/null || true
+    local tun_if="gre${tid}"
+
+    mkdir -p -m 700 "${STATE_DIR}"
+    rm -f "${STATE_DIR}/${tun_if}.stopped"
+    echo 0 > "${STATE_DIR}/${tun_if}.fails" 2>/dev/null || true
+    echo 0 > "${STATE_DIR}/${tun_if}.restarts" 2>/dev/null || true
+    echo 0 > "${STATE_DIR}/${tun_if}.t1_restarts" 2>/dev/null || true
+    rm -f "${STATE_DIR}/${tun_if}.last_restart" "${STATE_DIR}/${tun_if}.t1_last" 2>/dev/null || true
+
+    if ! systemctl restart "${name}" 2>/dev/null || ! systemctl is-active --quiet "${name}"; then
+        msg_err "Failed to restart ${name}!"
+        journalctl -u "${name}" -n 8 --no-pager 2>/dev/null || true
+        return 1
+    fi
     if [ -f "${SYSTEMD_DIR}/gre-keepalive-${tid}.service" ]; then
         systemctl restart "gre-keepalive-${tid}" 2>/dev/null || true
     fi
     if [ -f "${SYSTEMD_DIR}/gre-watchdog-${tid}.timer" ]; then
         systemctl restart "gre-watchdog-${tid}.timer" 2>/dev/null || true
     fi
+    return 0
 }
 
 # ─── Watchdog Helpers & Management ────────────────────────────────
@@ -1164,34 +1540,34 @@ ensure_watchdog_exists() {
     local up_script="${SCRIPTS_DIR}/gre${tid}-up.sh"
     local wd_script="${SCRIPTS_DIR}/gre${tid}-watchdog.sh"
 
-    local remote_tun=""
+    local remote_tun="" fou_en="yes" fou_pt=""
     if [ -f "$up_script" ]; then
         local lt
-        lt=$(grep '^LOCAL_TUN=' "$up_script" 2>/dev/null | cut -d'"' -f2)
-        local subnet_prefix
-        subnet_prefix=$(echo "$lt" | sed -E 's/\.[0-9]+\/[0-9]+$//')
-        if [[ "$lt" == *".1/"* ]]; then
-            remote_tun="${subnet_prefix}.2"
-        else
-            remote_tun="${subnet_prefix}.1"
-        fi
+        lt=$(extract_up_var "LOCAL_TUN" "$up_script")
+        remote_tun=$(derive_remote_tun_from_local "$lt")
+        fou_en=$(extract_up_var "FOU_ENABLE" "$up_script")
+        fou_pt=$(extract_up_var "FOU_PORT" "$up_script")
+        [ -z "$fou_en" ] && fou_en="yes"
     fi
     [ -z "$remote_tun" ] && remote_tun="10.80.${tid}.2"
 
-    # Save and restore globals so this function has no side-effects on the
-    # caller's context (TUNNEL_ID / TUN_IF / REMOTE_TUN are used by generators)
+    # Save and restore globals so this function has no side-effects on caller context
     local _saved_tid="${TUNNEL_ID:-}" _saved_tif="${TUN_IF:-}" _saved_rt="${REMOTE_TUN:-}"
+    local _saved_fe="${FOU_ENABLE:-}" _saved_fp="${FOU_PORT:-}"
+    TUNNEL_ID="${tid}"
     TUN_IF="gre${tid}"
     REMOTE_TUN="${remote_tun}"
-    TUNNEL_ID="${tid}"
+    FOU_ENABLE="${fou_en}"
+    FOU_PORT="${fou_pt}"
 
     generate_watchdog "${wd_script}"
-    create_watchdog_timer "${tid}" "${wd_script}"
+    create_watchdog_timer "${tid}" "${wd_script}" "yes"
 
-    # Restore
     TUNNEL_ID="${_saved_tid}"
     TUN_IF="${_saved_tif}"
     REMOTE_TUN="${_saved_rt}"
+    FOU_ENABLE="${_saved_fe}"
+    FOU_PORT="${_saved_fp}"
 }
 
 do_watchdog_status() {
@@ -1223,8 +1599,11 @@ do_watchdog_status() {
             fi
         fi
 
-        local fails
-        fails=$(cat "/tmp/.wd_${tun_if}" 2>/dev/null || echo 0)
+        local fails restarts
+        fails=$(cat "${STATE_DIR}/${tun_if}.fails" 2>/dev/null || cat "/tmp/.wd_${tun_if}" 2>/dev/null || echo 0)
+        restarts=$(cat "${STATE_DIR}/${tun_if}.restarts" 2>/dev/null || echo 0)
+        [[ ! "$fails" =~ ^[0-9]+$ ]] && fails=0
+        [[ ! "$restarts" =~ ^[0-9]+$ ]] && restarts=0
 
         local next_info=""
         if [ "$timer_status" = "active" ]; then
@@ -1241,12 +1620,15 @@ do_watchdog_status() {
         local tun_col="${RED}"
         [ "$tun_st" = "active" ] && tun_col="${GREEN}"
 
-        echo -e "  ${timer_col}●${NC} ${BOLD}gre${tid}${NC}  Timer: ${timer_col}[${timer_status}]${NC}  Tunnel: ${tun_col}[${tun_st}]${NC}  Fails: ${fails}/3  ${DIM}${next_info}${NC}${script_warn}"
+        local backoff_info=""
+        [[ "$restarts" =~ ^[0-9]+$ ]] && [ "$restarts" -gt 0 ] && backoff_info="  Backoff: lvl ${restarts}"
+
+        echo -e "  ${timer_col}●${NC} ${BOLD}gre${tid}${NC}  Timer: ${timer_col}[${timer_status}]${NC}  Tunnel: ${tun_col}[${tun_st}]${NC}  Fails: ${fails}/3${backoff_info}  ${DIM}${next_info}${NC}${script_warn}"
     done
 
     [ $found -eq 0 ] && msg_warn "No GRE/FOU tunnels found."
     echo ""
-    echo -e " ${DIM}Watchdog checks every 10s, restarts tunnel and keepalive after 3 consecutive failures.${NC}"
+    echo -e " ${DIM}Watchdog checks local integrity immediately and uses exponential backoff (60s/120s/300s) for remote outages.${NC}"
     echo ""
 }
 
@@ -1310,6 +1692,7 @@ do_watchdog_test() {
     local tid="${SELECTED_TID}"
     local tun_if="gre${tid}"
     local svc="gre-tunnel-${tid}"
+    local up_script="${SCRIPTS_DIR}/${tun_if}-up.sh"
 
     echo ""
     print_double_line
@@ -1321,33 +1704,61 @@ do_watchdog_test() {
     echo -n "  1. Tunnel service (${svc}): "
     if systemctl is-active "${svc}" &>/dev/null; then
         echo -e "${GREEN}active${NC}"
+    elif systemctl is-failed "${svc}" &>/dev/null; then
+        echo -e "${RED}failed${NC}"
     else
-        echo -e "${RED}inactive${NC}"
+        echo -e "${YELLOW}inactive${NC}"
     fi
 
     # 2. Check interface
     echo -n "  2. Network interface (${tun_if}): "
     if ip link show "${tun_if}" &>/dev/null; then
-        echo -e "${GREEN}EXISTS (UP)${NC}"
+        if ip -o link show "${tun_if}" 2>/dev/null | grep -qE "<([^>]*,)?UP([,>])"; then
+            echo -e "${GREEN}EXISTS (UP)${NC}"
+        else
+            echo -e "${YELLOW}EXISTS (DOWN)${NC}"
+        fi
     else
         echo -e "${RED}MISSING${NC}"
     fi
 
-    # 3. Remote IP
-    local up_script="${SCRIPTS_DIR}/gre${tid}-up.sh"
+    # 3. Check FOU & nftables
+    local fou_port="" fou_en="yes"
+    if [ -f "$up_script" ]; then
+        fou_port=$(extract_up_var "FOU_PORT" "$up_script")
+        fou_en=$(extract_up_var "FOU_ENABLE" "$up_script")
+        [ -z "$fou_en" ] && fou_en="yes"
+    fi
+    if [ "$fou_en" = "yes" ] && [ -n "$fou_port" ]; then
+        echo -n "  3. FOU UDP listener (port ${fou_port}): "
+        if ip fou show 2>/dev/null | awk -v p="${fou_port}" '$2 == p && $3 == "ipproto" && $4 == "47" {ok=1} END{exit !ok}'; then
+            echo -e "${GREEN}ACTIVE (ipproto 47)${NC}"
+        else
+            echo -e "${RED}MISSING${NC}"
+        fi
+    fi
+
+    echo -n "  4. nftables table (fw_gre_${tid}): "
+    if nft list table ip "fw_gre_${tid}" &>/dev/null; then
+        echo -e "${GREEN}LOADED${NC}"
+    elif nft list table ip "fw_${tid}" &>/dev/null; then
+        echo -e "${YELLOW}LEGACY (fw_${tid}) - consider Option 19 upgrade${NC}"
+    else
+        echo -e "${RED}MISSING${NC}"
+    fi
+
+    # 5. Remote IP
     local remote_tun=""
     if [ -f "$up_script" ]; then
         local lt
-        lt=$(grep '^LOCAL_TUN=' "$up_script" 2>/dev/null | cut -d'"' -f2)
-        local subnet_prefix
-        subnet_prefix=$(echo "$lt" | sed -E 's/\.[0-9]+\/[0-9]+$//')
-        [[ "$lt" == *".1/"* ]] && remote_tun="${subnet_prefix}.2" || remote_tun="${subnet_prefix}.1"
+        lt=$(extract_up_var "LOCAL_TUN" "$up_script")
+        remote_tun=$(derive_remote_tun_from_local "$lt")
     fi
-    echo -e "  3. Remote Tunnel IP: ${CYAN}${remote_tun:-unknown}${NC}"
+    echo -e "  5. Remote Tunnel IP: ${CYAN}${remote_tun:-unknown}${NC}"
 
-    # 4. Ping test
+    # 6. Ping test
     if [ -n "$remote_tun" ] && ip link show "${tun_if}" &>/dev/null; then
-        echo -e "  4. Executing ping: ping -c 3 -W 2 -I ${tun_if} ${remote_tun}"
+        echo -e "  6. Executing ping: ping -c 3 -W 2 -I ${tun_if} ${remote_tun}"
         if ping -c 3 -W 2 -I "${tun_if}" "${remote_tun}"; then
             echo -e "     ${GREEN}✓ Ping SUCCESSFUL! Tunnel connection is healthy.${NC}"
         else
@@ -1357,13 +1768,14 @@ do_watchdog_test() {
         echo -e "     ${YELLOW}Cannot ping (interface missing or IP unknown).${NC}"
     fi
 
-    # 5. Fail counter
-    local fails
-    fails=$(cat "/tmp/.wd_${tun_if}" 2>/dev/null || echo 0)
+    local fails restarts
+    fails=$(cat "${STATE_DIR}/${tun_if}.fails" 2>/dev/null || cat "/tmp/.wd_${tun_if}" 2>/dev/null || echo 0)
+    restarts=$(cat "${STATE_DIR}/${tun_if}.restarts" 2>/dev/null || echo 0)
+    [[ ! "$fails" =~ ^[0-9]+$ ]] && fails=0
+    [[ ! "$restarts" =~ ^[0-9]+$ ]] && restarts=0
     echo ""
-    echo -e "  Current failure counter: ${BOLD}${fails} / 3${NC}"
+    echo -e "  Current failure counter: ${BOLD}${fails} / 3${NC}  (backoff restarts: ${restarts})"
 
-    # 6. Timer status
     local timer_st
     timer_st=$(systemctl is-active "gre-watchdog-${tid}.timer" 2>/dev/null || echo "inactive")
     echo -e "  Timer status: ${BOLD}${timer_st}${NC}"
@@ -1454,7 +1866,7 @@ watchdog_menu() {
 do_dashboard() {
     echo ""
     print_double_line
-    echo -e " ${WHITE}${BOLD}  SYSTEM DASHBOARD${NC}"
+    echo -e " ${WHITE}${BOLD}  SYSTEM DASHBOARD (GRE-FOU v${VERSION})${NC}"
     print_double_line
 
     # Instantaneous CPU computation (100ms sample)
@@ -1475,11 +1887,9 @@ do_dashboard() {
             cpu="$(( (diff_total - diff_idle) * 100 / diff_total ))%"
         fi
     fi
-    local mem
+    local mem load up
     mem=$(free -m 2>/dev/null | awk '/Mem:/ {printf "%dMB / %dMB (%.0f%%)", $3, $2, $3/$2*100}')
-    local load
     load=$(cat /proc/loadavg 2>/dev/null | awk '{print $1, $2, $3}')
-    local up
     up=$(uptime -p 2>/dev/null || uptime | sed 's/.*up /up /' | sed 's/,.*//')
 
     echo ""
@@ -1503,7 +1913,7 @@ do_dashboard() {
     echo ""
 
     if [ $total -gt 0 ]; then
-        printf "  ${DIM}%-4s %-8s %-7s %-16s %-16s %-10s %-10s %-10s${NC}\n" "ID" "Role" "Status" "Remote Real" "Tunnel IP" "Traffic" "Watchdog" "Keepalive"
+        printf "  ${DIM}%-4s %-7s %-8s %-16s %-16s %-6s %-10s %-11s %-10s${NC}\n" "ID" "Role" "Status" "Remote Real" "Tunnel IP" "Port" "Traffic" "Watchdog" "Keepalive"
         print_line
         for tid in "${all_ids[@]}"; do
             local name="gre-tunnel-${tid}"
@@ -1511,26 +1921,26 @@ do_dashboard() {
             st=$(systemctl is-active "${name}" 2>/dev/null || echo "inactive")
             local tun_if="gre${tid}"
 
-            local remote="" tun_ip="" role="?"
-            local script="${SCRIPTS_DIR}/gre${tid}-up.sh"
+            local remote="" tun_ip="" fou_pt="" role="?"
+            local script="${SCRIPTS_DIR}/${tun_if}-up.sh"
             if [ -f "$script" ]; then
-                remote=$(grep '^REMOTE_REAL=' "$script" 2>/dev/null | cut -d'"' -f2)
-                tun_ip=$(grep '^LOCAL_TUN=' "$script" 2>/dev/null | cut -d'"' -f2)
+                remote=$(extract_up_var "REMOTE_REAL" "$script")
+                tun_ip=$(extract_up_var "LOCAL_TUN" "$script")
+                fou_pt=$(extract_up_var "FOU_PORT" "$script")
                 [[ "$tun_ip" == *".1/"* ]] && role="Iran" || role="Kharej"
             fi
 
-            local rx
+            local rx tx traffic
             rx=$(cat "/sys/class/net/${tun_if}/statistics/rx_bytes" 2>/dev/null || echo 0)
-            local tx
             tx=$(cat "/sys/class/net/${tun_if}/statistics/tx_bytes" 2>/dev/null || echo 0)
-            local traffic="$(( (rx+tx) / 1048576 ))MB"
+            traffic=$(format_bytes $(( rx + tx )))
 
-            local wd_st
+            local wd_st fails wd_info
             wd_st=$(systemctl is-active "gre-watchdog-${tid}.timer" 2>/dev/null || echo "inactive")
-            local fails
-            fails=$(cat "/tmp/.wd_gre${tid}" 2>/dev/null || echo 0)
-            local wd_info="${wd_st}"
-            [ "$fails" -gt 0 ] 2>/dev/null && wd_info="${wd_info}(${fails})"
+            fails=$(cat "${STATE_DIR}/${tun_if}.fails" 2>/dev/null || cat "/tmp/.wd_${tun_if}" 2>/dev/null || echo 0)
+            [[ ! "$fails" =~ ^[0-9]+$ ]] && fails=0
+            wd_info="${wd_st}"
+            [ "$fails" -gt 0 ] && wd_info="${wd_info}(${fails})"
 
             local ka_st
             ka_st=$(systemctl is-active "gre-keepalive-${tid}.service" 2>/dev/null || echo "inactive")
@@ -1540,8 +1950,8 @@ do_dashboard() {
             [ "$wd_st" = "active" ] && wd_col="${GREEN}"
             [ "$ka_st" = "active" ] && ka_col="${GREEN}"
 
-            printf "  %-4s %-8s ${st_col}%-7s${NC} %-16s %-16s %-10s ${wd_col}%-10s${NC} ${ka_col}%-10s${NC}\n" \
-                "$tid" "$role" "$st" "${remote:-?}" "${tun_ip:-?}" "$traffic" "$wd_info" "$ka_st"
+            printf "  %-4s %-7s ${st_col}%-8s${NC} %-16s %-16s %-6s %-10s ${wd_col}%-11s${NC} ${ka_col}%-10s${NC}\n" \
+                "$tid" "$role" "$st" "${remote:-?}" "${tun_ip:-?}" "${fou_pt:-?}" "$traffic" "$wd_info" "$ka_st"
         done
     fi
     echo ""
@@ -1557,28 +1967,22 @@ do_health_check() {
     local all_ids; mapfile -t all_ids < <(get_all_tunnel_ids)
     for tid in "${all_ids[@]}"; do
         local tun_if="gre${tid}"
-        local script="${SCRIPTS_DIR}/gre${tid}-up.sh"
+        local script="${SCRIPTS_DIR}/${tun_if}-up.sh"
 
         local tun_ip=""
         if [ -f "$script" ]; then
             local local_tun
-            local_tun=$(grep '^LOCAL_TUN=' "$script" 2>/dev/null | cut -d'"' -f2)
-            local subnet_prefix
-            subnet_prefix=$(echo "$local_tun" | sed -E 's/\.[0-9]+\/[0-9]+$//')
-            if [[ "$local_tun" == *".1/"* ]]; then
-                tun_ip="${subnet_prefix}.2"
-            else
-                tun_ip="${subnet_prefix}.1"
-            fi
+            local_tun=$(extract_up_var "LOCAL_TUN" "$script")
+            tun_ip=$(derive_remote_tun_from_local "$local_tun")
         fi
 
         if [ -z "$tun_ip" ]; then
-            echo -e "  ${YELLOW}●${NC} gre${tid}  ${YELLOW}[skip - no config]${NC}"
+            echo -e "  ${YELLOW}●${NC} ${tun_if}  ${YELLOW}[skip - invalid or missing config]${NC}"
             continue
         fi
 
         if ! ip link show "${tun_if}" &>/dev/null; then
-            echo -e "  ${RED}●${NC} gre${tid}  ${RED}[interface missing]${NC}"
+            echo -e "  ${RED}●${NC} ${tun_if}  ${RED}[interface missing]${NC}"
             all_ok=0
             continue
         fi
@@ -1590,9 +1994,9 @@ do_health_check() {
             local rtt
             rtt=$(echo "$ping_out" | awk -F'/' '/rtt|round-trip/ {print $5 " ms"}')
             [ -z "$rtt" ] && rtt=$(echo "$ping_out" | grep 'time=' | head -1 | sed -E 's/.*time=([^ ]+).*/\1 ms/')
-            echo -e "  ${GREEN}●${NC} gre${tid} → ${tun_ip}  ${GREEN}[OK]${NC}  ${DIM}${rtt}${NC}"
+            echo -e "  ${GREEN}●${NC} ${tun_if} → ${tun_ip}  ${GREEN}[OK]${NC}  ${DIM}${rtt}${NC}"
         else
-            echo -e "  ${RED}●${NC} gre${tid} → ${tun_ip}  ${RED}[FAIL]${NC}"
+            echo -e "  ${RED}●${NC} ${tun_if} → ${tun_ip}  ${RED}[FAIL]${NC}"
             all_ok=0
         fi
     done
@@ -1609,8 +2013,9 @@ do_restart_all() {
     [[ ! "$confirm" =~ ^[Yy]$ ]] && { msg_warn "Cancelled."; return; }
     local all_ids; mapfile -t all_ids < <(get_all_tunnel_ids)
     for tid in "${all_ids[@]}"; do
-        restart_tunnel_services "${tid}"
-        msg_ok "Tunnel ${tid}, keep-alive, and watchdog restarted."
+        if restart_tunnel_services "${tid}"; then
+            msg_ok "Tunnel ${tid}, keep-alive, and watchdog restarted."
+        fi
     done
 }
 
@@ -1629,15 +2034,16 @@ do_start_all() {
     echo ""
     local all_ids; mapfile -t all_ids < <(get_all_tunnel_ids)
     for tid in "${all_ids[@]}"; do
-        start_tunnel_services "${tid}"
-        msg_ok "Tunnel ${tid}, keep-alive, and watchdog started."
+        if start_tunnel_services "${tid}"; then
+            msg_ok "Tunnel ${tid}, keep-alive, and watchdog started."
+        fi
     done
 }
 
 # ─── Management ───────────────────────────────────────────────────
 list_tunnels() {
     echo ""
-    echo -e " ${CYAN}${BOLD}Detected FOU Tunnels:${NC}"
+    echo -e " ${CYAN}${BOLD}Detected GRE-FOU Tunnels:${NC}"
     print_line
 
     local found=0 i=1
@@ -1655,17 +2061,21 @@ list_tunnels() {
         TUNNEL_ID_LIST+=("${tid}")
 
         local remote="" role="?"
-        local script="${SCRIPTS_DIR}/gre${tid}-up.sh"
+        local script="${SCRIPTS_DIR}/${tun_if}-up.sh"
         if [ -f "$script" ]; then
-            remote=$(grep '^REMOTE_REAL=' "$script" 2>/dev/null | cut -d'"' -f2)
+            remote=$(extract_up_var "REMOTE_REAL" "$script")
             local lt
-            lt=$(grep '^LOCAL_TUN=' "$script" 2>/dev/null | cut -d'"' -f2)
+            lt=$(extract_up_var "LOCAL_TUN" "$script")
             [[ "$lt" == *".1/"* ]] && role="IR" || role="KH"
         fi
 
         local if_info="dev missing"
         if ip link show "${tun_if}" &>/dev/null; then
-            if_info="dev ${tun_if} UP"
+            if ip -o link show "${tun_if}" 2>/dev/null | grep -qE "<([^>]*,)?UP([,>])"; then
+                if_info="dev ${tun_if} UP"
+            else
+                if_info="dev ${tun_if} DOWN"
+            fi
         fi
 
         if [ "$status" = "active" ]; then
@@ -1687,16 +2097,12 @@ pick_tunnel() {
     [ -z "$pick" ] && { msg_err "Input cannot be empty."; return 1; }
 
     SELECTED_TID=""
-    # 1. Match menu index (1, 2, ...)
     if [[ "$pick" =~ ^[0-9]+$ ]] && [ "$pick" -ge 1 ] && [ "$pick" -le "${#TUNNEL_ID_LIST[@]}" ]; then
         SELECTED_TID="${TUNNEL_ID_LIST[$((pick-1))]}"
-    # 2. Direct match with Tunnel ID (e.g. 10)
     elif printf '%s\n' "${TUNNEL_ID_LIST[@]}" | grep -qx "${pick}"; then
         SELECTED_TID="${pick}"
-    # 3. Match interface name (gre10)
     elif [[ "$pick" =~ ^gre([0-9]+)$ ]] && printf '%s\n' "${TUNNEL_ID_LIST[@]}" | grep -qx "${BASH_REMATCH[1]}"; then
         SELECTED_TID="${BASH_REMATCH[1]}"
-    # 4. Match service name (gre-tunnel-10 or gre-tunnel-10.service)
     elif [[ "$pick" =~ ^gre-tunnel-([0-9]+)(\.service)?$ ]] && printf '%s\n' "${TUNNEL_ID_LIST[@]}" | grep -qx "${BASH_REMATCH[1]}"; then
         SELECTED_TID="${BASH_REMATCH[1]}"
     fi
@@ -1712,8 +2118,9 @@ pick_tunnel() {
 
 do_restart() {
     pick_tunnel || return
-    restart_tunnel_services "${SELECTED_TID}"
-    msg_ok "${SELECTED_TUNNEL}, keep-alive, and watchdog restarted."
+    if restart_tunnel_services "${SELECTED_TID}"; then
+        msg_ok "${SELECTED_TUNNEL}, keep-alive, and watchdog restarted."
+    fi
 }
 
 do_stop() {
@@ -1724,8 +2131,9 @@ do_stop() {
 
 do_start() {
     pick_tunnel || return
-    start_tunnel_services "${SELECTED_TID}"
-    msg_ok "${SELECTED_TUNNEL} started."
+    if start_tunnel_services "${SELECTED_TID}"; then
+        msg_ok "${SELECTED_TUNNEL} started."
+    fi
 }
 
 do_logs() {
@@ -1749,29 +2157,38 @@ do_status() {
     echo -e " ${WHITE}${BOLD}  TUNNEL ${tid} DETAILS${NC}"
     print_double_line
 
-    # Parse config
-    local script="${SCRIPTS_DIR}/gre${tid}-up.sh"
+    local script="${SCRIPTS_DIR}/${tun_if}-up.sh"
+    local fp=""
     if [ -f "$script" ]; then
         echo ""
-        local lr
-        lr=$(grep '^LOCAL_REAL=' "$script" 2>/dev/null | cut -d'"' -f2)
-        local rr
-        rr=$(grep '^REMOTE_REAL=' "$script" 2>/dev/null | cut -d'"' -f2)
-        local ls
-        ls=$(grep '^LOCAL_SPOOF=' "$script" 2>/dev/null | cut -d'"' -f2)
-        local rs
-        rs=$(grep '^REMOTE_SPOOF=' "$script" 2>/dev/null | cut -d'"' -f2)
-        local lt
-        lt=$(grep '^LOCAL_TUN=' "$script" 2>/dev/null | cut -d'"' -f2)
-        local gk
-        gk=$(grep '^GRE_KEY=' "$script" 2>/dev/null | cut -d'"' -f2)
-        local fp
-        fp=$(grep '^FOU_PORT=' "$script" 2>/dev/null | cut -d'"' -f2)
+        local lr rr ls rs lt gk mtu_val mss_val
+        lr=$(extract_up_var "LOCAL_REAL" "$script")
+        rr=$(extract_up_var "REMOTE_REAL" "$script")
+        ls=$(extract_up_var "LOCAL_SPOOF" "$script")
+        rs=$(extract_up_var "REMOTE_SPOOF" "$script")
+        lt=$(extract_up_var "LOCAL_TUN" "$script")
+        gk=$(extract_up_var "GRE_KEY" "$script")
+        fp=$(extract_up_var "FOU_PORT" "$script")
+        mtu_val=$(extract_up_var "TUN_MTU" "$script")
+        [ -z "$mtu_val" ] && mtu_val=$(grep -E '^[[:space:]]*MTU=' "$script" 2>/dev/null | head -1 | cut -d'=' -f2 | tr -d "\"'\r")
         local role="Kharej"; [[ "$lt" == *".1/"* ]] && role="Iran"
+
+        local csum_mode="${YELLOW}noencap-csum (WARN: 0-checksum)${NC}"
+        if grep -q 'encap-csum' "$script" 2>/dev/null; then
+            csum_mode="${GREEN}encap-csum (OK)${NC}"
+        fi
+
+        local mss_disp=""
+        if [[ "$mtu_val" =~ ^[0-9]+$ ]]; then
+            mss_val=$(( mtu_val - 40 ))
+            mss_disp=" (MSS: ${mss_val})"
+        fi
 
         echo -e "  ${MAGENTA}Role:${NC}          ${BOLD}${role}${NC}"
         echo -e "  ${MAGENTA}GRE Key:${NC}       ${BOLD}${gk}${NC}"
         echo -e "  ${MAGENTA}FOU Port:${NC}      ${BOLD}${fp:-N/A}${NC}"
+        echo -e "  ${MAGENTA}FOU Checksum:${NC}  ${csum_mode}"
+        echo -e "  ${MAGENTA}MTU / MSS:${NC}     ${BOLD}${mtu_val:-1392}${NC}${mss_disp}"
         echo -e "  ${MAGENTA}Local Real:${NC}    ${GREEN}${lr}${NC}"
         echo -e "  ${MAGENTA}Remote Real:${NC}   ${BLUE}${rr}${NC}"
         echo -e "  ${MAGENTA}Local Spoof:${NC}   ${DIM}${ls}${NC}"
@@ -1781,38 +2198,64 @@ do_status() {
 
     echo ""
     print_line
-    echo -e "  ${CYAN}Service:${NC}"
-    systemctl is-active "${SELECTED_TUNNEL}" 2>/dev/null | \
-        sed "s/active/${GREEN}active${NC}/" | sed "s/inactive/${RED}inactive${NC}/" | \
-        while read -r l; do echo -e "    $l"; done
+    local tun_st ka_st tun_col="${RED}" ka_col="${RED}"
+    tun_st=$(systemctl is-active "${SELECTED_TUNNEL}" 2>/dev/null || true)
+    [ -z "$tun_st" ] && tun_st="inactive"
+    [ "$tun_st" = "active" ] && tun_col="${GREEN}"
+    [ "$tun_st" = "activating" ] && tun_col="${YELLOW}"
 
-    local ka_st
-    ka_st=$(systemctl is-active "gre-keepalive-${tid}.service" 2>/dev/null || echo "inactive")
-    echo -e "  ${CYAN}Keepalive Service:${NC} ${ka_st}"
+    ka_st=$(systemctl is-active "gre-keepalive-${tid}.service" 2>/dev/null || true)
+    [ -z "$ka_st" ] && ka_st="inactive"
+    [ "$ka_st" = "active" ] && ka_col="${GREEN}"
+
+    echo -e "  ${CYAN}Service:${NC}           ${tun_col}${tun_st}${NC}"
+    echo -e "  ${CYAN}Keepalive Service:${NC} ${ka_col}${ka_st}${NC}"
 
     if ip link show "${tun_if}" &>/dev/null; then
-        local rx
+        local rx tx rxd txd
         rx=$(cat "/sys/class/net/${tun_if}/statistics/rx_bytes" 2>/dev/null || echo 0)
-        local tx
         tx=$(cat "/sys/class/net/${tun_if}/statistics/tx_bytes" 2>/dev/null || echo 0)
+        rxd=$(cat "/sys/class/net/${tun_if}/statistics/rx_dropped" 2>/dev/null || echo 0)
+        txd=$(cat "/sys/class/net/${tun_if}/statistics/tx_dropped" 2>/dev/null || echo 0)
         echo ""
         print_line
-        echo -e "  ${CYAN}Traffic:${NC}"
-        echo -e "    RX: ${GREEN}$(( rx / 1048576 )) MB${NC}  TX: ${BLUE}$(( tx / 1048576 )) MB${NC}"
+        echo -e "  ${CYAN}Traffic & Drops:${NC}"
+        echo -e "    RX: ${GREEN}$(format_bytes "$rx")${NC} (dropped: ${rxd})  |  TX: ${BLUE}$(format_bytes "$tx")${NC} (dropped: ${txd})"
+        echo -e "  ${CYAN}Link Info:${NC}"
+        ip -d link show "${tun_if}" 2>/dev/null | head -4 | sed 's/^/    /'
+    fi
+
+    if [ -n "$fp" ]; then
+        echo ""
+        print_line
+        echo -e "  ${CYAN}Kernel FOU Listener (port ${fp}):${NC}"
+        local fou_line
+        fou_line=$(ip fou show 2>/dev/null | awk -v p="$fp" '$2 == p {print}')
+        [ -n "$fou_line" ] && echo -e "    ${GREEN}${fou_line}${NC}" || msg_warn "  FOU port ${fp} is not registered in kernel."
     fi
 
     echo ""
     print_line
-    local wd_st
+    local wd_st fails restarts
     wd_st=$(systemctl is-active "gre-watchdog-${tid}.timer" 2>/dev/null || echo "inactive")
-    local fails
-    fails=$(cat "/tmp/.wd_gre${tid}" 2>/dev/null || echo 0)
-    echo -e "  ${CYAN}Watchdog:${NC}  ${wd_st}  fails: ${fails}/3"
+    fails=$(cat "${STATE_DIR}/${tun_if}.fails" 2>/dev/null || cat "/tmp/.wd_${tun_if}" 2>/dev/null || echo 0)
+    restarts=$(cat "${STATE_DIR}/${tun_if}.restarts" 2>/dev/null || echo 0)
+    [[ ! "$fails" =~ ^[0-9]+$ ]] && fails=0
+    [[ ! "$restarts" =~ ^[0-9]+$ ]] && restarts=0
+    echo -e "  ${CYAN}Watchdog:${NC}  ${wd_st}  fails: ${fails}/3  backoff restarts: ${restarts}"
 
     echo ""
     print_line
-    echo -e "  ${CYAN}nftables (fw_${tid}):${NC}"
-    nft list table ip "fw_${tid}" 2>/dev/null | head -20 || msg_warn "  Table not found."
+    if nft list table ip "fw_gre_${tid}" &>/dev/null; then
+        echo -e "  ${CYAN}nftables (fw_gre_${tid}):${NC}"
+        nft list table ip "fw_gre_${tid}" 2>/dev/null | head -35
+    elif nft list table ip "fw_${tid}" &>/dev/null; then
+        echo -e "  ${YELLOW}nftables (legacy fw_${tid}):${NC}"
+        nft list table ip "fw_${tid}" 2>/dev/null | head -35
+    else
+        echo -e "  ${CYAN}nftables (fw_gre_${tid}):${NC}"
+        msg_warn "  Table not found."
+    fi
     echo ""
 }
 
@@ -1821,9 +2264,9 @@ do_delete() {
     local tid="${SELECTED_TID}"
     local tun_if="gre${tid}"
     local svc_name="gre-tunnel-${tid}"
-    local up_script="${SCRIPTS_DIR}/gre${tid}-up.sh"
-    local down_script="${SCRIPTS_DIR}/gre${tid}-down.sh"
-    local wd_script="${SCRIPTS_DIR}/gre${tid}-watchdog.sh"
+    local up_script="${SCRIPTS_DIR}/${tun_if}-up.sh"
+    local down_script="${SCRIPTS_DIR}/${tun_if}-down.sh"
+    local wd_script="${SCRIPTS_DIR}/${tun_if}-watchdog.sh"
 
     echo ""
     echo -e " ${RED}${BOLD}This will permanently delete Tunnel ${tid} (${tun_if}) and ALL its components.${NC}"
@@ -1845,29 +2288,29 @@ do_delete() {
     # 1. Detect FOU port before deleting scripts
     local fou_port=""
     if [ -f "$up_script" ]; then
-        fou_port=$(grep '^FOU_PORT=' "$up_script" 2>/dev/null | cut -d'"' -f2)
+        fou_port=$(extract_up_var "FOU_PORT" "$up_script")
     fi
     if [ -z "$fou_port" ] && [ -f "$down_script" ]; then
-        fou_port=$(grep '^FOU_PORT=' "$down_script" 2>/dev/null | cut -d'"' -f2)
+        fou_port=$(extract_up_var "FOU_PORT" "$down_script")
     fi
 
-    # 2. Stop and disable watchdog FIRST so it cannot resurrect the tunnel!
+    # 2. Stop and disable watchdog FIRST so it cannot resurrect the tunnel
     systemctl stop "gre-watchdog-${tid}.timer" 2>/dev/null || true
     systemctl disable "gre-watchdog-${tid}.timer" 2>/dev/null || true
     systemctl stop "gre-watchdog-${tid}.service" 2>/dev/null || true
     systemctl disable "gre-watchdog-${tid}.service" 2>/dev/null || true
-    pkill -9 -f "gre${tid}-watchdog.sh" 2>/dev/null || true
+    pkill -9 -f "${tun_if}-watchdog\.sh([[:space:]]|$)" 2>/dev/null || true
 
-    # 3. Stop and disable keepalive service & kill any orphaned ping loops
+    # 3. Stop and disable keepalive service & kill only this tunnel's orphaned ping processes
     systemctl stop "gre-keepalive-${tid}.service" 2>/dev/null || true
     systemctl disable "gre-keepalive-${tid}.service" 2>/dev/null || true
-    pkill -9 -f "ping.*-I ${tun_if}" 2>/dev/null || true
+    pkill -9 -f "ping.*-I ${tun_if}([[:space:]]|$)" 2>/dev/null || true
 
     # 4. Stop and disable main tunnel service
     systemctl stop "${svc_name}.service" 2>/dev/null || true
     systemctl disable "${svc_name}.service" 2>/dev/null || true
 
-    # 5. Execute down script directly (ensures ExecStop logic runs even if service was already inactive)
+    # 5. Execute down script directly
     if [ -f "$down_script" ]; then
         bash "$down_script" 2>/dev/null || true
     fi
@@ -1877,16 +2320,19 @@ do_delete() {
     ip tunnel del "${tun_if}" 2>/dev/null || true
     ip link del "${tun_if}" 2>/dev/null || true
 
-    # 7. nftables cleanup
-    nft delete table ip "fw_${tid}" 2>/dev/null || true
+    # 7. nftables cleanup (new table and surgical legacy cleanup)
+    nft delete table ip "fw_gre_${tid}" 2>/dev/null || true
+    if nft list table ip "fw_${tid}" 2>/dev/null | grep -qE "\"?${tun_if}\"?|fwd_mss"; then
+        nft delete table ip "fw_${tid}" 2>/dev/null || true
+    fi
 
     # 8. Clean up FOU UDP port if no other tunnel is using it
     if [ -n "$fou_port" ]; then
-        local other_using=0
+        local other_using=0 s
         for s in "${SCRIPTS_DIR}"/*-up.sh; do
             [ -f "$s" ] || continue
             [ "$s" = "$up_script" ] && continue
-            if grep -q "FOU_PORT=\"${fou_port}\"" "$s" 2>/dev/null; then
+            if grep -Eq "^FOU_PORT=[\"']?${fou_port}[\"']?$" "$s" 2>/dev/null; then
                 other_using=1
                 break
             fi
@@ -1905,10 +2351,11 @@ do_delete() {
     rm -f "${SYSTEMD_DIR}/multi-user.target.wants/gre-keepalive-${tid}.service"
     rm -f "${SYSTEMD_DIR}/timers.target.wants/gre-watchdog-${tid}.timer"
 
-    # 10. Remove scripts and tracking files
+    # 10. Remove scripts and tracking/state files
     rm -f "$up_script"
     rm -f "$down_script"
     rm -f "$wd_script"
+    rm -f "${STATE_DIR}/${tun_if}.fails" "${STATE_DIR}/${tun_if}.restarts" "${STATE_DIR}/${tun_if}.last_restart" "${STATE_DIR}/${tun_if}.t1_restarts" "${STATE_DIR}/${tun_if}.t1_last" "${STATE_DIR}/${tun_if}.stopped" "${STATE_DIR}/${tun_if}.lock"
     rm -f "/tmp/.wd_${tun_if}"
 
     # 11. Reload systemd daemon and reset failed units
@@ -1952,6 +2399,151 @@ do_view_scripts() {
     fi
 }
 
+do_upgrade_tunnels() {
+    echo ""
+    echo -e " ${CYAN}${BOLD}Upgrade Existing GRE-FOU Tunnels to v${VERSION}:${NC}"
+    echo -e " ${DIM}(encap-csum, atomic nftables + output/prerouting notrack, SYN/SYN-ACK MSS, fq flow_limit 1000, backoff watchdog)${NC}"
+    print_line
+
+    local all_ids; mapfile -t all_ids < <(get_all_tunnel_ids)
+    [ ${#all_ids[@]} -eq 0 ] && { msg_warn "No GRE/FOU tunnels found."; return; }
+
+    local backup_dir="${SCRIPTS_DIR}/.gre-backup-$(date +%Y%m%d-%H%M%S)"
+    local backup_created=0
+    local upgraded_ids=()
+    local throttled_port_tunnels=()
+
+    # Save caller globals cleanly
+    local _s_tid="${TUNNEL_ID:-}" _s_tif="${TUN_IF:-}" _s_ifw="${IF_WAN:-}"
+    local _s_lr="${LOCAL_REAL:-}" _s_rr="${REMOTE_REAL:-}"
+    local _s_ls="${LOCAL_SPOOF:-}" _s_rs="${REMOTE_SPOOF:-}"
+    local _s_lt="${LOCAL_TUN:-}" _s_rt="${REMOTE_TUN:-}"
+    local _s_gk="${GRE_KEY:-}" _s_fe="${FOU_ENABLE:-}" _s_fp="${FOU_PORT:-}"
+    local _s_mtu="${TUN_MTU:-}"
+
+    local tid
+    for tid in "${all_ids[@]}"; do
+        local tun_if="gre${tid}"
+        local up_script="${SCRIPTS_DIR}/${tun_if}-up.sh"
+        local down_script="${SCRIPTS_DIR}/${tun_if}-down.sh"
+        local wd_script="${SCRIPTS_DIR}/${tun_if}-watchdog.sh"
+
+        if [ ! -f "$up_script" ]; then
+            msg_warn "Skipping Tunnel ${tid}: ${up_script} not found."
+            continue
+        fi
+
+        local u_ifw u_lr u_rr u_ls u_rs u_lt u_gk u_fe u_fp u_mtu u_rt u_role
+        u_ifw=$(extract_up_var "IF_WAN" "$up_script")
+        u_lr=$(extract_up_var "LOCAL_REAL" "$up_script")
+        u_rr=$(extract_up_var "REMOTE_REAL" "$up_script")
+        u_ls=$(extract_up_var "LOCAL_SPOOF" "$up_script")
+        u_rs=$(extract_up_var "REMOTE_SPOOF" "$up_script")
+        u_lt=$(extract_up_var "LOCAL_TUN" "$up_script")
+        u_gk=$(extract_up_var "GRE_KEY" "$up_script")
+        u_fe=$(extract_up_var "FOU_ENABLE" "$up_script")
+        u_fp=$(extract_up_var "FOU_PORT" "$up_script")
+        u_mtu=$(extract_up_var "TUN_MTU" "$up_script")
+        [ -z "$u_mtu" ] && u_mtu=$(grep -E '^[[:space:]]*MTU=' "$up_script" 2>/dev/null | head -1 | cut -d'=' -f2 | tr -d "\"'\r")
+
+        [ -z "$u_fe" ] && u_fe="yes"
+        [ -z "$u_ls" ] && u_ls="$u_lr"
+        [ -z "$u_rs" ] && u_rs="$u_rr"
+        [ -z "$u_gk" ] && u_gk="$tid"
+        if [ -z "$u_mtu" ] || ! [[ "$u_mtu" =~ ^[0-9]+$ ]]; then
+            [ "$u_fe" = "yes" ] && u_mtu="1392" || u_mtu="1400"
+        fi
+
+        u_rt=$(derive_remote_tun_from_local "$u_lt")
+
+        if [[ ! "$u_ifw" =~ ^[a-zA-Z0-9_.:-]+$ ]] || [ "${#u_ifw}" -gt 20 ] || ! validate_ipv4 "$u_lr" || ! validate_ipv4 "$u_rr" || ! validate_ipv4 "$u_ls" || ! validate_ipv4 "$u_rs" || [ -z "$u_rt" ] || ! [[ "$u_gk" =~ ^[0-9]+$ ]]; then
+            msg_warn "Skipping Tunnel ${tid}: invalid or incomplete parameters in ${up_script}."
+            continue
+        fi
+        if [ "$u_fe" = "yes" ] && { ! [[ "$u_fp" =~ ^[0-9]+$ ]] || [ "$u_fp" -lt 1 ] || [ "$u_fp" -gt 65535 ]; }; then
+            msg_warn "Skipping Tunnel ${tid}: invalid or missing FOU_PORT in ${up_script}."
+            continue
+        fi
+        if [ "$u_mtu" -lt 1280 ] || [ "$u_mtu" -gt 1464 ]; then
+            [ "$u_fe" = "yes" ] && u_mtu="1392" || u_mtu="1400"
+        fi
+
+        if [ "$backup_created" -eq 0 ]; then
+            mkdir -p "$backup_dir"
+            backup_created=1
+        fi
+        cp -p "$up_script" "$backup_dir/" 2>/dev/null || true
+        [ -f "$down_script" ] && cp -p "$down_script" "$backup_dir/" 2>/dev/null || true
+        [ -f "$wd_script" ] && cp -p "$wd_script" "$backup_dir/" 2>/dev/null || true
+
+        [[ "$u_lt" == *".1/"* ]] && u_role="Iran" || u_role="Kharej"
+
+        TUNNEL_ID="$tid"
+        TUN_IF="$tun_if"
+        IF_WAN="$u_ifw"
+        LOCAL_REAL="$u_lr"
+        REMOTE_REAL="$u_rr"
+        LOCAL_SPOOF="$u_ls"
+        REMOTE_SPOOF="$u_rs"
+        LOCAL_TUN="$u_lt"
+        REMOTE_TUN="$u_rt"
+        GRE_KEY="$u_gk"
+        FOU_ENABLE="$u_fe"
+        FOU_PORT="$u_fp"
+        TUN_MTU="$u_mtu"
+
+        generate_gre_up "$up_script"
+        generate_gre_down "$down_script"
+        generate_watchdog "$wd_script"
+
+        create_gre_service "$tid" "gre-tunnel-${tid}" "$up_script" "$down_script" "GRE Tunnel ${tid} - ${u_role}" "no"
+        create_keepalive_service "$tid" "$u_rt" "no"
+        create_watchdog_timer "$tid" "$wd_script" "no"
+
+        msg_ok "Upgraded Tunnel ${tid} (${tun_if}, ${u_role}, FOU port ${u_fp:-none}, MTU ${u_mtu})."
+        upgraded_ids+=("$tid")
+
+        if [ "$u_fe" = "yes" ] && [[ "$u_fp" =~ ^[0-9]+$ ]] && [ "$u_fp" -ge 51820 ] && [ "$u_fp" -le 51850 ]; then
+            throttled_port_tunnels+=("gre${tid}:port=${u_fp}")
+        fi
+    done
+
+    # Restore caller globals
+    TUNNEL_ID="${_s_tid}"; TUN_IF="${_s_tif}"; IF_WAN="${_s_ifw}"
+    LOCAL_REAL="${_s_lr}"; REMOTE_REAL="${_s_rr}"
+    LOCAL_SPOOF="${_s_ls}"; REMOTE_SPOOF="${_s_rs}"
+    LOCAL_TUN="${_s_lt}"; REMOTE_TUN="${_s_rt}"
+    GRE_KEY="${_s_gk}"; FOU_ENABLE="${_s_fe}"; FOU_PORT="${_s_fp}"
+    TUN_MTU="${_s_mtu}"
+
+    persist_sysctl_tuning
+    systemctl daemon-reload
+    msg_ok "Updated /etc/sysctl.d/99-xmanager-tunnel.conf & /etc/modules-load.d/99-xmanager-gre.conf"
+    [ "$backup_created" -eq 1 ] && msg_info "Backups saved in: ${backup_dir}"
+
+    if [ ${#throttled_port_tunnels[@]} -gt 0 ]; then
+        echo ""
+        msg_warn "The following tunnels still use WireGuard-range UDP ports (51820-51850), which some ISPs throttle:"
+        msg_warn "  ${throttled_port_tunnels[*]}"
+        msg_warn "Ports were preserved automatically; consider reconfiguring both sides to 4500/8443/1194 if you experience loss."
+    fi
+
+    if [ ${#upgraded_ids[@]} -gt 0 ]; then
+        echo ""
+        read -p "  Restart upgraded tunnels now to apply changes? (y/N): " rst_choice
+        if [[ "$rst_choice" =~ ^[Yy]$ ]]; then
+            for tid in "${upgraded_ids[@]}"; do
+                if restart_tunnel_services "$tid"; then
+                    msg_ok "Tunnel ${tid} restarted cleanly."
+                fi
+            done
+        else
+            msg_warn "Remember to restart upgraded tunnels on BOTH Iran and Kharej servers for encap-csum to take effect."
+        fi
+    fi
+    echo ""
+}
+
 # ─── Main Menu ────────────────────────────────────────────────────
 main_menu() {
     while true; do
@@ -1987,8 +2579,9 @@ main_menu() {
         echo -e " ${BOLD}${WHITE}Danger${NC}"
         echo -e "  ${RED}17)${NC} Delete a Tunnel"
         echo ""
-        echo -e " ${BOLD}${WHITE}Install${NC}"
+        echo -e " ${BOLD}${WHITE}Install & Maintenance${NC}"
         echo -e "  ${MAGENTA}18)${NC} Install Prerequisites"
+        echo -e "  ${GREEN}19)${NC} Upgrade Existing Tunnels (v${VERSION}: encap-csum, notrack, MSS, Watchdog)"
         echo ""
         echo -e "  ${DIM}0)${NC}  Exit"
         echo ""
@@ -2013,6 +2606,7 @@ main_menu() {
             16|wd|watchdog) watchdog_menu ;;
             17) do_delete ;;
             18) install_prereqs ;;
+            19) do_upgrade_tunnels ;;
             0)  echo -e "\n ${GREEN}Goodbye!${NC}\n"; exit 0 ;;
             *)  msg_err "Invalid option." ;;
         esac
