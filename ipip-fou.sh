@@ -472,6 +472,7 @@ net.ipv4.ipfrag_time = 30
 net.core.netdev_max_backlog = 100000
 net.core.netdev_budget = 1200
 net.core.netdev_budget_usecs = 8000
+net.core.dev_weight = 128
 
 # Connection Scalability & Limits
 fs.file-max = 2097152
@@ -485,8 +486,14 @@ net.ipv4.tcp_keepalive_time = 120
 net.ipv4.tcp_keepalive_intvl = 10
 net.ipv4.tcp_keepalive_probes = 3
 net.netfilter.nf_conntrack_max = 2097152
+net.netfilter.nf_conntrack_tcp_timeout_established = 1800
+net.netfilter.nf_conntrack_udp_timeout = 15
+net.netfilter.nf_conntrack_udp_timeout_stream = 45
 EOF
     sysctl -p /etc/sysctl.d/99-xmanager-tunnel.conf >/dev/null 2>&1 || true
+    if [ -w /sys/module/nf_conntrack/parameters/hashsize ]; then
+        echo 524288 > /sys/module/nf_conntrack/parameters/hashsize 2>/dev/null || true
+    fi
 }
 
 # ─── Generate IPIP-UP Script ─────────────────────────────────────
@@ -564,6 +571,7 @@ sysctl -w net.ipv4.ipfrag_time=30              >/dev/null 2>&1 || true
 sysctl -w net.core.netdev_max_backlog=100000   >/dev/null 2>&1 || true
 sysctl -w net.core.netdev_budget=1200          >/dev/null 2>&1 || true
 sysctl -w net.core.netdev_budget_usecs=8000    >/dev/null 2>&1 || true
+sysctl -w net.core.dev_weight=128              >/dev/null 2>&1 || true
 
 # ── Performance: Max connections & bandwidth ──
 modprobe nf_conntrack 2>/dev/null || true
@@ -624,8 +632,9 @@ ip link set \${TUN_IF} up
 ethtool -G \${IF_WAN} rx 4096 tx 4096 2>/dev/null || ethtool -G \${IF_WAN} rx 2048 tx 2048 2>/dev/null || true
 ip link set dev \${IF_WAN} txqueuelen 10000 2>/dev/null || true
 
-# Disable hardware offloads on WAN and tunnel to prevent corrupted frames and softirq spikes
-ethtool -K \${IF_WAN} tso off gso off gro off 2>/dev/null || true
+# Keep WAN GRO/GSO/TSO enabled for high-PPS forwarding efficiency; disable UDP tunnel segmentation only
+ethtool -K \${IF_WAN} tso on gso on gro on 2>/dev/null || true
+ethtool -K \${IF_WAN} tx-udp_tnl-segmentation off tx-udp_tnl-csum-segmentation off 2>/dev/null || true
 ethtool -K \${TUN_IF} tso off gso off gro off 2>/dev/null || true
 
 # Route advmss tuning: forces local sockets to clamp MSS automatically
@@ -659,42 +668,62 @@ if [ "\${CORES}" -gt 1 ]; then
     echo 32768 > /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null || true
 fi
 
-# ── nftables ──
-nft delete table ip \${NFT_TABLE} 2>/dev/null || true
-nft add table ip \${NFT_TABLE}
-
-# Check if IP spoofing is enabled and needed
+# ── nftables (atomic reload + prerouting/output notrack + MSS clamping) ──
 DO_SPOOF=0
 if [ -n "\${LOCAL_SPOOF}" ] && [ -n "\${REMOTE_SPOOF}" ] && { [ "\${LOCAL_SPOOF}" != "\${LOCAL_REAL}" ] || [ "\${REMOTE_SPOOF}" != "\${REMOTE_REAL}" ]; }; then
     DO_SPOOF=1
 fi
 
-if [ "\$DO_SPOOF" -eq 1 ]; then
-    nft add chain ip \${NFT_TABLE} prerouting  '{ type filter hook prerouting  priority -300 ; }'
-    nft add chain ip \${NFT_TABLE} postrouting '{ type filter hook postrouting priority  300 ; }'
-
+{
+    echo "table ip \${NFT_TABLE}"
+    echo "delete table ip \${NFT_TABLE}"
+    echo "table ip \${NFT_TABLE} {"
+    echo "    chain prerouting {"
+    echo "        type filter hook prerouting priority -300; policy accept;"
     if [ "\${FOU_ENABLE}" = "yes" ]; then
-        nft add rule ip \${NFT_TABLE} prerouting  iif "\${IF_WAN}" ip saddr \${REMOTE_SPOOF} ip daddr \${LOCAL_REAL} udp dport \${FOU_PORT} ip saddr set \${REMOTE_REAL} notrack
-        nft add rule ip \${NFT_TABLE} postrouting oif "\${IF_WAN}" ip saddr \${LOCAL_REAL} ip daddr \${REMOTE_REAL} udp dport \${FOU_PORT} ip saddr set \${LOCAL_SPOOF} notrack
+        if [ "\$DO_SPOOF" -eq 1 ]; then
+            echo "        iifname \"\${IF_WAN}\" ip saddr \${REMOTE_SPOOF} ip daddr \${LOCAL_REAL} udp dport \${FOU_PORT} ip saddr set \${REMOTE_REAL} notrack"
+        else
+            echo "        iifname \"\${IF_WAN}\" ip saddr \${REMOTE_REAL} ip daddr \${LOCAL_REAL} udp dport \${FOU_PORT} notrack"
+        fi
     else
-        nft add rule ip \${NFT_TABLE} prerouting  iif "\${IF_WAN}" ip protocol ipip ip saddr \${REMOTE_SPOOF} ip daddr \${LOCAL_REAL} ip saddr set \${REMOTE_REAL} notrack
-        nft add rule ip \${NFT_TABLE} postrouting oif "\${IF_WAN}" ip protocol ipip ip saddr \${LOCAL_REAL} ip daddr \${REMOTE_REAL} ip saddr set \${LOCAL_SPOOF} notrack
+        if [ "\$DO_SPOOF" -eq 1 ]; then
+            echo "        iifname \"\${IF_WAN}\" ip protocol ipip ip saddr \${REMOTE_SPOOF} ip daddr \${LOCAL_REAL} ip saddr set \${REMOTE_REAL} notrack"
+        else
+            echo "        iifname \"\${IF_WAN}\" ip protocol ipip ip saddr \${REMOTE_REAL} ip daddr \${LOCAL_REAL} notrack"
+        fi
     fi
-elif [ "\${FOU_ENABLE}" = "yes" ]; then
-    # Bypass conntrack & generic dstnat/port-forward tables for FOU outer UDP traffic
-    nft add chain ip \${NFT_TABLE} prerouting  '{ type filter hook prerouting  priority -300 ; }'
-    nft add chain ip \${NFT_TABLE} postrouting '{ type filter hook postrouting priority  300 ; }'
-    nft add rule ip \${NFT_TABLE} prerouting  iif "\${IF_WAN}" ip saddr \${REMOTE_REAL} ip daddr \${LOCAL_REAL} udp dport \${FOU_PORT} notrack
-    nft add rule ip \${NFT_TABLE} postrouting oif "\${IF_WAN}" ip saddr \${LOCAL_REAL} ip daddr \${REMOTE_REAL} udp dport \${FOU_PORT} notrack
-fi
-
-# MSS Clamping
-nft add chain ip \${NFT_TABLE} fwd_mss '{ type filter hook forward priority 0 ; }'
-nft add rule  ip \${NFT_TABLE} fwd_mss oif "\${TUN_IF}" tcp flags syn tcp option maxseg size set \${MSS}
-nft add rule  ip \${NFT_TABLE} fwd_mss iif "\${TUN_IF}" tcp flags syn tcp option maxseg size set \${MSS}
-
-nft add chain ip \${NFT_TABLE} out_mss '{ type filter hook output priority 0 ; }'
-nft add rule  ip \${NFT_TABLE} out_mss oif "\${TUN_IF}" tcp flags syn tcp option maxseg size set \${MSS}
+    echo "    }"
+    echo "    chain output {"
+    echo "        type filter hook output priority -300; policy accept;"
+    if [ "\${FOU_ENABLE}" = "yes" ]; then
+        echo "        oifname \"\${IF_WAN}\" ip saddr \${LOCAL_REAL} ip daddr \${REMOTE_REAL} udp dport \${FOU_PORT} notrack"
+        echo "        oifname \"\${IF_WAN}\" ip saddr \${LOCAL_REAL} ip daddr \${REMOTE_REAL} udp sport \${FOU_PORT} notrack"
+    else
+        echo "        oifname \"\${IF_WAN}\" ip protocol ipip ip saddr \${LOCAL_REAL} ip daddr \${REMOTE_REAL} notrack"
+    fi
+    echo "    }"
+    if [ "\$DO_SPOOF" -eq 1 ]; then
+        echo "    chain postrouting {"
+        echo "        type filter hook postrouting priority 300; policy accept;"
+        if [ "\${FOU_ENABLE}" = "yes" ]; then
+            echo "        oifname \"\${IF_WAN}\" ip saddr \${LOCAL_REAL} ip daddr \${REMOTE_REAL} udp dport \${FOU_PORT} ip saddr set \${LOCAL_SPOOF}"
+        else
+            echo "        oifname \"\${IF_WAN}\" ip protocol ipip ip saddr \${LOCAL_REAL} ip daddr \${REMOTE_REAL} ip saddr set \${LOCAL_SPOOF}"
+        fi
+        echo "    }"
+    fi
+    echo "    chain fwd_mss {"
+    echo "        type filter hook forward priority -150; policy accept;"
+    echo "        oifname \"\${TUN_IF}\" tcp flags & (syn | rst) == syn tcp option maxseg size > \${MSS} tcp option maxseg size set \${MSS}"
+    echo "        iifname \"\${TUN_IF}\" tcp flags & (syn | rst) == syn tcp option maxseg size > \${MSS} tcp option maxseg size set \${MSS}"
+    echo "    }"
+    echo "    chain out_mss {"
+    echo "        type filter hook output priority -150; policy accept;"
+    echo "        oifname \"\${TUN_IF}\" tcp flags & (syn | rst) == syn tcp option maxseg size > \${MSS} tcp option maxseg size set \${MSS}"
+    echo "    }"
+    echo "}"
+} | nft -f -
 
 echo "IPIP tunnel \${TUN_IF} UP (table: \${NFT_TABLE})"
 IPIPEOF
@@ -2019,6 +2048,212 @@ do_upgrade_tunnels() {
     echo ""
 }
 
+extract_ipip_up_var() {
+    local key="$1" file="$2"
+    grep -E "^${key}=" "$file" 2>/dev/null | head -1 | sed -E "s/^${key}=//; s/[[:space:]]+#.*$//; s/^[\"']//; s/[\"'][[:space:]]*$//" | tr -d '\r'
+}
+
+derive_ipip_remote_tun() {
+    local lt="$1"
+    local subnet_prefix
+    subnet_prefix=$(echo "$lt" | sed -E 's/\.[0-9]+\/[0-9]+$//')
+    if [[ "$subnet_prefix" =~ ^([0-9]{1,3}\.){2}[0-9]{1,3}$ ]]; then
+        if [[ "$lt" == *".1/"* ]]; then
+            echo "${subnet_prefix}.2"
+        else
+            echo "${subnet_prefix}.1"
+        fi
+    fi
+}
+
+apply_live_ipip_nftables() {
+    local tid="$1" tun_if="$2" if_wan="$3" lr="$4" rr="$5" ls="$6" rs="$7" fe="$8" fp="$9" mss="${10}"
+    local nft_table="fw_ipip_${tid}"
+    local do_spoof=0
+    if [ -n "$ls" ] && [ -n "$rs" ] && { [ "$ls" != "$lr" ] || [ "$rs" != "$rr" ]; }; then
+        do_spoof=1
+    fi
+
+    {
+        echo "table ip ${nft_table}"
+        echo "delete table ip ${nft_table}"
+        echo "table ip ${nft_table} {"
+        echo "    chain prerouting {"
+        echo "        type filter hook prerouting priority -300; policy accept;"
+        if [ "$fe" = "yes" ]; then
+            if [ "$do_spoof" -eq 1 ]; then
+                echo "        iifname \"${if_wan}\" ip saddr ${rs} ip daddr ${lr} udp dport ${fp} ip saddr set ${rr} notrack"
+            else
+                echo "        iifname \"${if_wan}\" ip saddr ${rr} ip daddr ${lr} udp dport ${fp} notrack"
+            fi
+        else
+            if [ "$do_spoof" -eq 1 ]; then
+                echo "        iifname \"${if_wan}\" ip protocol ipip ip saddr ${rs} ip daddr ${lr} ip saddr set ${rr} notrack"
+            else
+                echo "        iifname \"${if_wan}\" ip protocol ipip ip saddr ${rr} ip daddr ${lr} notrack"
+            fi
+        fi
+        echo "    }"
+        echo "    chain output {"
+        echo "        type filter hook output priority -300; policy accept;"
+        if [ "$fe" = "yes" ]; then
+            echo "        oifname \"${if_wan}\" ip saddr ${lr} ip daddr ${rr} udp dport ${fp} notrack"
+            echo "        oifname \"${if_wan}\" ip saddr ${lr} ip daddr ${rr} udp sport ${fp} notrack"
+        else
+            echo "        oifname \"${if_wan}\" ip protocol ipip ip saddr ${lr} ip daddr ${rr} notrack"
+        fi
+        echo "    }"
+        if [ "$do_spoof" -eq 1 ]; then
+            echo "    chain postrouting {"
+            echo "        type filter hook postrouting priority 300; policy accept;"
+            if [ "$fe" = "yes" ]; then
+                echo "        oifname \"${if_wan}\" ip saddr ${lr} ip daddr ${rr} udp dport ${fp} ip saddr set ${ls}"
+            else
+                echo "        oifname \"${if_wan}\" ip protocol ipip ip saddr ${lr} ip daddr ${rr} ip saddr set ${ls}"
+            fi
+            echo "    }"
+        fi
+        echo "    chain fwd_mss {"
+        echo "        type filter hook forward priority -150; policy accept;"
+        echo "        oifname \"${tun_if}\" tcp flags & (syn | rst) == syn tcp option maxseg size > ${mss} tcp option maxseg size set ${mss}"
+        echo "        iifname \"${tun_if}\" tcp flags & (syn | rst) == syn tcp option maxseg size > ${mss} tcp option maxseg size set ${mss}"
+        echo "    }"
+        echo "    chain out_mss {"
+        echo "        type filter hook output priority -150; policy accept;"
+        echo "        oifname \"${tun_if}\" tcp flags & (syn | rst) == syn tcp option maxseg size > ${mss} tcp option maxseg size set ${mss}"
+        echo "    }"
+        echo "}"
+    } | nft -f -
+}
+
+do_optimize_tunnels() {
+    echo ""
+    echo -e " ${CYAN}${BOLD}Optimize Existing IPIP-FOU Tunnels & Kernel Stack (Live + Persistent):${NC}"
+    echo -e " ${DIM}(Adds prerouting/output notrack, flushes stale FOU conntrack, enables WAN GRO/GSO/TSO, fq flow_limit 1000, netdev_budget 1200 / dev_weight 128)${NC}"
+    print_line
+
+    local all_ids; mapfile -t all_ids < <(get_all_tunnel_ids)
+    [ ${#all_ids[@]} -eq 0 ] && { msg_warn "No IPIP/FOU tunnels found."; return; }
+
+    local backup_dir="${SCRIPTS_DIR}/.ipip-opt-backup-$(date +%Y%m%d-%H%M%S)"
+    local backup_created=0
+    local optimized_ids=()
+    local restart_needed_ids=()
+
+    # Save caller globals cleanly
+    local _s_tid="${TUNNEL_ID:-}" _s_tif="${TUN_IF:-}" _s_ifw="${IF_WAN:-}"
+    local _s_lr="${LOCAL_REAL:-}" _s_rr="${REMOTE_REAL:-}"
+    local _s_ls="${LOCAL_SPOOF:-}" _s_rs="${REMOTE_SPOOF:-}"
+    local _s_lt="${LOCAL_TUN:-}" _s_rt="${REMOTE_TUN:-}"
+    local _s_fe="${FOU_ENABLE:-}" _s_fp="${FOU_PORT:-}"
+
+    local tid
+    for tid in "${all_ids[@]}"; do
+        local tun_if="ipip${tid}"
+        local up_script="${SCRIPTS_DIR}/${tun_if}-up.sh"
+        if [ ! -f "$up_script" ]; then
+            msg_warn "Skipping Tunnel ${tid}: ${up_script} not found."
+            continue
+        fi
+
+        local u_ifw u_lr u_rr u_ls u_rs u_lt u_fe u_fp u_rt u_mss had_csum=1
+        u_ifw=$(extract_ipip_up_var "IF_WAN" "$up_script")
+        u_lr=$(extract_ipip_up_var "LOCAL_REAL" "$up_script")
+        u_rr=$(extract_ipip_up_var "REMOTE_REAL" "$up_script")
+        u_ls=$(extract_ipip_up_var "LOCAL_SPOOF" "$up_script")
+        u_rs=$(extract_ipip_up_var "REMOTE_SPOOF" "$up_script")
+        u_lt=$(extract_ipip_up_var "LOCAL_TUN" "$up_script")
+        u_fe=$(extract_ipip_up_var "FOU_ENABLE" "$up_script")
+        u_fp=$(extract_ipip_up_var "FOU_PORT" "$up_script")
+
+        [ -z "$u_fe" ] && u_fe="yes"
+        [ -z "$u_ls" ] && u_ls="$u_lr"
+        [ -z "$u_rs" ] && u_rs="$u_rr"
+        [ "$u_fe" = "yes" ] && u_mss=1360 || u_mss=1380
+        if [ "$u_fe" = "yes" ] && ! grep -q 'encap-csum' "$up_script" 2>/dev/null; then
+            had_csum=0
+        fi
+        u_rt=$(derive_ipip_remote_tun "$u_lt")
+
+        if [[ ! "$u_ifw" =~ ^[a-zA-Z0-9_.:-]+$ ]] || [ "${#u_ifw}" -gt 20 ] || ! validate_ipv4 "$u_lr" || ! validate_ipv4 "$u_rr" || ! validate_ipv4 "$u_ls" || ! validate_ipv4 "$u_rs" || [ -z "$u_rt" ]; then
+            msg_warn "Skipping Tunnel ${tid}: invalid or incomplete parameters in ${up_script}."
+            continue
+        fi
+        if [ "$u_fe" = "yes" ] && { ! [[ "$u_fp" =~ ^[0-9]+$ ]] || [ "$u_fp" -lt 1 ] || [ "$u_fp" -gt 65535 ]; }; then
+            msg_warn "Skipping Tunnel ${tid}: invalid or missing FOU_PORT in ${up_script}."
+            continue
+        fi
+
+        if [ "$backup_created" -eq 0 ]; then
+            mkdir -p "$backup_dir"
+            backup_created=1
+        fi
+        cp -p "$up_script" "$backup_dir/" 2>/dev/null || true
+
+        TUNNEL_ID="$tid"
+        TUN_IF="$tun_if"
+        IF_WAN="$u_ifw"
+        LOCAL_REAL="$u_lr"
+        REMOTE_REAL="$u_rr"
+        LOCAL_SPOOF="$u_ls"
+        REMOTE_SPOOF="$u_rs"
+        LOCAL_TUN="$u_lt"
+        REMOTE_TUN="$u_rt"
+        FOU_ENABLE="$u_fe"
+        FOU_PORT="$u_fp"
+
+        generate_ipip_up "$up_script"
+
+        # Apply live zero-downtime optimizations on active interfaces and firewall
+        ethtool -K "${u_ifw}" tso on gso on gro on 2>/dev/null || true
+        ethtool -K "${u_ifw}" tx-udp_tnl-segmentation off tx-udp_tnl-csum-segmentation off 2>/dev/null || true
+        tc qdisc replace dev "${u_ifw}" root fq flow_limit 1000 2>/dev/null || true
+        if ip link show "${tun_if}" &>/dev/null; then
+            tc qdisc replace dev "${tun_if}" root fq flow_limit 1000 2>/dev/null || true
+        fi
+
+        if apply_live_ipip_nftables "$tid" "$tun_if" "$u_ifw" "$u_lr" "$u_rr" "$u_ls" "$u_rs" "$u_fe" "$u_fp" "$u_mss"; then
+            if [ "$u_fe" = "yes" ] && command -v conntrack &>/dev/null; then
+                conntrack -D -p udp --dport "${u_fp}" >/dev/null 2>&1 || true
+            fi
+            msg_ok "Optimized Tunnel ${tid} (${tun_if}, FOU ${u_fp:-none}, live notrack + offloads + qdisc applied)."
+        else
+            msg_warn "Updated script for Tunnel ${tid}, but live nftables reload failed."
+        fi
+
+        [ "$had_csum" -eq 0 ] && restart_needed_ids+=("$tid")
+        optimized_ids+=("$tid")
+    done
+
+    # Restore caller globals
+    TUNNEL_ID="${_s_tid}"; TUN_IF="${_s_tif}"; IF_WAN="${_s_ifw}"
+    LOCAL_REAL="${_s_lr}"; REMOTE_REAL="${_s_rr}"
+    LOCAL_SPOOF="${_s_ls}"; REMOTE_SPOOF="${_s_rs}"
+    LOCAL_TUN="${_s_lt}"; REMOTE_TUN="${_s_rt}"
+    FOU_ENABLE="${_s_fe}"; FOU_PORT="${_s_fp}"
+
+    persist_sysctl_tuning
+    msg_ok "Updated /etc/sysctl.d/99-xmanager-tunnel.conf (netdev_budget=1200, dev_weight=128, conntrack timeouts)"
+    [ "$backup_created" -eq 1 ] && msg_info "Backups saved in: ${backup_dir}"
+
+    if [ ${#restart_needed_ids[@]} -gt 0 ]; then
+        echo ""
+        msg_info "Live sysctl/qdisc/offload/notrack optimizations are active immediately."
+        read -p "  Restart tunnels missing encap-csum (${restart_needed_ids[*]}) now? (y/N): " rst_choice
+        if [[ "$rst_choice" =~ ^[Yy]$ ]]; then
+            for tid in "${restart_needed_ids[@]}"; do
+                restart_tunnel_services "$tid"
+                msg_ok "Tunnel ${tid} restarted."
+            done
+        else
+            msg_warn "Remember to restart tunnels missing encap-csum (both Iran & Kharej) for encap-csum to take effect."
+        fi
+    elif [ ${#optimized_ids[@]} -gt 0 ]; then
+        msg_ok "All live optimizations applied with ZERO tunnel downtime!"
+    fi
+    echo ""
+}
+
 # ─── Main Menu ────────────────────────────────────────────────────
 main_menu() {
     while true; do
@@ -2057,6 +2292,7 @@ main_menu() {
         echo -e " ${BOLD}${WHITE}Install & Maintenance${NC}"
         echo -e "  ${MAGENTA}18)${NC} Install Prerequisites"
         echo -e "  ${GREEN}19)${NC} Upgrade Existing Tunnels (Enable encap-csum & fq flow_limit)"
+        echo -e "  ${CYAN}20)${NC} Optimize Existing Tunnels & Kernel (Low CPU, GRO/GSO/TSO, Notrack, Conntrack)"
         echo ""
         echo -e "  ${DIM}0)${NC}  Exit"
         echo ""
@@ -2082,6 +2318,7 @@ main_menu() {
             17) do_delete ;;
             18) install_prereqs ;;
             19) do_upgrade_tunnels ;;
+            20) do_optimize_tunnels ;;
             0)  echo -e "\n ${GREEN}Goodbye!${NC}\n"; exit 0 ;;
             *)  msg_err "Invalid option." ;;
         esac
