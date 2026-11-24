@@ -607,6 +607,7 @@ net.ipv4.ipfrag_time = 30
 net.core.netdev_max_backlog = 100000
 net.core.netdev_budget = 1200
 net.core.netdev_budget_usecs = 8000
+net.core.dev_weight = 128
 
 # Connection Scalability & Limits
 fs.file-max = 2097152
@@ -625,6 +626,9 @@ net.ipv4.tcp_sack = 1
 net.ipv4.tcp_no_metrics_save = 1
 net.ipv4.tcp_moderate_rcvbuf = 1
 net.netfilter.nf_conntrack_max = ${CT_MAX}
+net.netfilter.nf_conntrack_tcp_timeout_established = 1800
+net.netfilter.nf_conntrack_udp_timeout = 15
+net.netfilter.nf_conntrack_udp_timeout_stream = 45
 EOF
 
     modprobe tcp_bbr 2>/dev/null || true
@@ -756,8 +760,8 @@ if [ -n "${RING_INFO}" ]; then
 fi
 ip link set dev "${IF_WAN}" txqueuelen 10000 2>/dev/null || true
 
-# Disable hardware offloads on WAN to prevent corrupted FOU frames and softirq spikes
-ethtool -K "${IF_WAN}" tso off gso off gro off 2>/dev/null || true
+# Keep WAN GRO/GSO/TSO enabled for high-PPS forwarding efficiency; disable UDP tunnel segmentation only
+ethtool -K "${IF_WAN}" tso on gso on gro on 2>/dev/null || true
 ethtool -K "${IF_WAN}" tx-udp_tnl-segmentation off tx-udp_tnl-csum-segmentation off 2>/dev/null || true
 
 # Qdisc: Fair Queue with elevated flow_limit to prevent burst tail drops
@@ -821,6 +825,7 @@ fi
     echo "        type filter hook output priority -300; policy accept;"
     if [ "${FOU_ENABLE}" = "yes" ]; then
         echo "        oifname \"${IF_WAN}\" ip saddr ${LOCAL_REAL} ip daddr ${REMOTE_REAL} udp dport ${FOU_PORT} notrack"
+        echo "        oifname \"${IF_WAN}\" ip saddr ${LOCAL_REAL} ip daddr ${REMOTE_REAL} udp sport ${FOU_PORT} notrack"
     else
         echo "        oifname \"${IF_WAN}\" ip protocol gre ip saddr ${LOCAL_REAL} ip daddr ${REMOTE_REAL} notrack"
     fi
@@ -2399,10 +2404,81 @@ do_view_scripts() {
     fi
 }
 
-do_upgrade_tunnels() {
+apply_live_gre_nftables() {
+    local tid="$1" tun_if="$2" if_wan="$3" lr="$4" rr="$5" ls="$6" rs="$7" fe="$8" fp="$9" mss="${10}"
+    local nft_table="fw_gre_${tid}"
+    local legacy_table="fw_${tid}"
+    local do_spoof=0
+    if [ -n "$ls" ] && [ -n "$rs" ] && { [ "$ls" != "$lr" ] || [ "$rs" != "$rr" ]; }; then
+        do_spoof=1
+    fi
+
+    if nft list table ip "${legacy_table}" 2>/dev/null | grep -qE "\"?${tun_if}\"?|fwd_mss"; then
+        nft delete table ip "${legacy_table}" 2>/dev/null || true
+    fi
+
+    {
+        echo "table ip ${nft_table}"
+        echo "delete table ip ${nft_table}"
+        echo "table ip ${nft_table} {"
+        echo "    chain prerouting {"
+        echo "        type filter hook prerouting priority -300; policy accept;"
+        if [ "$fe" = "yes" ]; then
+            if [ "$do_spoof" -eq 1 ]; then
+                echo "        iifname \"${if_wan}\" ip saddr ${rs} ip daddr ${lr} udp dport ${fp} ip saddr set ${rr} notrack"
+            else
+                echo "        iifname \"${if_wan}\" ip saddr ${rr} ip daddr ${lr} udp dport ${fp} notrack"
+            fi
+        else
+            if [ "$do_spoof" -eq 1 ]; then
+                echo "        iifname \"${if_wan}\" ip protocol gre ip saddr ${rs} ip daddr ${lr} ip saddr set ${rr} notrack"
+            else
+                echo "        iifname \"${if_wan}\" ip protocol gre ip saddr ${rr} ip daddr ${lr} notrack"
+            fi
+        fi
+        echo "    }"
+        echo "    chain output {"
+        echo "        type filter hook output priority -300; policy accept;"
+        if [ "$fe" = "yes" ]; then
+            echo "        oifname \"${if_wan}\" ip saddr ${lr} ip daddr ${rr} udp dport ${fp} notrack"
+            echo "        oifname \"${if_wan}\" ip saddr ${lr} ip daddr ${rr} udp sport ${fp} notrack"
+        else
+            echo "        oifname \"${if_wan}\" ip protocol gre ip saddr ${lr} ip daddr ${rr} notrack"
+        fi
+        echo "    }"
+        if [ "$do_spoof" -eq 1 ]; then
+            echo "    chain postrouting {"
+            echo "        type filter hook postrouting priority 300; policy accept;"
+            if [ "$fe" = "yes" ]; then
+                echo "        oifname \"${if_wan}\" ip saddr ${lr} ip daddr ${rr} udp dport ${fp} ip saddr set ${ls}"
+            else
+                echo "        oifname \"${if_wan}\" ip protocol gre ip saddr ${lr} ip daddr ${rr} ip saddr set ${ls}"
+            fi
+            echo "    }"
+        fi
+        echo "    chain fwd_mss {"
+        echo "        type filter hook forward priority -150; policy accept;"
+        echo "        oifname \"${tun_if}\" tcp flags & (syn | rst) == syn tcp option maxseg size > ${mss} tcp option maxseg size set ${mss}"
+        echo "        iifname \"${tun_if}\" tcp flags & (syn | rst) == syn tcp option maxseg size > ${mss} tcp option maxseg size set ${mss}"
+        echo "    }"
+        echo "    chain out_mss {"
+        echo "        type filter hook output priority -150; policy accept;"
+        echo "        oifname \"${tun_if}\" tcp flags & (syn | rst) == syn tcp option maxseg size > ${mss} tcp option maxseg size set ${mss}"
+        echo "    }"
+        echo "}"
+    } | nft -f -
+}
+
+_sync_existing_tunnels() {
+    local mode="${1:-upgrade}" # upgrade | optimize
     echo ""
-    echo -e " ${CYAN}${BOLD}Upgrade Existing GRE-FOU Tunnels to v${VERSION}:${NC}"
-    echo -e " ${DIM}(encap-csum, atomic nftables + output/prerouting notrack, SYN/SYN-ACK MSS, fq flow_limit 1000, backoff watchdog)${NC}"
+    if [ "$mode" = "optimize" ]; then
+        echo -e " ${CYAN}${BOLD}Optimize Existing GRE-FOU Tunnels & Kernel Stack (Live + Persistent):${NC}"
+        echo -e " ${DIM}(Restores prerouting/output notrack, flushes stale FOU conntrack, enables WAN GRO/GSO/TSO, fq flow_limit 1000, netdev_budget 1200 / dev_weight 128)${NC}"
+    else
+        echo -e " ${CYAN}${BOLD}Upgrade Existing GRE-FOU Tunnels to v${VERSION}:${NC}"
+        echo -e " ${DIM}(encap-csum, atomic nftables + output/prerouting notrack, SYN/SYN-ACK MSS, fq flow_limit 1000, backoff watchdog)${NC}"
+    fi
     print_line
 
     local all_ids; mapfile -t all_ids < <(get_all_tunnel_ids)
@@ -2410,7 +2486,8 @@ do_upgrade_tunnels() {
 
     local backup_dir="${SCRIPTS_DIR}/.gre-backup-$(date +%Y%m%d-%H%M%S)"
     local backup_created=0
-    local upgraded_ids=()
+    local processed_ids=()
+    local restart_needed_ids=()
     local throttled_port_tunnels=()
 
     # Save caller globals cleanly
@@ -2433,7 +2510,7 @@ do_upgrade_tunnels() {
             continue
         fi
 
-        local u_ifw u_lr u_rr u_ls u_rs u_lt u_gk u_fe u_fp u_mtu u_rt u_role
+        local u_ifw u_lr u_rr u_ls u_rs u_lt u_gk u_fe u_fp u_mtu u_rt u_role had_csum=1
         u_ifw=$(extract_up_var "IF_WAN" "$up_script")
         u_lr=$(extract_up_var "LOCAL_REAL" "$up_script")
         u_rr=$(extract_up_var "REMOTE_REAL" "$up_script")
@@ -2452,6 +2529,9 @@ do_upgrade_tunnels() {
         [ -z "$u_gk" ] && u_gk="$tid"
         if [ -z "$u_mtu" ] || ! [[ "$u_mtu" =~ ^[0-9]+$ ]]; then
             [ "$u_fe" = "yes" ] && u_mtu="1392" || u_mtu="1400"
+        fi
+        if [ "$u_fe" = "yes" ] && ! grep -q 'encap-csum' "$up_script" 2>/dev/null; then
+            had_csum=0
         fi
 
         u_rt=$(derive_remote_tun_from_local "$u_lt")
@@ -2500,8 +2580,29 @@ do_upgrade_tunnels() {
         create_keepalive_service "$tid" "$u_rt" "no"
         create_watchdog_timer "$tid" "$wd_script" "no"
 
-        msg_ok "Upgraded Tunnel ${tid} (${tun_if}, ${u_role}, FOU port ${u_fp:-none}, MTU ${u_mtu})."
-        upgraded_ids+=("$tid")
+        if [ "$mode" = "optimize" ]; then
+            # Apply live zero-downtime optimizations on active interfaces and firewall
+            ethtool -K "${u_ifw}" tso on gso on gro on 2>/dev/null || true
+            ethtool -K "${u_ifw}" tx-udp_tnl-segmentation off tx-udp_tnl-csum-segmentation off 2>/dev/null || true
+            tc qdisc replace dev "${u_ifw}" root fq flow_limit 1000 2>/dev/null || true
+            if ip link show "${tun_if}" &>/dev/null; then
+                tc qdisc replace dev "${tun_if}" root fq flow_limit 1000 2>/dev/null || true
+            fi
+            if apply_live_gre_nftables "$tid" "$tun_if" "$u_ifw" "$u_lr" "$u_rr" "$u_ls" "$u_rs" "$u_fe" "$u_fp" "$(( u_mtu - 40 ))"; then
+                if [ "$u_fe" = "yes" ] && command -v conntrack &>/dev/null; then
+                    conntrack -D -p udp --dport "${u_fp}" >/dev/null 2>&1 || true
+                fi
+                msg_ok "Optimized Tunnel ${tid} (${tun_if}, ${u_role}, FOU ${u_fp:-none}, live notrack + offloads + qdisc applied)."
+            else
+                msg_warn "Updated scripts for Tunnel ${tid}, but live nftables reload failed."
+            fi
+            [ "$had_csum" -eq 0 ] && restart_needed_ids+=("$tid")
+        else
+            msg_ok "Upgraded Tunnel ${tid} (${tun_if}, ${u_role}, FOU port ${u_fp:-none}, MTU ${u_mtu})."
+            restart_needed_ids+=("$tid")
+        fi
+
+        processed_ids+=("$tid")
 
         if [ "$u_fe" = "yes" ] && [[ "$u_fp" =~ ^[0-9]+$ ]] && [ "$u_fp" -ge 51820 ] && [ "$u_fp" -le 51850 ]; then
             throttled_port_tunnels+=("gre${tid}:port=${u_fp}")
@@ -2528,20 +2629,35 @@ do_upgrade_tunnels() {
         msg_warn "Ports were preserved automatically; consider reconfiguring both sides to 4500/8443/1194 if you experience loss."
     fi
 
-    if [ ${#upgraded_ids[@]} -gt 0 ]; then
+    if [ ${#restart_needed_ids[@]} -gt 0 ]; then
         echo ""
-        read -p "  Restart upgraded tunnels now to apply changes? (y/N): " rst_choice
+        if [ "$mode" = "optimize" ]; then
+            msg_info "Live sysctl/qdisc/offload/notrack optimizations are active immediately."
+            read -p "  Restart tunnels missing encap-csum (${restart_needed_ids[*]}) now? (y/N): " rst_choice
+        else
+            read -p "  Restart upgraded tunnels now to apply changes? (y/N): " rst_choice
+        fi
         if [[ "$rst_choice" =~ ^[Yy]$ ]]; then
-            for tid in "${upgraded_ids[@]}"; do
+            for tid in "${restart_needed_ids[@]}"; do
                 if restart_tunnel_services "$tid"; then
                     msg_ok "Tunnel ${tid} restarted cleanly."
                 fi
             done
         else
-            msg_warn "Remember to restart upgraded tunnels on BOTH Iran and Kharej servers for encap-csum to take effect."
+            msg_warn "Remember to restart tunnels missing encap-csum on BOTH Iran and Kharej servers for encap-csum to take effect."
         fi
+    elif [ "$mode" = "optimize" ] && [ ${#processed_ids[@]} -gt 0 ]; then
+        msg_ok "All live optimizations applied with ZERO tunnel downtime!"
     fi
     echo ""
+}
+
+do_upgrade_tunnels() {
+    _sync_existing_tunnels "upgrade"
+}
+
+do_optimize_tunnels() {
+    _sync_existing_tunnels "optimize"
 }
 
 # ─── Main Menu ────────────────────────────────────────────────────
@@ -2582,6 +2698,7 @@ main_menu() {
         echo -e " ${BOLD}${WHITE}Install & Maintenance${NC}"
         echo -e "  ${MAGENTA}18)${NC} Install Prerequisites"
         echo -e "  ${GREEN}19)${NC} Upgrade Existing Tunnels (v${VERSION}: encap-csum, notrack, MSS, Watchdog)"
+        echo -e "  ${CYAN}20)${NC} Optimize Existing Tunnels & Kernel (Low CPU, GRO/GSO/TSO, Notrack, Conntrack)"
         echo ""
         echo -e "  ${DIM}0)${NC}  Exit"
         echo ""
@@ -2607,6 +2724,7 @@ main_menu() {
             17) do_delete ;;
             18) install_prereqs ;;
             19) do_upgrade_tunnels ;;
+            20) do_optimize_tunnels ;;
             0)  echo -e "\n ${GREEN}Goodbye!${NC}\n"; exit 0 ;;
             *)  msg_err "Invalid option." ;;
         esac
