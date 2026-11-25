@@ -359,6 +359,17 @@ ensure_prereqs() {
     if ! systemctl is-active --quiet strongswan; then
         systemctl start strongswan &>/dev/null || true
     fi
+    if ! modprobe xfrm_interface 2>/dev/null; then
+        if grep -qw 'ipv6.disable=1' /proc/cmdline 2>/dev/null; then
+            msg_err "Kernel boot parameter 'ipv6.disable=1' is active in /proc/cmdline."
+            msg_err "The xfrm_interface module depends on xfrm6_tunnel/tunnel6 and fails with EAFNOSUPPORT when IPv6 is disabled at boot."
+            msg_warn "Fix: Remove 'ipv6.disable=1' from /etc/default/grub, run 'update-grub', and reboot (use sysctl net.ipv6.conf.all.disable_ipv6=1 instead if needed)."
+        else
+            msg_err "Failed to load kernel module 'xfrm_interface' (required for XFRM ESP interfaces)."
+            msg_warn "Try installing linux-modules-extra-\$(uname -r) or verify kernel CONFIG_XFRM_INTERFACE=m/y."
+        fi
+        return 1
+    fi
     return 0
 }
 
@@ -888,9 +899,11 @@ UNIT
     chmod 644 "$svc_tun" "$svc_ka" "$svc_wd" "$tmr_wd"
     systemctl daemon-reload
     systemctl enable "esp-tunnel-${tid}" "esp-keepalive-${tid}" "esp-watchdog-${tid}.timer" &>/dev/null
-    systemctl restart "esp-tunnel-${tid}"
-    systemctl restart "esp-keepalive-${tid}"
-    systemctl restart "esp-watchdog-${tid}.timer"
+    if ! systemctl restart "esp-tunnel-${tid}"; then
+        return 1
+    fi
+    systemctl restart "esp-keepalive-${tid}" || true
+    systemctl restart "esp-watchdog-${tid}.timer" || true
 }
 
 # ─── Setup Flows ──────────────────────────────────────────────────
@@ -1047,7 +1060,11 @@ setup_role() {
     generate_esp_up "$up_script"
     generate_esp_down "$down_script"
     generate_watchdog "$wd_script"
-    create_systemd_units "$tid" "$up_script" "$down_script" "$wd_script" "$role_label" "$remote_tun"
+    if ! create_systemd_units "$tid" "$up_script" "$down_script" "$wd_script" "$role_label" "$remote_tun"; then
+        echo ""
+        msg_err "ESP Tunnel ${tid} (${tun_if}) failed to start! Check: journalctl -xeu esp-tunnel-${tid}.service"
+        return 1
+    fi
 
     echo ""
     msg_ok "ESP Tunnel ${tid} (${tun_if}) configured and started!"
