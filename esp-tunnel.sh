@@ -108,6 +108,29 @@ validate_subnet_prefix() {
     return 0
 }
 
+normalize_subnet_prefix() {
+    local raw="$1"
+    raw=$(echo "$raw" | tr -d '\r\n[:space:]')
+    # Strip trailing dot or CIDR/host 4th octet (e.g. 10.250.51. or 10.250.51.0/30 -> 10.250.51)
+    raw="${raw%.}"
+    if [[ "$raw" =~ ^([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})\.[0-9]{1,3}(/[0-9]{1,2})?$ ]]; then
+        raw="${BASH_REMATCH[1]}"
+    fi
+    echo "$raw"
+}
+
+get_next_free_tunnel_id() {
+    local i=1
+    while [ $i -le 255 ]; do
+        if [ ! -f "${SYSTEMD_DIR}/esp-tunnel-${i}.service" ] && [ ! -f "${SCRIPTS_DIR}/esp${i}-up.sh" ] && ! ip link show "esp${i}" &>/dev/null; then
+            echo "$i"
+            return 0
+        fi
+        i=$(( i + 1 ))
+    done
+    echo "1"
+}
+
 is_tunnel_subnet_in_use() {
     local s="$1"
     local exclude_if="${2:-${TUN_IF:-}}"
@@ -137,6 +160,7 @@ is_tunnel_subnet_in_use() {
 find_free_tunnel_subnet() {
     local proto_base="$1"
     local tid="$2"
+    [[ ! "$tid" =~ ^[0-9]+$ ]] && tid=1
     local cand="${proto_base}.${tid}"
     local oct2
     oct2=$(echo "$proto_base" | cut -d. -f2)
@@ -159,91 +183,93 @@ find_free_tunnel_subnet() {
 }
 
 read_input() {
-    local prompt="$1" default="$2" var_name="$3"
-    local input_val
-    if [ -n "$default" ]; then
-        read -p "  ${prompt} [${default}]: " input_val
-        input_val="${input_val//$'\r'/}"
-        printf -v "$var_name" "%s" "${input_val:-$default}"
+    local _ri_prompt="$1" _ri_default="$2" _ri_var="$3"
+    local _ri_in=""
+    if [ -n "$_ri_default" ]; then
+        read -r -p "  ${_ri_prompt} [${_ri_default}]: " _ri_in
+        _ri_in="${_ri_in//$'\r'/}"
+        printf -v "$_ri_var" "%s" "${_ri_in:-$_ri_default}"
     else
-        read -p "  ${prompt}: " input_val
-        input_val="${input_val//$'\r'/}"
-        printf -v "$var_name" "%s" "$input_val"
+        read -r -p "  ${_ri_prompt}: " _ri_in
+        _ri_in="${_ri_in//$'\r'/}"
+        printf -v "$_ri_var" "%s" "$_ri_in"
     fi
 }
 
 read_ip() {
-    local prompt="$1" default="$2" var_name="$3"
-    local val=""
+    local _rip_prompt="$1" _rip_default="$2" _rip_var="$3"
+    local _rip_val=""
     while true; do
-        read_input "$prompt" "$default" val
-        val=$(echo "$val" | tr -d '\r\n[:space:]')
-        if [ -z "$val" ]; then
+        read_input "$_rip_prompt" "$_rip_default" _rip_val
+        _rip_val=$(echo "$_rip_val" | tr -d '\r\n[:space:]')
+        if [ -z "$_rip_val" ]; then
             msg_err "IP address is required."
             continue
         fi
-        if validate_ipv4 "$val"; then
-            printf -v "$var_name" "%s" "$val"
+        if validate_ipv4 "$_rip_val"; then
+            printf -v "$_rip_var" "%s" "$_rip_val"
             return 0
         else
-            msg_err "Invalid IPv4 address format '${val}'. Try again."
+            msg_err "Invalid IPv4 address format '${_rip_val}'. Try again."
         fi
     done
 }
 
 read_port() {
-    local prompt="$1" default="$2" var_name="$3"
-    local val=""
+    local _rp_prompt="$1" _rp_default="$2" _rp_var="$3"
+    local _rp_val=""
     while true; do
-        read_input "$prompt" "$default" val
-        val=$(echo "$val" | tr -d '\r\n[:space:]')
-        if [[ "$val" =~ ^[0-9]+$ ]] && [ "$val" -ge 1 ] && [ "$val" -le 65535 ]; then
-            printf -v "$var_name" "%s" "$val"
+        read_input "$_rp_prompt" "$_rp_default" _rp_val
+        _rp_val=$(echo "$_rp_val" | tr -d '\r\n[:space:]')
+        if [[ "$_rp_val" =~ ^[0-9]+$ ]] && [ "$_rp_val" -ge 1 ] && [ "$_rp_val" -le 65535 ]; then
+            printf -v "$_rp_var" "%s" "$_rp_val"
             return 0
         else
-            msg_err "Invalid port number '${val}'. Must be between 1 and 65535."
+            msg_err "Invalid port number '${_rp_val}'. Must be between 1 and 65535."
         fi
     done
 }
 
 read_mtu() {
-    local prompt="$1" default="$2" var_name="$3"
-    local val=""
+    local _rmtu_prompt="$1" _rmtu_default="$2" _rmtu_var="$3"
+    local _rmtu_val=""
     while true; do
-        read_input "$prompt" "$default" val
-        val=$(echo "$val" | tr -d '\r\n[:space:]')
-        if [[ "$val" =~ ^[0-9]+$ ]] && [ "$val" -ge 1280 ] && [ "$val" -le 1460 ]; then
-            printf -v "$var_name" "%s" "$val"
+        read_input "$_rmtu_prompt" "$_rmtu_default" _rmtu_val
+        _rmtu_val=$(echo "$_rmtu_val" | tr -d '\r\n[:space:]')
+        if [[ "$_rmtu_val" =~ ^[0-9]+$ ]] && [ "$_rmtu_val" -ge 1280 ] && [ "$_rmtu_val" -le 1460 ]; then
+            printf -v "$_rmtu_var" "%s" "$_rmtu_val"
             return 0
         else
-            msg_err "Invalid MTU '${val}'. Recommended range for XFRM/ESP is 1280-1460 (default 1400)."
+            msg_err "Invalid MTU '${_rmtu_val}'. Recommended range for XFRM/ESP is 1280-1460 (default 1400)."
         fi
     done
 }
 
 read_tunnel_id() {
-    local var_name="$1"
-    local tid=""
+    local _rtid_var="$1"
+    local _rtid_def
+    _rtid_def=$(get_next_free_tunnel_id)
+    local _rtid=""
     while true; do
-        read_input "Tunnel ID (number between 1 and 255)" "" tid
-        tid=$(echo "$tid" | tr -d '\r\n[:space:]')
-        if [ -z "$tid" ]; then
+        read_input "Tunnel ID (1-255, Enter for ${_rtid_def})" "$_rtid_def" _rtid
+        _rtid=$(echo "$_rtid" | tr -d '\r\n[:space:]')
+        if [ -z "$_rtid" ]; then
             msg_err "Tunnel ID is required! Please enter a number between 1 and 255."
             continue
         fi
-        if ! [[ "$tid" =~ ^[0-9]+$ ]] || [ "$tid" -lt 1 ] || [ "$tid" -gt 255 ]; then
-            msg_err "Invalid Tunnel ID '${tid}'! Must be an integer between 1 and 255."
+        if ! [[ "$_rtid" =~ ^[0-9]+$ ]] || [ "$_rtid" -lt 1 ] || [ "$_rtid" -gt 255 ]; then
+            msg_err "Invalid Tunnel ID '${_rtid}'! Must be an integer between 1 and 255."
             continue
         fi
 
-        local tun_dev="esp${tid}"
-        local svc_file="${SYSTEMD_DIR}/esp-tunnel-${tid}.service"
-        local up_file="${SCRIPTS_DIR}/esp${tid}-up.sh"
+        local tun_dev="esp${_rtid}"
+        local svc_file="${SYSTEMD_DIR}/esp-tunnel-${_rtid}.service"
+        local up_file="${SCRIPTS_DIR}/esp${_rtid}-up.sh"
         if [ -f "$svc_file" ] || [ -f "$up_file" ] || ip link show "$tun_dev" &>/dev/null; then
-            msg_warn "Tunnel ID ${tid} (${tun_dev}) already exists on this server!"
+            msg_warn "Tunnel ID ${_rtid} (${tun_dev}) already exists on this server!"
             read -p "  Do you want to overwrite and reconfigure it? (y/N): " ow_choice
             if [[ "$ow_choice" =~ ^[Yy]$ ]]; then
-                printf -v "$var_name" "%s" "$tid"
+                printf -v "$_rtid_var" "%s" "$_rtid"
                 return 0
             else
                 msg_info "Please choose a different Tunnel ID."
@@ -251,34 +277,34 @@ read_tunnel_id() {
             fi
         fi
 
-        printf -v "$var_name" "%s" "$tid"
+        printf -v "$_rtid_var" "%s" "$_rtid"
         return 0
     done
 }
 
 read_interface() {
-    local prompt="$1" default="$2" var_name="$3"
-    local iface=""
+    local prompt="$1" default="$2" _rif_var="$3"
+    local _rif=""
     while true; do
-        read_input "$prompt" "$default" iface
-        iface=$(echo "$iface" | tr -d '\r\n[:space:]')
-        [ -z "$iface" ] && iface="$default"
-        if [ -z "$iface" ]; then
+        read_input "$prompt" "$default" _rif
+        _rif=$(echo "$_rif" | tr -d '\r\n[:space:]')
+        [ -z "$_rif" ] && _rif="$default"
+        if [ -z "$_rif" ]; then
             msg_err "Interface name cannot be empty."
             continue
         fi
-        if [[ ! "$iface" =~ ^[a-zA-Z0-9_.:-]+$ ]] || [ "${#iface}" -gt 15 ]; then
-            msg_err "Invalid interface name '${iface}'. Allowed: alphanumeric, '.', '_', ':', '-' (max 15 chars)."
+        if [[ ! "$_rif" =~ ^[a-zA-Z0-9_.:-]+$ ]] || [ "${#_rif}" -gt 15 ]; then
+            msg_err "Invalid interface name '${_rif}'. Allowed: alphanumeric, '.', '_', ':', '-' (max 15 chars)."
             continue
         fi
-        if ip link show "$iface" &>/dev/null; then
-            printf -v "$var_name" "%s" "$iface"
+        if ip link show "$_rif" &>/dev/null; then
+            printf -v "$_rif_var" "%s" "$_rif"
             return 0
         else
-            msg_warn "Interface '${iface}' does not currently exist on this system!"
-            read -p "  Are you sure you want to use interface '${iface}'? (y/N): " if_confirm
+            msg_warn "Interface '${_rif}' does not currently exist on this system!"
+            read -p "  Are you sure you want to use interface '${_rif}'? (y/N): " if_confirm
             if [[ "$if_confirm" =~ ^[Yy]$ ]]; then
-                printf -v "$var_name" "%s" "$iface"
+                printf -v "$_rif_var" "%s" "$_rif"
                 return 0
             fi
         fi
@@ -390,44 +416,49 @@ do_optimize_kernel() {
 
 # ─── PSK Management ───────────────────────────────────────────────
 read_or_generate_psk() {
-    local role="$1"
-    local psk_file="$2"
-    local var_name="$3"
+    local _rpsk_role="$1"
+    local _rpsk_file="$2"
+    local _rpsk_var="$3"
+    local _rpsk_gen_var="${4:-}"
 
     mkdir -p -m 700 "${ESP_CFG_DIR}"
 
-    if [ "$role" = "iran" ]; then
+    if [ "$_rpsk_role" = "iran" ]; then
         echo ""
         msg_info "Pre-Shared Key (PSK) options for IKEv2 authentication:"
         echo -e "   ${GREEN}1)${NC} Generate a new 64-hex random PSK automatically (Recommended)"
         echo -e "   ${CYAN}2)${NC} Paste an existing 64-hex PSK from the peer server"
-        local pchoice=""
-        read -p "  Select [1]: " pchoice
-        pchoice="${pchoice:-1}"
-        if [ "$pchoice" = "1" ]; then
-            local new_psk
-            new_psk=$(openssl rand -hex 32)
+        local _rpsk_choice=""
+        read -r -p "  Select [1]: " _rpsk_choice
+        _rpsk_choice=$(echo "${_rpsk_choice:-1}" | tr -d '\r\n[:space:]')
+        if [ "$_rpsk_choice" = "1" ]; then
+            local _new_psk
+            _new_psk=$(openssl rand -hex 32)
             umask 077
-            printf '%s\n' "$new_psk" > "$psk_file"
-            chmod 600 "$psk_file"
-            printf -v "$var_name" "%s" "$new_psk"
+            printf '%s\n' "$_new_psk" > "$_rpsk_file"
+            chmod 600 "$_rpsk_file"
+            printf -v "$_rpsk_var" "%s" "$_new_psk"
+            [ -n "$_rpsk_gen_var" ] && printf -v "$_rpsk_gen_var" "%s" "1"
+            echo ""
+            msg_ok "Generated 64-hex PSK (will also be shown at the end):"
+            echo -e "  ${YELLOW}${BOLD}${_new_psk}${NC}"
             return 0
         fi
     fi
 
-    local pasted=""
+    local _pasted=""
     while true; do
-        read -s -p "  Paste 64-hex PSK from peer server (input hidden): " pasted
-        echo ""
-        pasted=$(echo "$pasted" | tr -d '\r\n[:space:]')
-        if [[ "$pasted" =~ ^[0-9a-fA-F]{64}$ ]]; then
+        read -r -p "  Paste 64-hex PSK from peer server: " _pasted
+        _pasted=$(echo "$_pasted" | tr -d '\r\n[:space:]"'\''')
+        if [[ "$_pasted" =~ ^[0-9a-fA-F]{64}$ ]]; then
             umask 077
-            printf '%s\n' "$pasted" > "$psk_file"
-            chmod 600 "$psk_file"
-            printf -v "$var_name" "%s" "$pasted"
+            printf '%s\n' "$_pasted" > "$_rpsk_file"
+            chmod 600 "$_rpsk_file"
+            printf -v "$_rpsk_var" "%s" "$_pasted"
+            [ -n "$_rpsk_gen_var" ] && printf -v "$_rpsk_gen_var" "%s" "0"
             return 0
         else
-            msg_err "Invalid PSK format. Expected exactly 64 hexadecimal characters."
+            msg_err "Invalid PSK (got ${#_pasted} chars; expected exactly 64 hex chars 0-9/a-f)."
         fi
     done
 }
@@ -873,6 +904,15 @@ setup_role() {
     echo -e " ${CYAN}${BOLD}Setup ESP / XFRM Tunnel — ${role_label} Server${NC}"
     print_double_line
 
+    if [ -f "${SCRIPTS_DIR}/esp-up.sh" ] || [ -f "${SYSTEMD_DIR}/esp-tunnel-.service" ] || ip link show dev "esp" &>/dev/null; then
+        msg_warn "Detected an unnumbered legacy/incomplete ESP tunnel ('esp') on this server."
+        local clean_leg=""
+        read -r -p "  Remove this unnumbered 'esp' tunnel before creating 'esp1'? (Y/n): " clean_leg
+        if [[ ! "$clean_leg" =~ ^[Nn]$ ]]; then
+            cleanup_unnumbered_legacy
+        fi
+    fi
+
     ensure_prereqs || return 1
 
     local tid=""
@@ -887,23 +927,30 @@ setup_role() {
 
     local local_real="" remote_real=""
     read_ip "This server public IPv4" "$def_ip" local_real
-    if [ "$role" = "iran" ]; then
-        read_ip "Outside (Kharej) server public IPv4" "" remote_real
-    else
-        read_ip "Iran server public IPv4" "" remote_real
-    fi
+    while true; do
+        if [ "$role" = "iran" ]; then
+            read_ip "Outside (Kharej) server public IPv4" "" remote_real
+        else
+            read_ip "Iran server public IPv4" "" remote_real
+        fi
+        if [ "$remote_real" = "$local_real" ]; then
+            msg_err "Peer IP (${remote_real}) cannot be the same as this server's local IP!"
+            continue
+        fi
+        break
+    done
 
     local tun_if="esp${tid}"
     local free_sub
     free_sub=$(find_free_tunnel_subnet "10.87" "$tid")
     local custom_sub=""
     while true; do
-        read_input "Tunnel /30 subnet prefix (e.g. 10.87.${tid} or 10.250.50)" "$free_sub" custom_sub
-        custom_sub=$(echo "$custom_sub" | tr -d '\r\n[:space:]')
+        read_input "Tunnel /30 subnet prefix (Enter for ${free_sub}, or e.g. 10.250.51)" "$free_sub" custom_sub
+        custom_sub=$(normalize_subnet_prefix "$custom_sub")
         if validate_subnet_prefix "$custom_sub"; then
             break
         fi
-        msg_err "Invalid /24 prefix '${custom_sub}'. Example: 10.87.${tid}"
+        msg_err "Invalid /24 prefix '${custom_sub}'. Example: ${free_sub} or 10.250.51"
     done
 
     local local_tun remote_tun outside_tun_ip
@@ -916,6 +963,7 @@ setup_role() {
         remote_tun="${custom_sub}.1"
         outside_tun_ip="${custom_sub}.2"
     fi
+    msg_ok "Subnet: ${custom_sub}.0/30 (Iran: ${custom_sub}.1 | Kharej: ${custom_sub}.2)"
 
     local tun_mtu=""
     read_mtu "XFRM interface MTU" "1400" tun_mtu
@@ -926,8 +974,8 @@ setup_role() {
     echo -e "      (Use 'nftables_dsr_synack' on Iran and 'nftables_dsr_direct' on Outside)"
     echo -e "   ${CYAN}2)${NC} Standalone Direct-Return DSR rules in nftables (all-in-one without XForwarder)"
     local fmode="" dsr_mode="xforwarder" client_port="1036" backend_port="24443"
-    read -p "  Select [1]: " fmode
-    fmode="${fmode:-1}"
+    read -r -p "  Select [1]: " fmode
+    fmode=$(echo "${fmode:-1}" | tr -d '\r\n[:space:]')
     if [ "$fmode" = "2" ]; then
         dsr_mode="standalone"
         read_port "Public client TCP port on Iran" "1036" client_port
@@ -935,8 +983,8 @@ setup_role() {
     fi
 
     local psk_file="${ESP_CFG_DIR}/esp${tid}.psk"
-    local psk_val=""
-    read_or_generate_psk "$role" "$psk_file" psk_val
+    local psk_val="" psk_generated="0"
+    read_or_generate_psk "$role" "$psk_file" psk_val psk_generated
 
     local if_id reqid route_table rule_prio route_mark
     if_id=$(printf '0x%x' $((0x4250 + tid)))
@@ -1005,15 +1053,31 @@ setup_role() {
     msg_ok "ESP Tunnel ${tid} (${tun_if}) configured and started!"
     if [ "$role" = "iran" ]; then
         echo ""
-        msg_info "PSK stored at ${psk_file} (run 'cat ${psk_file}' on Iran when configuring Kharej; keep secret)."
+        print_double_line
+        echo -e " ${YELLOW}${BOLD}Copy these settings to your Kharej server (Step 4):${NC}"
+        echo -e "  Tunnel ID     : ${WHITE}${tid}${NC}"
+        echo -e "  Subnet Prefix : ${WHITE}${custom_sub}${NC}"
+        echo -e "  64-hex PSK    : ${YELLOW}${BOLD}${psk_val}${NC}"
+        echo -e "  ${DIM}(Saved at ${psk_file}, chmod 600)${NC}"
+        print_double_line
+    else
+        echo ""
+        msg_info "Verifying ESP tunnel to Iran (${remote_tun})..."
+        sleep 1
+        if swanctl --list-sas --ike "esp-tun-${tid}" 2>/dev/null | grep -q "INSTALLED" && \
+           ping -c 2 -W 1 -I "${tun_if}" "${remote_tun}" >/dev/null 2>&1; then
+            msg_ok "ESP IPsec SA is INSTALLED and peer ${remote_tun} is reachable over ${tun_if}!"
+        else
+            msg_warn "Tunnel started; waiting for Iran to initiate or allow UDP 500 + IP Proto 50 (ESP)."
+        fi
     fi
     if [ "$dsr_mode" = "xforwarder" ]; then
         echo ""
         msg_info "Next step in XForwarder Web UI:"
         if [ "$role" = "iran" ]; then
-            echo -e "  Protocol: ${CYAN}tcp${NC} | Type: ${GREEN}nftables_dsr_synack${NC} | Target: ${YELLOW}${outside_tun_ip}${NC} | Tunnel Iface: ${CYAN}${tun_if}${NC} | Spoof IP: ${WHITE}${local_real}${NC}"
+            echo -e "  Protocol: ${CYAN}tcp${NC} | Type: ${GREEN}NFTables DSR (SYN-ACK · Iran)${NC} | Target: ${YELLOW}${outside_tun_ip}${NC} | Tunnel Iface: ${CYAN}${tun_if}${NC} | Spoof IP: ${WHITE}${local_real}${NC}"
         else
-            echo -e "  Protocol: ${CYAN}tcp${NC} | Type: ${GREEN}nftables_dsr_direct${NC} | Target: ${YELLOW}${outside_tun_ip}${NC} | Ingress Iface: ${CYAN}${tun_if}${NC} | Spoof IP: ${WHITE}${remote_real}${NC}"
+            echo -e "  Protocol: ${CYAN}tcp${NC} | Type: ${GREEN}NFTables DSR (Direct · Outside)${NC} | Target: ${YELLOW}${outside_tun_ip}${NC} | Ingress Iface: ${CYAN}${tun_if}${NC} | Spoof IP: ${WHITE}${remote_real}${NC}"
         fi
     fi
 }
@@ -1022,6 +1086,45 @@ setup_iran()   { setup_role "iran"; }
 setup_kharej() { setup_role "kharej"; }
 
 # ─── Management & Inspection ──────────────────────────────────────
+cleanup_unnumbered_legacy() {
+    systemctl stop "esp-watchdog-.timer" "esp-keepalive-" "esp-tunnel-" &>/dev/null || true
+    systemctl disable "esp-watchdog-.timer" "esp-keepalive-" "esp-tunnel-" &>/dev/null || true
+    rm -f "${SYSTEMD_DIR}/esp-tunnel-.service" \
+          "${SYSTEMD_DIR}/esp-keepalive-.service" \
+          "${SYSTEMD_DIR}/esp-watchdog-.service" \
+          "${SYSTEMD_DIR}/esp-watchdog-.timer"
+    rm -f "${SCRIPTS_DIR}/esp-up.sh" \
+          "${SCRIPTS_DIR}/esp-down.sh" \
+          "${SCRIPTS_DIR}/esp-watchdog.sh"
+    if command -v swanctl &>/dev/null && systemctl is-active --quiet strongswan; then
+        swanctl --terminate --ike "esp-tun-" --timeout 2 >/dev/null 2>&1 || true
+        swanctl --unload-conn --name "esp-tun-" >/dev/null 2>&1 || true
+    fi
+    rm -f "${SWANCTL_DIR}/esp-tun-.conf" "${ESP_CFG_DIR}/esp.psk" "${STATE_DIR}/esp."*
+    nft delete table ip "esp_dsr_" 2>/dev/null || true
+    ip link set dev "esp" down 2>/dev/null || true
+    ip link del dev "esp" 2>/dev/null || true
+    systemctl daemon-reload
+    msg_ok "Cleaned up unnumbered legacy 'esp' tunnel."
+}
+
+list_unmanaged_xfrm_ifaces() {
+    local dev
+    for dev in /sys/class/net/*; do
+        [ -e "$dev" ] || continue
+        local ifn
+        ifn=$(basename "$dev")
+        [[ "$ifn" =~ ^esp[0-9]+$ ]] && [ -f "${SCRIPTS_DIR}/${ifn}-up.sh" ] && continue
+        local kind=""
+        kind=$(ip -j -d link show dev "$ifn" 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin)[0].get('linkinfo',{}); print(d.get('info_kind',''))" 2>/dev/null || true)
+        if [ "$kind" = "xfrm" ]; then
+            local ips
+            ips=$(ip -4 -o addr show dev "$ifn" 2>/dev/null | awk '{print $4}' | tr '\n' ' ')
+            echo "  ${ifn} [kernel xfrm, unmanaged by numbered ID] | IP: ${ips:-none}"
+        fi
+    done
+}
+
 get_all_tunnel_ids() {
     local f tid ids=()
     for f in "${SCRIPTS_DIR}"/esp[0-9]*-up.sh; do
@@ -1041,7 +1144,12 @@ list_tunnels() {
     print_line
     local ids
     mapfile -t ids < <(get_all_tunnel_ids)
-    if [ ${#ids[@]} -eq 0 ]; then
+    local has_legacy=0
+    [ -f "${SCRIPTS_DIR}/esp-up.sh" ] && has_legacy=1
+    local extra_xfrm=""
+    extra_xfrm=$(list_unmanaged_xfrm_ifaces)
+
+    if [ ${#ids[@]} -eq 0 ] && [ "$has_legacy" -eq 0 ] && [ -z "$extra_xfrm" ]; then
         msg_warn "No ESP tunnels configured yet."
         return 0
     fi
@@ -1061,6 +1169,18 @@ list_tunnels() {
         fi
         echo -e "  ID ${WHITE}${tid}${NC} (esp${tid}) | Role: ${CYAN}${role}${NC} | ${lr} <-> ${rr} | ${lt} -> ${rt} | Mode: ${mode} | Svc: ${st} | ESP SA: ${sa_st}"
     done
+    if [ "$has_legacy" -eq 1 ]; then
+        up_f="${SCRIPTS_DIR}/esp-up.sh"
+        role=$(extract_up_var "ROLE" "$up_f")
+        lt=$(extract_up_var "LOCAL_TUN" "$up_f")
+        rt=$(extract_up_var "REMOTE_TUN" "$up_f")
+        echo -e "  ${YELLOW}ID legacy (esp)${NC} | Role: ${CYAN}${role}${NC} | ${lt} -> ${rt} | ${YELLOW}(unnumbered - use Delete option with 'legacy' to clean)${NC}"
+    fi
+    if [ -n "$extra_xfrm" ]; then
+        echo ""
+        echo -e " ${DIM}Kernel XFRM interfaces:${NC}"
+        echo -e "${CYAN}${extra_xfrm}${NC}"
+    fi
 }
 
 do_dashboard() {
@@ -1069,7 +1189,9 @@ do_dashboard() {
     print_double_line
     local ids
     mapfile -t ids < <(get_all_tunnel_ids)
-    if [ ${#ids[@]} -eq 0 ]; then
+    local extra_xfrm=""
+    extra_xfrm=$(list_unmanaged_xfrm_ifaces)
+    if [ ${#ids[@]} -eq 0 ] && [ ! -f "${SCRIPTS_DIR}/esp-up.sh" ] && [ -z "$extra_xfrm" ]; then
         msg_warn "No ESP tunnels found. Use option 3 (Iran) or 4 (Kharej) to create one."
         return 0
     fi
@@ -1087,6 +1209,11 @@ do_dashboard() {
         echo -e "  ${CYAN}esp${tid}${NC} [${svc_st}] | ${lt} -> ${rt} | Ping: ${YELLOW}${rtt}${NC} | RX: $(format_bytes "$rx") | TX: $(format_bytes "$tx")"
         [ -n "$sa_info" ] && echo -e "    ${DIM}${sa_info}${NC}"
     done
+    if [ -n "$extra_xfrm" ]; then
+        echo ""
+        echo -e " ${YELLOW}Other kernel XFRM interfaces:${NC}"
+        echo -e "${CYAN}${extra_xfrm}${NC}"
+    fi
     print_double_line
 }
 
@@ -1109,17 +1236,17 @@ do_health_check() {
 }
 
 select_tunnel_id() {
-    local var_name="$1"
-    local tid=""
+    local _stid_var="$1"
+    local _stid=""
     list_tunnels
     echo ""
-    read_input "Enter Tunnel ID" "" tid
-    tid=$(echo "$tid" | tr -d '\r\n[:space:]')
-    if [[ ! "$tid" =~ ^[0-9]+$ ]] || [ ! -f "${SCRIPTS_DIR}/esp${tid}-up.sh" ]; then
-        msg_err "Tunnel ID '${tid}' not found."
+    read_input "Enter Tunnel ID" "" _stid
+    _stid=$(echo "$_stid" | tr -d '\r\n[:space:]')
+    if [[ ! "$_stid" =~ ^[0-9]+$ ]] || [ ! -f "${SCRIPTS_DIR}/esp${_stid}-up.sh" ]; then
+        msg_err "Tunnel ID '${_stid}' not found."
         return 1
     fi
-    printf -v "$var_name" "%s" "$tid"
+    printf -v "$_stid_var" "%s" "$_stid"
     return 0
 }
 
@@ -1171,10 +1298,28 @@ do_logs() {
 }
 
 do_delete() {
-    local id
-    select_tunnel_id id || return 1
+    list_tunnels
+    echo ""
+    local id=""
+    read_input "Enter Tunnel ID to delete (or 'legacy' for unnumbered esp)" "" id
+    id=$(echo "$id" | tr -d '\r\n[:space:]')
+    if [ "$id" = "legacy" ] || [ "$id" = "esp" ]; then
+        if [ -f "${SCRIPTS_DIR}/esp-up.sh" ] || ip link show dev "esp" &>/dev/null; then
+            local ans=""
+            read -r -p "  Delete unnumbered legacy 'esp' tunnel? (y/N): " ans
+            [[ ! "$ans" =~ ^[Yy]$ ]] && { msg_warn "Canceled."; return 0; }
+            cleanup_unnumbered_legacy
+            return 0
+        fi
+        msg_err "No legacy 'esp' tunnel found."
+        return 1
+    fi
+    if [[ ! "$id" =~ ^[0-9]+$ ]] || [ ! -f "${SCRIPTS_DIR}/esp${id}-up.sh" ]; then
+        msg_err "Tunnel ID '${id}' not found."
+        return 1
+    fi
     local ans=""
-    read -p "  Permanently delete ESP tunnel esp${id} and its config/PSK? (y/N): " ans
+    read -r -p "  Permanently delete ESP tunnel esp${id} and its config/PSK? (y/N): " ans
     [[ ! "$ans" =~ ^[Yy]$ ]] && { msg_warn "Canceled."; return 0; }
 
     systemctl stop "esp-watchdog-${id}.timer" "esp-keepalive-${id}" "esp-tunnel-${id}" &>/dev/null || true
