@@ -1,12 +1,12 @@
 #!/bin/bash
 
 # ╔════════════════════════════════════════════════════════════════╗
-# ║  ESP (IPSEC XFRM) TUNNEL & DIRECT-RETURN MANAGER v1.0.0        ║
+# ║  ESP (IPSEC XFRM) TUNNEL & DIRECT-RETURN MANAGER v1.1.0        ║
 # ║  Route-Based XFRM (espN) + IKEv2/strongSwan + Raw ESP (Proto50)║
 # ║  Supports XForwarder DSR (SYN-ACK/Direct) & Standalone Relay   ║
 # ╚════════════════════════════════════════════════════════════════╝
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 # ─── Colors ───────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -375,7 +375,18 @@ ensure_prereqs() {
 
 # ─── Kernel & NIC Tuning ──────────────────────────────────────────
 persist_sysctl_tuning() {
-    cat > /etc/sysctl.d/99-xmanager-tunnel.conf <<'SYSCTL'
+    # Remove legacy 99-xmanager-tunnel.conf which sorted after 99-xforwarder.conf and downgraded buffers
+    rm -f /etc/sysctl.d/99-xmanager-tunnel.conf 2>/dev/null || true
+
+    if [ -f /etc/sysctl.d/99-xforwarder.conf ]; then
+        rm -f /etc/sysctl.d/90-xmanager-tunnel.conf 2>/dev/null || true
+        sysctl -e --system &>/dev/null || true
+        sysctl -e -p /etc/sysctl.d/99-xforwarder.conf &>/dev/null || true
+        [ -f /etc/sysctl.d/99-xforwarder-dsr.conf ] && sysctl -e -p /etc/sysctl.d/99-xforwarder-dsr.conf &>/dev/null || true
+        return 0
+    fi
+
+    cat > /etc/sysctl.d/90-xmanager-tunnel.conf <<'SYSCTL'
 # Managed by XManager ESP Tunnel Manager
 net.ipv4.ip_forward = 1
 net.ipv4.conf.all.rp_filter = 0
@@ -394,7 +405,7 @@ net.core.wmem_max = 33554432
 net.ipv4.tcp_rmem = 4096 87380 33554432
 net.ipv4.tcp_wmem = 4096 65536 33554432
 SYSCTL
-    sysctl -p /etc/sysctl.d/99-xmanager-tunnel.conf &>/dev/null || true
+    sysctl -e -p /etc/sysctl.d/90-xmanager-tunnel.conf &>/dev/null || true
 }
 
 apply_live_nic_tuning() {
@@ -422,7 +433,11 @@ do_optimize_kernel() {
     [ -z "$def_wan" ] && def_wan="eth0"
     persist_sysctl_tuning
     apply_live_nic_tuning "$def_wan"
-    msg_ok "Kernel tuning applied and persisted to /etc/sysctl.d/99-xmanager-tunnel.conf"
+    if [ -f /etc/sysctl.d/99-xforwarder.conf ]; then
+        msg_ok "Kernel tuning synced with XForwarder (/etc/sysctl.d/99-xforwarder.conf); legacy 99-xmanager-tunnel.conf cleaned."
+    else
+        msg_ok "Kernel tuning applied and persisted to /etc/sysctl.d/90-xmanager-tunnel.conf"
+    fi
 }
 
 # ─── PSK Management ───────────────────────────────────────────────
@@ -510,18 +525,21 @@ generate_swanctl_conf() {
     local conn_name="esp-tun-${tid}"
     local child_name="esp-tun-${tid}-child"
     local conf_file="${SWANCTL_DIR}/${conn_name}.conf"
-    local local_ts="0.0.0.0/0" remote_ts="${outside_tun_ip}/32" start_act="start"
+    local local_ts="0.0.0.0/0" remote_ts="${outside_tun_ip}/32"
+    local start_act="start" dpd_act="restart" close_act="start"
 
     if [ "$role" = "kharej" ]; then
         local_ts="${outside_tun_ip}/32"
         remote_ts="0.0.0.0/0"
         start_act="none"
+        dpd_act="clear"
+        close_act="none"
     fi
 
     mkdir -p "${SWANCTL_DIR}"
     umask 077
     cat > "${conf_file}" <<SWAN
-# Managed by XManager ESP Tunnel Manager (ID ${tid})
+# Managed by XManager ESP Tunnel Manager v${VERSION} (ID ${tid})
 connections {
     ${conn_name} {
         version = 2
@@ -530,10 +548,11 @@ connections {
         proposals = aes256-sha256-modp2048
         mobike = no
         encap = no
+        unique = replace
         keyingtries = 0
         dpd_delay = 20s
         reauth_time = 0s
-        rekey_time = 4h
+        rekey_time = 6h
         local {
             auth = psk
             id = ${local_real}
@@ -550,12 +569,13 @@ connections {
                 if_id_out = ${if_id}
                 reqid = ${reqid}
                 esp_proposals = aes128gcm16
-                rekey_time = 30m
-                rand_time = 3m
-                life_time = 1h
+                replay_window = 1024
+                rekey_time = 2h
+                rand_time = 10m
+                life_time = 2h30m
                 start_action = ${start_act}
-                dpd_action = restart
-                close_action = start
+                dpd_action = ${dpd_act}
+                close_action = ${close_act}
             }
         }
     }
@@ -657,7 +677,38 @@ if ! systemctl is-active --quiet strongswan; then
 fi
 swanctl --load-all >/dev/null 2>&1 || true
 if [ "\${ROLE}" = "iran" ]; then
-    swanctl --initiate --child "\${CHILD_NAME}" --timeout 5 >/dev/null 2>&1 || true
+    sleep 0.5
+    if ! swanctl --list-sas --ike "\${CONN_NAME}" 2>/dev/null | grep -q "INSTALLED"; then
+        swanctl --initiate --child "\${CHILD_NAME}" --timeout 5 >/dev/null 2>&1 || true
+    fi
+fi
+
+# Immediately reconcile XForwarder DSR Direct policy routes for this interface (even on older XForwarder)
+if [ "\${DSR_MODE}" = "xforwarder" ] && command -v python3 >/dev/null 2>&1 && [ -f /run/xforwarder/dsr_direct_routes.json ]; then
+    python3 - "\${TUN_IF}" <<'PY' >/dev/null 2>&1 || true
+import ipaddress, json, subprocess, sys
+iface = sys.argv[1]
+with open("/run/xforwarder/dsr_direct_routes.json", "r", encoding="utf-8") as f:
+    data = json.load(f)
+rules_out = subprocess.run(["ip", "-4", "rule", "show"], capture_output=True, text=True).stdout
+for slot in (data.get("slots") or []):
+    if str(slot.get("iface") or "").strip() != iface:
+        continue
+    tid = int(slot["table_id"])
+    prio = int(slot["priority"])
+    mark_int = int(str(slot["fwmark"]), 0)
+    if not (42600 <= tid < 42664 and 12600 <= prio < 12664 and 0x42600001 <= mark_int < 0x42600001 + 64):
+        continue
+    subprocess.run(["ip", "route", "replace", "default", "dev", iface, "table", str(tid)], check=False)
+    for tip in (slot.get("throw_ips") or []):
+        ip_s = str(ipaddress.IPv4Address(str(tip).strip()))
+        subprocess.run(["ip", "route", "replace", "throw", f"{ip_s}/32", "table", str(tid)], check=False)
+    if not any(ln.lstrip().startswith(f"{prio}:") for ln in rules_out.splitlines()):
+        subprocess.run(["ip", "rule", "add", "priority", str(prio), "fwmark", f"0x{mark_int:08x}/0xffffffff", "lookup", str(tid)], check=False)
+PY
+    if [ -f /run/xforwarder/engine.pid ]; then
+        kill -USR1 "\$(cat /run/xforwarder/engine.pid 2>/dev/null)" 2>/dev/null || true
+    fi
 fi
 
 # Optional standalone Direct-Return DSR rules (skip when XForwarder manages forwarding)
@@ -801,7 +852,7 @@ if ! ip link show "\${TUN_IF}" >/dev/null 2>&1; then
     exit 0
 fi
 
-# Verify peer over ESP tunnel; on Iran side re-initiate CHILD_SA if ping fails
+# Verify peer over ESP tunnel; on failure use 2-stage recovery (soft SA reset first, interface restart only at 6+ fails)
 if ping -c 2 -W 2 -I "\${TUN_IF}" "\${TARGET_IP}" >/dev/null 2>&1; then
     rm -f "\${FAIL_FILE}" "\${COOLDOWN_FILE}"
     exit 0
@@ -821,19 +872,44 @@ if [ "\$fails" -ge 3 ]; then
         exit 0
     fi
     echo \$((now + 30)) > "\${COOLDOWN_FILE}"
-    logger -t "\${TAG}" "Recovering ESP tunnel \${TUN_IF} (esp-tunnel-\${TUNNEL_ID})"
-    if [ "\${ROLE}" = "iran" ] && command -v swanctl &>/dev/null; then
-        swanctl --initiate --child "esp-tun-\${TUNNEL_ID}-child" --timeout 5 >/dev/null 2>&1 || systemctl restart "esp-tunnel-\${TUNNEL_ID}" || true
+
+    inst_cnt=0
+    if command -v swanctl &>/dev/null; then
+        inst_cnt=\$(swanctl --list-sas --ike "esp-tun-\${TUNNEL_ID}" 2>/dev/null | grep -c "INSTALLED" || true)
+    fi
+    [[ ! "\$inst_cnt" =~ ^[0-9]+$ ]] && inst_cnt=0
+
+    if [ "\$fails" -ge 6 ]; then
+        logger -t "\${TAG}" "Stage 2 recovery: restarting esp-tunnel-\${TUNNEL_ID} after \${fails} failed checks"
+        systemctl restart "esp-tunnel-\${TUNNEL_ID}" || true
+        echo 0 > "\${FAIL_FILE}"
+    elif [ "\${ROLE}" = "iran" ] && command -v swanctl &>/dev/null; then
+        logger -t "\${TAG}" "Stage 1 recovery (iran): resetting SA for esp-tun-\${TUNNEL_ID} (installed=\${inst_cnt})"
+        if [ "\${inst_cnt}" -eq 0 ]; then
+            swanctl --load-all >/dev/null 2>&1 || true
+            swanctl --initiate --child "esp-tun-\${TUNNEL_ID}-child" --timeout 5 >/dev/null 2>&1 || true
+        else
+            swanctl --terminate --ike "esp-tun-\${TUNNEL_ID}" --timeout 3 >/dev/null 2>&1 || true
+            swanctl --load-all >/dev/null 2>&1 || true
+            swanctl --initiate --child "esp-tun-\${TUNNEL_ID}-child" --timeout 5 >/dev/null 2>&1 || true
+        fi
+    elif command -v swanctl &>/dev/null; then
+        # Kharej: clear stale SA without deleting espN netdev (preserves XForwarder table 42600 routes)
+        logger -t "\${TAG}" "Stage 1 recovery (kharej): soft-clearing SA for esp-tun-\${TUNNEL_ID} without deleting \${TUN_IF}"
+        ip link set dev "\${TUN_IF}" up >/dev/null 2>&1 || true
+        sysctl -w "net.ipv4.conf.\${TUN_IF}.rp_filter=0" >/dev/null 2>&1 || true
+        swanctl --terminate --ike "esp-tun-\${TUNNEL_ID}" --timeout 3 >/dev/null 2>&1 || true
+        swanctl --load-all >/dev/null 2>&1 || true
     else
         systemctl restart "esp-tunnel-\${TUNNEL_ID}" || true
+        echo 0 > "\${FAIL_FILE}"
     fi
-    echo 0 > "\${FAIL_FILE}"
 fi
 WD
     chmod 755 "$script_path"
 }
 
-create_systemd_units() {
+write_systemd_units() {
     local tid="$1" up_script="$2" down_script="$3" wd_script="$4" role_label="$5" remote_tun="$6"
     local svc_tun="${SYSTEMD_DIR}/esp-tunnel-${tid}.service"
     local svc_ka="${SYSTEMD_DIR}/esp-keepalive-${tid}.service"
@@ -898,7 +974,12 @@ UNIT
 
     chmod 644 "$svc_tun" "$svc_ka" "$svc_wd" "$tmr_wd"
     systemctl daemon-reload
-    systemctl enable "esp-tunnel-${tid}" "esp-keepalive-${tid}" "esp-watchdog-${tid}.timer" &>/dev/null
+    systemctl enable "esp-tunnel-${tid}" "esp-keepalive-${tid}" "esp-watchdog-${tid}.timer" &>/dev/null || true
+}
+
+create_systemd_units() {
+    local tid="$1" up_script="$2" down_script="$3" wd_script="$4" role_label="$5" remote_tun="$6"
+    write_systemd_units "$tid" "$up_script" "$down_script" "$wd_script" "$role_label" "$remote_tun"
     if ! systemctl restart "esp-tunnel-${tid}"; then
         return 1
     fi
@@ -1359,6 +1440,177 @@ do_delete() {
     msg_ok "Deleted ESP tunnel esp${id} cleanly."
 }
 
+upgrade_single_tunnel() {
+    local tid="$1"
+    local up_f="${SCRIPTS_DIR}/esp${tid}-up.sh"
+    local down_f="${SCRIPTS_DIR}/esp${tid}-down.sh"
+    local wd_f="${SCRIPTS_DIR}/esp${tid}-watchdog.sh"
+    local swan_f="${SWANCTL_DIR}/esp-tun-${tid}.conf"
+    local psk_f="${ESP_CFG_DIR}/esp${tid}.psk"
+
+    if [ ! -f "$up_f" ]; then
+        msg_warn "Skipping esp${tid}: ${up_f} not found."
+        return 1
+    fi
+
+    local role tun_if if_wan local_real remote_real local_tun remote_tun
+    local tun_mtu if_id reqid dsr_mode client_port backend_port route_table rule_prio route_mark
+    role=$(extract_up_var "ROLE" "$up_f")
+    tun_if=$(extract_up_var "TUN_IF" "$up_f")
+    if_wan=$(extract_up_var "IF_WAN" "$up_f")
+    local_real=$(extract_up_var "LOCAL_REAL" "$up_f")
+    remote_real=$(extract_up_var "REMOTE_REAL" "$up_f")
+    local_tun=$(extract_up_var "LOCAL_TUN" "$up_f")
+    remote_tun=$(extract_up_var "REMOTE_TUN" "$up_f")
+    tun_mtu=$(extract_up_var "TUN_MTU" "$up_f")
+    if_id=$(extract_up_var "IF_ID" "$up_f")
+    reqid=$(extract_up_var "REQ_ID" "$up_f")
+    dsr_mode=$(extract_up_var "DSR_MODE" "$up_f")
+    client_port=$(extract_up_var "CLIENT_PORT" "$up_f")
+    backend_port=$(extract_up_var "BACKEND_PORT" "$up_f")
+    route_table=$(extract_up_var "ROUTE_TABLE" "$up_f")
+    rule_prio=$(extract_up_var "RULE_PRIORITY" "$up_f")
+    route_mark=$(extract_up_var "ROUTE_MARK" "$up_f")
+
+    [ -z "$tun_if" ] && tun_if="esp${tid}"
+    [ -z "$if_wan" ] && { if_wan=$(detect_default_iface); [ -z "$if_wan" ] && if_wan="eth0"; }
+    [ -z "$remote_tun" ] && [ -n "$local_tun" ] && remote_tun=$(derive_remote_tun_from_local "$local_tun")
+    [ -z "$tun_mtu" ] && tun_mtu="1400"
+    [ -z "$if_id" ] && if_id=$(printf '0x%x' $((0x4250 + tid)))
+    [ -z "$reqid" ] && reqid=$((4251000 + tid))
+    [ -z "$dsr_mode" ] && dsr_mode="xforwarder"
+    [ -z "$client_port" ] && client_port="1036"
+    [ -z "$backend_port" ] && backend_port="24443"
+    [ -z "$route_table" ] && route_table=$((42500 + tid))
+    [ -z "$rule_prio" ] && rule_prio=$((12500 + tid))
+    [ -z "$route_mark" ] && route_mark=$(printf '0x%08x' $((0x42510000 + tid)))
+
+    if [ -z "$role" ] || [ -z "$local_real" ] || [ -z "$remote_real" ] || [ -z "$local_tun" ] || [ -z "$remote_tun" ]; then
+        msg_err "Skipping esp${tid}: missing core variables in ${up_f}."
+        return 1
+    fi
+
+    local psk_val=""
+    if [ -f "$psk_f" ]; then
+        psk_val=$(tr -d '\r\n[:space:]' < "$psk_f" 2>/dev/null || true)
+    fi
+    if [ -z "$psk_val" ] && [ -f "$swan_f" ]; then
+        psk_val=$(grep -E '^[[:space:]]*secret[[:space:]]*=' "$swan_f" 2>/dev/null | head -1 | sed -E 's/^[^=]+=[[:space:]]*(0x)?//; s/[[:space:]]+$//' | tr -d '\r\n"'\''')
+        if [[ "$psk_val" =~ ^[0-9a-fA-F]{64}$ ]]; then
+            mkdir -p -m 700 "${ESP_CFG_DIR}"
+            umask 077
+            printf '%s\n' "$psk_val" > "$psk_f"
+            chmod 600 "$psk_f"
+        fi
+    fi
+    if [ -z "$psk_val" ]; then
+        msg_err "Skipping esp${tid}: PSK not found in ${psk_f} or ${swan_f}."
+        return 1
+    fi
+
+    local outside_tun_ip="$remote_tun"
+    [ "$role" = "kharej" ] && outside_tun_ip="${local_tun%/*}"
+    local role_label="Iran"
+    [ "$role" = "kharej" ] && role_label="Kharej (Outside)"
+
+    local was_active=0
+    if systemctl is-active --quiet "esp-tunnel-${tid}" || ip link show "$tun_if" &>/dev/null; then
+        [ ! -f "${STATE_DIR}/${tun_if}.stopped" ] && was_active=1
+    fi
+
+    TUNNEL_ID="$tid"
+    ROLE="$role"
+    TUN_IF="$tun_if"
+    IF_WAN="$if_wan"
+    LOCAL_REAL="$local_real"
+    REMOTE_REAL="$remote_real"
+    LOCAL_TUN="$local_tun"
+    REMOTE_TUN="$remote_tun"
+    TUN_MTU="$tun_mtu"
+    IF_ID="$if_id"
+    REQ_ID="$reqid"
+    DSR_MODE="$dsr_mode"
+    CLIENT_PORT="$client_port"
+    BACKEND_PORT="$backend_port"
+    ROUTE_TABLE="$route_table"
+    RULE_PRIORITY="$rule_prio"
+    ROUTE_MARK="$route_mark"
+
+    generate_swanctl_conf "$tid" "$role" "$local_real" "$remote_real" "$outside_tun_ip" "$if_id" "$reqid" "$psk_val"
+    generate_esp_up "$up_f"
+    generate_esp_down "$down_f"
+    generate_watchdog "$wd_f"
+    write_systemd_units "$tid" "$up_f" "$down_f" "$wd_f" "$role_label" "$remote_tun"
+
+    if [ "$was_active" -eq 1 ]; then
+        rm -f "${STATE_DIR}/${tun_if}.fails" "${STATE_DIR}/${tun_if}.cooldown"
+        if ip link show "$tun_if" &>/dev/null; then
+            if command -v swanctl &>/dev/null && systemctl is-active --quiet strongswan; then
+                # Terminate old IKE_SA first so single up-script run loads new parameters cleanly
+                swanctl --terminate --ike "esp-tun-${tid}" --timeout 3 >/dev/null 2>&1 || true
+            fi
+            # Re-run up-script to reconcile XForwarder routes, reload swanctl config, and initiate once without deleting espN
+            if ! bash "$up_f" >/dev/null 2>&1; then
+                msg_warn "Warning: re-applying ${up_f} returned non-zero."
+            fi
+        else
+            systemctl restart "esp-tunnel-${tid}" || true
+        fi
+        systemctl restart "esp-keepalive-${tid}" || true
+        systemctl restart "esp-watchdog-${tid}.timer" || true
+    fi
+
+    msg_ok "Upgraded esp${tid} (${role}, ${dsr_mode}): replay_window=1024, unique=replace, smart watchdog, XForwarder route sync."
+    return 0
+}
+
+do_upgrade_tunnels() {
+    echo ""
+    print_double_line
+    echo -e " ${CYAN}${BOLD}Upgrade Existing ESP Tunnels to v${VERSION}${NC}"
+    print_line
+    msg_info "Preserves all IPs, subnets, ports, and PSKs while applying:"
+    echo -e "   - ${GREEN}replay_window = 1024${NC} (fixes XfrmInStateSeqError packet drops)"
+    echo -e "   - ${GREEN}unique = replace${NC} + ${GREEN}rekey_time = 2h${NC} + clean single CHILD_SA"
+    echo -e "   - ${GREEN}Smart 2-stage watchdog${NC} (avoids deleting espN netdev on Kharej)"
+    echo -e "   - ${GREEN}XForwarder DSR Direct sync${NC} (restores table 42600+ routes immediately)"
+    echo -e "   - ${GREEN}Sysctl conflict fix${NC} (removes legacy 99-xmanager-tunnel.conf)"
+    print_line
+
+    persist_sysctl_tuning
+    local def_wan
+    def_wan=$(detect_default_iface)
+    [ -z "$def_wan" ] && def_wan="eth0"
+    apply_live_nic_tuning "$def_wan"
+    ensure_charon_no_routes
+
+    local ids
+    mapfile -t ids < <(get_all_tunnel_ids)
+    if [ ${#ids[@]} -eq 0 ]; then
+        msg_warn "No numbered ESP tunnels found to upgrade."
+        if [ -f "${SCRIPTS_DIR}/esp-up.sh" ]; then
+            msg_warn "Found unnumbered legacy 'esp' tunnel; recreate it with option 3/4 after cleaning."
+        fi
+        return 0
+    fi
+
+    local tid ok_cnt=0 fail_cnt=0
+    for tid in "${ids[@]}"; do
+        if upgrade_single_tunnel "$tid"; then
+            ok_cnt=$(( ok_cnt + 1 ))
+        else
+            fail_cnt=$(( fail_cnt + 1 ))
+        fi
+    done
+
+    echo ""
+    if [ "$fail_cnt" -eq 0 ]; then
+        msg_ok "Upgraded ${ok_cnt} tunnel(s) cleanly! Note: run --upgrade on BOTH Iran and Kharej servers for full effect."
+    else
+        msg_warn "Upgraded ${ok_cnt} tunnel(s), ${fail_cnt} skipped/failed."
+    fi
+}
+
 # ─── Main Menu ────────────────────────────────────────────────────
 main_menu() {
     while true; do
@@ -1388,9 +1640,10 @@ main_menu() {
         echo -e "  ${CYAN}14)${NC} View Logs"
         echo -e "  ${RED}15)${NC} Delete a Tunnel"
         echo ""
-        echo -e " ${BOLD}${WHITE}Install & Tuning${NC}"
+        echo -e " ${BOLD}${WHITE}Install, Tuning & Upgrade${NC}"
         echo -e "  ${MAGENTA}16)${NC} Install Prerequisites (strongSwan / nftables)"
         echo -e "  ${GREEN}17)${NC} Optimize Kernel & Network (BBR / fq / rp_filter=0)"
+        echo -e "  ${YELLOW}18)${NC} Upgrade / Update Existing Tunnels (Apply Fixes)"
         echo ""
         echo -e "  ${DIM}0)${NC}  Exit"
         echo ""
@@ -1415,6 +1668,7 @@ main_menu() {
             15) do_delete ;;
             16) install_prereqs ;;
             17) do_optimize_kernel ;;
+            18) do_upgrade_tunnels ;;
             0)  echo -e "\n ${GREEN}Goodbye!${NC}\n"; exit 0 ;;
             *)  msg_err "Invalid option." ;;
         esac
@@ -1431,4 +1685,10 @@ if [ "${1:-}" = "-v" ] || [ "${1:-}" = "--version" ]; then
 fi
 
 check_root
+
+if [ "${1:-}" = "--upgrade" ] || [ "${1:-}" = "upgrade" ]; then
+    do_upgrade_tunnels
+    exit 0
+fi
+
 main_menu
