@@ -1,12 +1,12 @@
 #!/bin/bash
 
 # ╔════════════════════════════════════════════════════════════════╗
-# ║  ESP (IPSEC XFRM) TUNNEL & DIRECT-RETURN MANAGER v1.1.0        ║
+# ║  ESP (IPSEC XFRM) TUNNEL & DIRECT-RETURN MANAGER v1.1.1        ║
 # ║  Route-Based XFRM (espN) + IKEv2/strongSwan + Raw ESP (Proto50)║
 # ║  Supports XForwarder DSR (SYN-ACK/Direct) & Standalone Relay   ║
 # ╚════════════════════════════════════════════════════════════════╝
 
-VERSION="1.1.0"
+VERSION="1.1.1"
 
 # ─── Colors ───────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -572,7 +572,7 @@ connections {
                 replay_window = 1024
                 rekey_time = 2h
                 rand_time = 10m
-                life_time = 2h30m
+                life_time = 150m
                 start_action = ${start_act}
                 dpd_action = ${dpd_act}
                 close_action = ${close_act}
@@ -675,7 +675,10 @@ if ! systemctl is-active --quiet strongswan; then
     systemctl start strongswan
     sleep 1
 fi
-swanctl --load-all >/dev/null 2>&1 || true
+if ! SWAN_LOAD_ERR=\$(swanctl --load-all 2>&1); then
+    echo "[WARN] swanctl --load-all failed for \${CONN_NAME}: \${SWAN_LOAD_ERR}" >&2
+    logger -t "esp-up-\${TUNNEL_ID}" "swanctl --load-all failed: \${SWAN_LOAD_ERR}" 2>/dev/null || true
+fi
 if [ "\${ROLE}" = "iran" ]; then
     sleep 0.5
     if ! swanctl --list-sas --ike "\${CONN_NAME}" 2>/dev/null | grep -q "INSTALLED"; then
@@ -1546,10 +1549,15 @@ upgrade_single_tunnel() {
         rm -f "${STATE_DIR}/${tun_if}.fails" "${STATE_DIR}/${tun_if}.cooldown"
         if ip link show "$tun_if" &>/dev/null; then
             if command -v swanctl &>/dev/null && systemctl is-active --quiet strongswan; then
-                # Terminate old IKE_SA first so single up-script run loads new parameters cleanly
+                # Load and validate updated swanctl config BEFORE terminating the live IKE_SA
+                local load_err=""
+                if ! load_err=$(swanctl --load-all 2>&1); then
+                    msg_err "Aborting reload for esp${tid}: swanctl --load-all failed (${load_err})."
+                    return 1
+                fi
                 swanctl --terminate --ike "esp-tun-${tid}" --timeout 3 >/dev/null 2>&1 || true
             fi
-            # Re-run up-script to reconcile XForwarder routes, reload swanctl config, and initiate once without deleting espN
+            # Re-run up-script to reconcile XForwarder routes and initiate once without deleting espN
             if ! bash "$up_f" >/dev/null 2>&1; then
                 msg_warn "Warning: re-applying ${up_f} returned non-zero."
             fi
@@ -1560,7 +1568,7 @@ upgrade_single_tunnel() {
         systemctl restart "esp-watchdog-${tid}.timer" || true
     fi
 
-    msg_ok "Upgraded esp${tid} (${role}, ${dsr_mode}): replay_window=1024, unique=replace, smart watchdog, XForwarder route sync."
+    msg_ok "Upgraded esp${tid} (${role}, ${dsr_mode}) to v${VERSION}: replay_window=1024, unique=replace, smart watchdog, XForwarder route sync."
     return 0
 }
 
